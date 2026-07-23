@@ -7,6 +7,7 @@
 
 #include <csignal>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
@@ -980,19 +981,64 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     return client;
 }
 
+namespace {
+// Monotonic per-call id so a batched retrieve ("job") can be correlated across
+// its MC_BATCHGET job-line and its MC_GET per-chunk lines, and joined offline
+// with the python-side L3_remote_get by object_key.
+std::atomic<uint64_t> g_mc_job_seq{0};
+// Per-chunk MC_GET lines are one-per-object and can be chatty. Default ON; set
+// MC_GET_TRACE=0 to keep only the per-job MC_BATCHGET / MC_GET_E2E summaries.
+inline bool mc_get_trace_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("MC_GET_TRACE");
+        return (e == nullptr) || (std::string(e) != "0");
+    }();
+    return on;
+}
+}  // namespace
+
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           std::vector<Slice>& slices) {
-    auto query_result = Query(object_key);
+    // End-to-end single get = gRPC (master Query) + data transfer, logged split.
+    const uint64_t job_id = g_mc_job_seq.fetch_add(1, std::memory_order_relaxed);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto query_result = Query(object_key);  // master gRPC
+    const auto t_after_query = std::chrono::steady_clock::now();
     if (!query_result) {
         return tl::unexpected(query_result.error());
     }
-    return Get(object_key, query_result.value(), slices);
+    auto r = Get(object_key, query_result.value(), slices);  // data transfer
+    const auto t_end = std::chrono::steady_clock::now();
+
+    const int64_t grpc_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(t_after_query -
+                                                              t0)
+            .count();
+    const int64_t e2e_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(t_end - t0)
+            .count();
+    if (metrics_) {
+        metrics_->transfer_metric.query_latency_us.observe(grpc_us);
+        metrics_->transfer_metric.e2e_get_latency_us.observe(e2e_us);
+    }
+    size_t nbytes = 0;
+    for (const auto& s : slices) nbytes += s.size;
+    LOG(INFO) << "MC_GET_E2E job=" << job_id << " key=" << object_key
+              << " bytes=" << nbytes << " grpc_us=" << grpc_us
+              << " xfer_us=" << (e2e_us - grpc_us) << " e2e_us=" << e2e_us
+              << " ok=" << r.has_value();
+    return r;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     std::unordered_map<std::string, std::vector<Slice>>& slices) {
-    auto batched_query_results = BatchQuery(object_keys);
+    // ---- job-level end-to-end timing: gRPC (query) vs data transfer ----
+    const uint64_t job_id = g_mc_job_seq.fetch_add(1, std::memory_order_relaxed);
+    const auto t0 = std::chrono::steady_clock::now();
+
+    auto batched_query_results = BatchQuery(object_keys);  // master gRPC
+    const auto t_after_query = std::chrono::steady_clock::now();
 
     // If any queries failed, return error results immediately for failed
     // queries
@@ -1016,6 +1062,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     // If we have any valid queries, process them
+    auto t_xfer0 = t_after_query;
+    auto t_xfer1 = t_after_query;
     if (!valid_keys.empty()) {
         std::unordered_map<std::string, std::vector<Slice>> valid_slices;
         for (const auto& key : valid_keys) {
@@ -1025,14 +1073,61 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
         }
 
+        t_xfer0 = std::chrono::steady_clock::now();
         auto valid_results =
-            BatchGet(valid_keys, valid_query_results, valid_slices);
+            BatchGet(valid_keys, valid_query_results, valid_slices);  // transfer
+        t_xfer1 = std::chrono::steady_clock::now();
 
         // Merge results back
         for (size_t i = 0; i < valid_indices.size(); ++i) {
             results[valid_indices[i]] = valid_results[i];
         }
     }
+
+    // ---- job + per-chunk structured logging (docker logs; MC_GET_TRACE=0 to
+    // silence per-chunk). object_keys arrive in token order, so pos i of N is
+    // the chunk's prefix/suffix position within this job (heuristic: first half
+    // = prefix region, second half = suffix). The authoritative shared-vs-unique
+    // signal is cross-run access frequency (cache_used); join with the python
+    // L3_remote_get by key for that. ----
+    const auto t_end = std::chrono::steady_clock::now();
+    const int64_t grpc_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(t_after_query -
+                                                              t0)
+            .count();
+    const int64_t xfer_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(t_xfer1 - t_xfer0)
+            .count();
+    const int64_t e2e_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(t_end - t0)
+            .count();
+
+    const size_t n_objs = object_keys.size();
+    size_t total_bytes = 0;
+    for (size_t j = 0; j < valid_keys.size(); ++j) {
+        const size_t oi = valid_indices[j];
+        size_t nbytes = 0;
+        auto it = slices.find(valid_keys[j]);
+        if (it != slices.end())
+            for (const auto& s : it->second) nbytes += s.size;
+        total_bytes += nbytes;
+        if (mc_get_trace_enabled()) {
+            const char* region = (oi * 2 < n_objs) ? "prefix" : "suffix";
+            LOG(INFO) << "MC_GET job=" << job_id << " pos=" << oi << "/"
+                      << n_objs << " region=" << region
+                      << " key=" << valid_keys[j] << " bytes=" << nbytes
+                      << " ok=" << results[oi].has_value();
+        }
+    }
+
+    if (metrics_) {
+        metrics_->transfer_metric.query_latency_us.observe(grpc_us);
+        metrics_->transfer_metric.e2e_get_latency_us.observe(e2e_us);
+    }
+    LOG(INFO) << "MC_BATCHGET job=" << job_id << " n_objs=" << n_objs
+              << " n_valid=" << valid_keys.size() << " bytes=" << total_bytes
+              << " grpc_us=" << grpc_us << " xfer_us=" << xfer_us
+              << " e2e_us=" << e2e_us;
 
     return results;
 }

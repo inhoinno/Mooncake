@@ -117,6 +117,12 @@ struct TransferMetric {
                          "Get transfer latency (us)", kLatencyBucket, labels),
           put_latency_us("mooncake_transfer_put_latency",
                          "Put transfer latency (us)", kLatencyBucket, labels),
+          query_latency_us("mooncake_transfer_query_latency",
+                           "Query (master gRPC) latency (us)", kLatencyBucket,
+                           labels),
+          e2e_get_latency_us("mooncake_transfer_e2e_get_latency",
+                             "End-to-end get latency incl gRPC (us)",
+                             kLatencyBucket, labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t total_read_bytes;
@@ -125,6 +131,9 @@ struct TransferMetric {
     ylt::metric::histogram_t batch_get_latency_us;
     ylt::metric::histogram_t get_latency_us;
     ylt::metric::histogram_t put_latency_us;
+    // gRPC (master Query) latency, and end-to-end get latency = gRPC + transfer.
+    ylt::metric::histogram_t query_latency_us;
+    ylt::metric::histogram_t e2e_get_latency_us;
 
     void serialize(std::string& str) {
         total_read_bytes.serialize(str);
@@ -133,6 +142,8 @@ struct TransferMetric {
         batch_get_latency_us.serialize(str);
         get_latency_us.serialize(str);
         put_latency_us.serialize(str);
+        query_latency_us.serialize(str);
+        e2e_get_latency_us.serialize(str);
     }
 
     std::string summary_metrics(bool include_bandwidth = true) {
@@ -161,6 +172,9 @@ struct TransferMetric {
            << "\n";
         ss << "Batch Put: " << format_latency_summary(batch_put_latency_us)
            << "\n";
+        ss << "Query(gRPC): " << format_latency_summary(query_latency_us)
+           << "\n";
+        ss << "E2E Get: " << format_latency_summary(e2e_get_latency_us) << "\n";
 
         return ss.str();
     }
