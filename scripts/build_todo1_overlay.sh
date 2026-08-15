@@ -38,6 +38,14 @@ if ! command -v curl-config >/dev/null 2>&1; then
   exit 2
 fi
 
+if ! printf '#include <xxhash.h>\n' |
+     "${CXX:-c++}" -E -x c++ - >/dev/null 2>&1; then
+  echo "[FATAL] xxHash development files are required by Mooncake Store checksums" >&2
+  echo "        Ubuntu/Debian: sudo apt-get install -y libxxhash-dev" >&2
+  echo "        RHEL/Fedora:   sudo dnf install -y xxhash-devel" >&2
+  exit 2
+fi
+
 build_dir="$repo_dir/$build_dir_name"
 ylt_source_dir="$repo_dir/extern/yalantinglibs"
 ylt_build_dir="$build_dir/_deps/yalantinglibs-build"

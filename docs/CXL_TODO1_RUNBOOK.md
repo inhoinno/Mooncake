@@ -37,7 +37,9 @@ used by the vLLM/LMCache launcher:
 
 ```bash
 git submodule update --init --recursive extern/pybind11 extern/yalantinglibs
-sudo apt-get install -y libcurl4-openssl-dev
+sudo apt-get install -y \
+  libcurl4-openssl-dev libxxhash-dev libzstd-dev libmsgpack-dev \
+  libboost-dev libnuma-dev libibverbs-dev libasio-dev
 MOONCAKE_USE_CUDA=OFF bash scripts/build_todo1_overlay.sh
 ```
 
@@ -63,8 +65,9 @@ The submodule source must be copied without broad `build*` exclusions:
 artifact. If a lab copy omitted it, restore the specific file with
 `git -C extern/yalantinglibs restore --source=HEAD --worktree -- cmake/build.cmake`.
 The build also fails preflight when `extern/pybind11` is incomplete or when
-`curl-config` is absent. `USE_HTTP=ON` requires the libcurl development package,
-not only the `curl` command-line program.
+`curl-config` or `xxhash.h` is absent. `USE_HTTP=ON` requires the libcurl
+development package, not only the `curl` command-line program. Mooncake Store
+uses xxHash unconditionally for checksums; do not disable it for TODO#1.
 
 Do not build the pybind extensions on macOS or an arbitrary host and mount them
 into the Linux runtime image. Python, glibc/libstdc++, CUDA, ibverbs, and other
