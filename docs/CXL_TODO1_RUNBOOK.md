@@ -36,6 +36,15 @@ Run this on Linux in an ABI-compatible environment, preferably the same image
 used by the vLLM/LMCache launcher:
 
 ```bash
+git submodule update --init --recursive extern/pybind11 extern/yalantinglibs
+sudo apt-get install -y libcurl4-openssl-dev
+MOONCAKE_USE_CUDA=OFF bash scripts/build_todo1_overlay.sh
+```
+
+Use the final line by itself on subsequent CPU-only rebuilds. The default CUDA
+build remains:
+
+```bash
 bash scripts/build_todo1_overlay.sh
 ```
 
@@ -53,6 +62,9 @@ The submodule source must be copied without broad `build*` exclusions:
 `extern/yalantinglibs/cmake/build.cmake` is a tracked source helper, not a build
 artifact. If a lab copy omitted it, restore the specific file with
 `git -C extern/yalantinglibs restore --source=HEAD --worktree -- cmake/build.cmake`.
+The build also fails preflight when `extern/pybind11` is incomplete or when
+`curl-config` is absent. `USE_HTTP=ON` requires the libcurl development package,
+not only the `curl` command-line program.
 
 Do not build the pybind extensions on macOS or an arbitrary host and mount them
 into the Linux runtime image. Python, glibc/libstdc++, CUDA, ibverbs, and other

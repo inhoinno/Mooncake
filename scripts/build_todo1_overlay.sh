@@ -21,6 +21,23 @@ if [ "$(uname -s)" != "Linux" ]; then
   exit 2
 fi
 
+pybind_source_dir="$repo_dir/extern/pybind11"
+if [ ! -f "$pybind_source_dir/CMakeLists.txt" ]; then
+  echo "[FATAL] incomplete pybind11 checkout: missing $pybind_source_dir/CMakeLists.txt" >&2
+  echo "        Run: git submodule update --init --recursive extern/pybind11" >&2
+  exit 2
+fi
+
+# USE_HTTP is required by this Store build, so Mooncake's transfer engine calls
+# find_package(CURL REQUIRED). The curl command alone is insufficient: the
+# development package supplies curl-config, headers, and the link library.
+if ! command -v curl-config >/dev/null 2>&1; then
+  echo "[FATAL] libcurl development files are required because USE_HTTP=ON" >&2
+  echo "        Ubuntu/Debian: sudo apt-get install -y libcurl4-openssl-dev" >&2
+  echo "        RHEL/Fedora:   sudo dnf install -y libcurl-devel" >&2
+  exit 2
+fi
+
 build_dir="$repo_dir/$build_dir_name"
 ylt_source_dir="$repo_dir/extern/yalantinglibs"
 ylt_build_dir="$build_dir/_deps/yalantinglibs-build"
