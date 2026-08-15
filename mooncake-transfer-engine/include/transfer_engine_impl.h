@@ -394,6 +394,10 @@ class TransferEngineImpl {
     }
 
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
+    size_t getCxlBaseSize() { return multi_transports_->getCxlBaseSize(); }
+    std::string getCxlPoolStatus() {
+        return multi_transports_->getCxlPoolStatus();
+    }
 
     void setWhitelistFilters(std::vector<std::string>&& filters) {
         filter_ = std::move(filters);

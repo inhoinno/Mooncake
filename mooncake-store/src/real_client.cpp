@@ -762,21 +762,26 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // If global_segment_size is larger than max_mr_size, split to multiple
     // mapped_shms.
     if (protocol == "cxl") {
-        size_t cxl_dev_size = 0;
-        const char *env = std::getenv("MC_CXL_DEV_SIZE");
-        if (env) {
-            cxl_dev_size =
-                TryParseInteger<size_t>(env, {.trim_ascii_whitespace = true,
-                                              .allow_leading_plus = true})
-                    .value_or(0);
-        } else {
-            LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
+        // Consume the already validated mapping configuration from Transfer
+        // Engine. Re-parsing MC_CXL_DEV_SIZE here previously allowed Store and
+        // CxlTransport to disagree about the usable extent.
+        const size_t cxl_dev_size = client_->GetCxlBaseSize();
+        if (cxl_dev_size == 0) {
+            LOG(ERROR) << "component=mooncake_store event=cxl_mount "
+                          "error_code=invalid_config field=capacity "
+                          "message=\"CXL backend reported zero capacity\"";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        void *ptr = client_->GetBaseAddr();
-        LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
-                  << ptr;
+        void* ptr = client_->GetBaseAddr();
+        if (ptr == nullptr) {
+            LOG(ERROR) << "component=mooncake_store event=cxl_mount "
+                          "error_code=backend_closed field=base_address";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        LOG(INFO) << client_->GetCxlPoolStatus();
+        LOG(INFO) << "component=mooncake_store event=cxl_mount "
+                  << "capacity=" << cxl_dev_size;
         auto mount_result = client_->MountSegment(ptr, cxl_dev_size, protocol);
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "

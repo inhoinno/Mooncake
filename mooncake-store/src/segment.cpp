@@ -4,6 +4,7 @@
 #include "utils/zstd_util.h"
 
 #include <functional>
+#include <stdexcept>
 
 namespace mooncake {
 namespace {
@@ -123,6 +124,14 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
             if (segment_manager_->cxl_global_allocator_ == nullptr) {
                 LOG(ERROR) << "Cxl global allocator has not been initialized.";
                 return ErrorCode::INTERNAL_ERROR;
+            }
+            if (size == 0 || allocator->capacity() != size) {
+                LOG(ERROR)
+                    << "component=segment_manager event=cxl_mount "
+                    << "error_code=capacity_mismatch configured_capacity="
+                    << allocator->capacity() << " mapped_capacity=" << size
+                    << " segment_name=" << segment.name;
+                return ErrorCode::INVALID_PARAMS;
             }
             segment_manager_->allocator_manager_.addAllocator(segment.name,
                                                               allocator);
@@ -1583,6 +1592,13 @@ void SegmentManager::releaseCapacityMetrics() {
 
 void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
                                             const size_t cxl_size) {
+    if (cxl_path.empty() || cxl_size == 0) {
+        LOG(ERROR) << "component=segment_manager event=cxl_allocator_init "
+                   << "error_code=invalid_config field="
+                   << (cxl_path.empty() ? "cxl_path" : "cxl_size");
+        throw std::invalid_argument(
+            "CXL allocator requires a non-empty path and non-zero size");
+    }
     LOG(INFO) << "Init CXL global allocator.";
     LOG(INFO) << "[CXL] create allocator with "
               << "path=" << cxl_path << " base=0x" << std::hex

@@ -262,6 +262,8 @@ class TransferEngine {
     void setAutoDiscover(const AutoDiscoverConfig& config);
 
     void* getBaseAddr();
+    size_t getCxlBaseSize();
+    std::string getCxlPoolStatus();
 
     void setWhitelistFilters(std::vector<std::string>&& filters);
 

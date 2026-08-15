@@ -1,6 +1,7 @@
 find_package(yaml-cpp REQUIRED)
 
-set(MOONCAKE_COMMON_SOURCES crc_checksum.cpp default_config.cpp environ.cpp
+set(MOONCAKE_COMMON_SOURCES crc_checksum.cpp cxl_pool_backend.cpp
+                            default_config.cpp environ.cpp
                             rpc_client_io_context.cpp)
 
 add_library(asio_shared SHARED asio_impl.cpp)

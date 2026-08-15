@@ -23,6 +23,7 @@
 
 #include "integration_utils.h"
 #include "buffer_pool.h"
+#include "mooncake_get_clock.h"
 
 // Forward declaration for EngramStore bindings
 namespace mooncake {
@@ -517,8 +518,11 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::bytes get(const std::string &key) {
+        detail::MooncakeGetClock clock(detail::MooncakeGetClockApi::kGet,
+                                       "get", 1);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
+            clock.Finish(0, 0, "not_initialized");
             return pybind11::bytes("\\0", 0);
         }
 
@@ -529,6 +533,7 @@ class MooncakeStorePyWrapper {
             auto buffer_handle = store_->get_buffer(key);
             if (!buffer_handle) {
                 py::gil_scoped_acquire acquire_gil;
+                clock.Finish(0, 0, "miss");
                 return kNullString;
             }
 
@@ -543,10 +548,13 @@ class MooncakeStorePyWrapper {
                                                     buffer_handle->ptr(),
                                                     buffer_handle->size())) {
                     LOG(ERROR) << "Failed to copy buffer to host memory";
+                    clock.Finish(0, 0, "copy_error");
                     return pybind11::none();
                 }
+                clock.Finish(1, buffer_handle->size(), "ok");
                 return pybind11::bytes(host_buf);
             }
+            clock.Finish(1, buffer_handle->size(), "ok");
             return pybind11::bytes((char *)buffer_handle->ptr(),
                                    buffer_handle->size());
         }
@@ -554,10 +562,13 @@ class MooncakeStorePyWrapper {
 
     std::vector<pybind11::bytes> get_batch(
         const std::vector<std::string> &keys) {
+        detail::MooncakeGetClock clock(detail::MooncakeGetClockApi::kGetBatch,
+                                       "get_batch", keys.size());
         const auto kNullString = pybind11::bytes("\\0", 0);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             py::gil_scoped_acquire acquire_gil;
+            clock.Finish(0, 0, "not_initialized");
             return {kNullString};
         }
 
@@ -566,12 +577,15 @@ class MooncakeStorePyWrapper {
             auto batch_data = store_->batch_get_buffer(keys);
             if (batch_data.empty()) {
                 py::gil_scoped_acquire acquire_gil;
+                clock.Finish(0, 0, "miss");
                 return {kNullString};
             }
 
             py::gil_scoped_acquire acquire_gil;
             std::vector<pybind11::bytes> results;
             results.reserve(batch_data.size());
+            size_t completed = 0;
+            uint64_t bytes = 0;
 
             auto runtime_accelerator =
                 mooncake::device::GetAcceleratorRegistry()
@@ -595,7 +609,16 @@ class MooncakeStorePyWrapper {
                     results.emplace_back(
                         pybind11::bytes((char *)data->ptr(), data->size()));
                 }
+                ++completed;
+                bytes = data->size() >
+                                std::numeric_limits<uint64_t>::max() - bytes
+                            ? std::numeric_limits<uint64_t>::max()
+                            : bytes + data->size();
             }
+            const char *status = completed == keys.size()
+                                     ? "ok"
+                                     : (completed == 0 ? "miss" : "partial");
+            clock.Finish(completed, bytes, status);
             return results;
         }
     }
@@ -2324,16 +2347,46 @@ PYBIND11_MODULE(store, m) {
         .def(
             "get_buffer",
             [](MooncakeStorePyWrapper &self, const std::string &key) {
-                py::gil_scoped_release release;
-                return self.store_->get_buffer(key);
+                detail::MooncakeGetClock clock(
+                    detail::MooncakeGetClockApi::kGetBuffer, "get_buffer", 1);
+                std::shared_ptr<BufferHandle> result;
+                {
+                    py::gil_scoped_release release;
+                    result = self.store_->get_buffer(key);
+                }
+                clock.Finish(result ? 1 : 0, result ? result->size() : 0,
+                             result ? "ok" : "miss");
+                return result;
             },
             py::return_value_policy::take_ownership)
         .def(
             "batch_get_buffer",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
-                py::gil_scoped_release release;
-                return self.store_->batch_get_buffer(keys);
+                detail::MooncakeGetClock clock(
+                    detail::MooncakeGetClockApi::kBatchGetBuffer,
+                    "batch_get_buffer", keys.size());
+                std::vector<std::shared_ptr<BufferHandle>> result;
+                {
+                    py::gil_scoped_release release;
+                    result = self.store_->batch_get_buffer(keys);
+                }
+                size_t completed = 0;
+                uint64_t bytes = 0;
+                for (const auto &handle : result) {
+                    if (!handle) continue;
+                    ++completed;
+                    bytes = handle->size() >
+                                    std::numeric_limits<uint64_t>::max() - bytes
+                                ? std::numeric_limits<uint64_t>::max()
+                                : bytes + handle->size();
+                }
+                const char *status = completed == keys.size()
+                                         ? "ok"
+                                         : (completed == 0 ? "miss"
+                                                           : "partial");
+                clock.Finish(completed, bytes, status);
+                return result;
             },
             py::return_value_policy::take_ownership)
         .def(
@@ -2809,9 +2862,19 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper &self, const std::string &key,
                uintptr_t buffer_ptr, size_t size) {
                 // Get data directly into user-provided buffer
+                detail::MooncakeGetClock clock(
+                    detail::MooncakeGetClockApi::kGetInto, "get_into", 1,
+                    size);
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
-                py::gil_scoped_release release;
-                return self.store_->get_into(key, buffer, size);
+                int64_t result;
+                {
+                    py::gil_scoped_release release;
+                    result = self.store_->get_into(key, buffer, size);
+                }
+                clock.Finish(result > 0 ? 1 : 0,
+                             result > 0 ? static_cast<uint64_t>(result) : 0,
+                             result > 0 ? "ok" : "miss_or_error");
+                return result;
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             "Get object data directly into a pre-allocated buffer")
@@ -2846,13 +2909,37 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::string> &keys,
                const std::vector<uintptr_t> &buffer_ptrs,
                const std::vector<size_t> &sizes) {
+                detail::MooncakeGetClock clock(
+                    detail::MooncakeGetClockApi::kBatchGetInto,
+                    "batch_get_into", keys.size(),
+                    detail::MooncakeGetSumSizes(sizes));
                 std::vector<void *> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
                     buffers.push_back(reinterpret_cast<void *>(ptr));
                 }
-                py::gil_scoped_release release;
-                return self.store_->batch_get_into(keys, buffers, sizes);
+                std::vector<int64_t> result;
+                {
+                    py::gil_scoped_release release;
+                    result = self.store_->batch_get_into(keys, buffers, sizes);
+                }
+                size_t completed = 0;
+                uint64_t bytes = 0;
+                for (const int64_t transferred : result) {
+                    if (transferred <= 0) continue;
+                    ++completed;
+                    const auto value = static_cast<uint64_t>(transferred);
+                    bytes = value >
+                                    std::numeric_limits<uint64_t>::max() - bytes
+                                ? std::numeric_limits<uint64_t>::max()
+                                : bytes + value;
+                }
+                const char *status = completed == keys.size()
+                                         ? "ok"
+                                         : (completed == 0 ? "miss_or_error"
+                                                           : "partial");
+                clock.Finish(completed, bytes, status);
+                return result;
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
             "Get object data directly into pre-allocated buffers for "

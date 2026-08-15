@@ -25,6 +25,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "cxl_pool_backend.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -37,7 +38,8 @@ class CxlTransport : public Transport {
     using SegmentDesc = TransferMetadata::SegmentDesc;
 
    public:
-    CxlTransport();
+    explicit CxlTransport(
+        std::shared_ptr<CxlPoolBackend> cxl_backend = nullptr);
 
     ~CxlTransport();
 
@@ -50,7 +52,23 @@ class CxlTransport : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
-    void *getCxlBaseAddr() { return cxl_base_addr; }
+    void *getCxlBaseAddr() const {
+        return cxl_backend_ ? cxl_backend_->base() : nullptr;
+    }
+
+    size_t getCxlDeviceSize() const {
+        return cxl_backend_ ? cxl_backend_->config().capacity : 0;
+    }
+
+    std::string getCxlPoolId() const {
+        return cxl_backend_ ? cxl_backend_->config().logical_pool_id
+                            : std::string();
+    }
+
+    CxlPoolStatusSnapshot getCxlPoolStatus() const {
+        return cxl_backend_ ? cxl_backend_->status()
+                            : CxlPoolStatusSnapshot{};
+    }
 
    private:
     int install(std::string &local_server_name,
@@ -76,8 +94,6 @@ class CxlTransport : public Transport {
 
     int cxlDevInit();
 
-    size_t cxlGetDeviceSize();
-
     int cxlMemcpy(void *dest_addr, void *source_addr, size_t size);
 
     bool isAddressInCxlRange(void *addr);
@@ -85,9 +101,7 @@ class CxlTransport : public Transport {
     bool validateMemoryBounds(void *dest, void *src, size_t size);
 
    private:
-    void *cxl_base_addr;
-    size_t cxl_dev_size;
-    char *cxl_dev_path;
+    std::shared_ptr<CxlPoolBackend> cxl_backend_;
 };
 }  // namespace mooncake
 

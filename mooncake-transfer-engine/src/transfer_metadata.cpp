@@ -318,6 +318,11 @@ static int encodeMultiProtocolSegmentDesc(
             segmentJSON["cxl_name"] = desc.cxl_name;
             segmentJSON["cxl_base_addr"] =
                 static_cast<Json::UInt64>(desc.cxl_base_addr);
+            segmentJSON["cxl_pool_id"] = desc.cxl_pool_id;
+            segmentJSON["cxl_map_offset"] =
+                static_cast<Json::UInt64>(desc.cxl_map_offset);
+            segmentJSON["cxl_capacity"] =
+                static_cast<Json::UInt64>(desc.cxl_capacity);
         }
         protocolJSON.append(proto);
     }
@@ -534,6 +539,11 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         segmentJSON["cxl_name"] = desc.cxl_name;
         segmentJSON["cxl_base_addr"] =
             static_cast<Json::UInt64>(desc.cxl_base_addr);
+        segmentJSON["cxl_pool_id"] = desc.cxl_pool_id;
+        segmentJSON["cxl_map_offset"] =
+            static_cast<Json::UInt64>(desc.cxl_map_offset);
+        segmentJSON["cxl_capacity"] =
+            static_cast<Json::UInt64>(desc.cxl_capacity);
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
@@ -639,6 +649,15 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
         } else if (proto == "cxl") {
             desc->cxl_name = segmentJSON["cxl_name"].asString();
             desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
+            desc->cxl_pool_id = segmentJSON.isMember("cxl_pool_id")
+                                    ? segmentJSON["cxl_pool_id"].asString()
+                                    : desc->cxl_name;
+            desc->cxl_map_offset = segmentJSON.isMember("cxl_map_offset")
+                                       ? segmentJSON["cxl_map_offset"].asUInt64()
+                                       : 0;
+            desc->cxl_capacity = segmentJSON.isMember("cxl_capacity")
+                                     ? segmentJSON["cxl_capacity"].asUInt64()
+                                     : 0;
         }
     }
 
@@ -989,6 +1008,15 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     } else if (desc->protocol == "cxl") {
         desc->cxl_name = segmentJSON["cxl_name"].asString();
         desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
+        desc->cxl_pool_id = segmentJSON.isMember("cxl_pool_id")
+                                ? segmentJSON["cxl_pool_id"].asString()
+                                : desc->cxl_name;
+        desc->cxl_map_offset = segmentJSON.isMember("cxl_map_offset")
+                                   ? segmentJSON["cxl_map_offset"].asUInt64()
+                                   : 0;
+        desc->cxl_capacity = segmentJSON.isMember("cxl_capacity")
+                                 ? segmentJSON["cxl_capacity"].asUInt64()
+                                 : 0;
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
@@ -1096,6 +1124,9 @@ bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
            devices == other.devices && topology == other.topology &&
            buffers == other.buffers && nvmeof_buffers == other.nvmeof_buffers &&
            cxl_name == other.cxl_name && cxl_base_addr == other.cxl_base_addr &&
+           cxl_pool_id == other.cxl_pool_id &&
+           cxl_map_offset == other.cxl_map_offset &&
+           cxl_capacity == other.cxl_capacity &&
            rank_info == other.rank_info &&
            tcp_data_port == other.tcp_data_port &&
            rdma_server_name == other.rdma_server_name;

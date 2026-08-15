@@ -673,4 +673,27 @@ void* MultiTransport::getBaseAddr() {
     return 0;
 }
 
+size_t MultiTransport::getCxlBaseSize() {
+#ifdef USE_CXL
+    Transport* transport = getTransport("cxl");
+    if (transport) {
+        auto* cxl_transport = dynamic_cast<CxlTransport*>(transport);
+        return cxl_transport ? cxl_transport->getCxlDeviceSize() : 0;
+    }
+#endif
+    return 0;
+}
+
+std::string MultiTransport::getCxlPoolStatus() {
+#ifdef USE_CXL
+    Transport* transport = getTransport("cxl");
+    if (transport) {
+        auto* cxl_transport = dynamic_cast<CxlTransport*>(transport);
+        return cxl_transport ? cxl_transport->getCxlPoolStatus().ToJson()
+                             : std::string("{}");
+    }
+#endif
+    return "{}";
+}
+
 }  // namespace mooncake

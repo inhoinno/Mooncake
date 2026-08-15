@@ -3469,6 +3469,12 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
+size_t Client::GetCxlBaseSize() { return transfer_engine_->getCxlBaseSize(); }
+
+std::string Client::GetCxlPoolStatus() {
+    return transfer_engine_->getCxlPoolStatus();
+}
+
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
     bool enable_offloading) {
     auto response =

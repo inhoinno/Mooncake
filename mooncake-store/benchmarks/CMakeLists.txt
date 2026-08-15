@@ -3,6 +3,13 @@ add_executable(allocator_bench allocator_bench.cpp)
 target_link_libraries(allocator_bench PRIVATE cachelib_memory_allocator
                                               mooncake_store)
 
+# Isolated benchmark for the CacheLib allocator Mooncake uses to represent a
+# fixed client segment. This does not start Master or run a transfer engine.
+add_executable(cachelib_allocator_bench cachelib_allocator_bench.cpp)
+target_link_libraries(
+  cachelib_allocator_bench PRIVATE cachelib_memory_allocator mooncake_store
+                                   gflags::gflags glog::glog pthread)
+
 # Add focused OffsetAllocator concurrency benchmark
 add_executable(offset_allocator_concurrency_bench
                offset_allocator_concurrency_bench.cpp)

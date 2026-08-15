@@ -303,6 +303,12 @@ void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
 
 void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
 
+size_t TransferEngine::getCxlBaseSize() { return impl_->getCxlBaseSize(); }
+
+std::string TransferEngine::getCxlPoolStatus() {
+    return impl_->getCxlPoolStatus();
+}
+
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
     impl_->setWhitelistFilters(std::move(filters));
 }
@@ -877,6 +883,14 @@ void* TransferEngine::getBaseAddr() {
         return nullptr;
     } else
         return impl_->getBaseAddr();
+}
+
+size_t TransferEngine::getCxlBaseSize() {
+    return use_tent_ ? 0 : impl_->getCxlBaseSize();
+}
+
+std::string TransferEngine::getCxlPoolStatus() {
+    return use_tent_ ? std::string("{}") : impl_->getCxlPoolStatus();
 }
 
 void TransferEngine::enableGracefulShutdown() {

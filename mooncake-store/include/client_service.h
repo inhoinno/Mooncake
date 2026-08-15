@@ -450,6 +450,12 @@ class Client {
      */
     void* GetBaseAddr();
 
+    /** Returns the capacity of the same mapped CXL backend as GetBaseAddr(). */
+    size_t GetCxlBaseSize();
+
+    /** Safe JSON status for black-box CXL startup/debugging. */
+    std::string GetCxlPoolStatus();
+
     /**
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).

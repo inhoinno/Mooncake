@@ -48,27 +48,27 @@ DEFINE_string(device_name, "tmp_dax_sim", "Device name for cxl");
 
 DEFINE_int64(device_size, 1073741824, "Device Size for cxl");
 
-static void *allocateMemoryPool(size_t size, int socket_id,
+static void* allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
     return numa_alloc_onnode(size, socket_id);
 }
 
-static void freeMemoryPool(void *addr, size_t size) { numa_free(addr, size); }
+static void freeMemoryPool(void* addr, size_t size) { numa_free(addr, size); }
 
 class CXLTransportTest : public ::testing::Test {
    public:
     std::shared_ptr<mooncake::TransferMetadata> metadata_client;
     int tmp_fd = -1;
-    uint8_t *addr = nullptr;
-    uint8_t *base_addr;
+    uint8_t* addr = nullptr;
+    uint8_t* base_addr;
     std::pair<std::string, uint16_t> hostname_port;
     std::unique_ptr<mooncake::TransferEngine> engine;
     const size_t offset_1 = 2 * 1024 * 1024;
     const size_t offset_2 = 6 * 1024 * 1024;
     const size_t len = 2 * 1024 * 1024;
-    CxlTransport *cxl_xport;
-    Transport *xport;
-    void **args;
+    CxlTransport* cxl_xport;
+    Transport* xport;
+    void** args;
     mooncake::Transport::SegmentID segment_id;
     std::shared_ptr<TransferMetadata::SegmentDesc> segment_desc;
     const size_t kDataLength = 4 * 1024;
@@ -87,6 +87,9 @@ class CXLTransportTest : public ::testing::Test {
         setenv("MC_CXL_DEV_PATH", FLAGS_device_name.c_str(), 1);
 
         setenv("MC_CXL_DEV_SIZE", std::to_string(FLAGS_device_size).c_str(), 1);
+        setenv("MC_CXL_PROVIDER", "faketract", 1);
+        setenv("MC_CXL_BACKEND_KIND", "file", 1);
+        setenv("MC_CXL_POOL_ID", "cxl-transport-test-pool", 1);
 
         // cxl setup
         engine = std::make_unique<TransferEngine>(false);
@@ -96,20 +99,32 @@ class CXLTransportTest : public ::testing::Test {
                      hostname_port.second + offset++);
         xport = nullptr;
 
-        args = (void **)malloc(2 * sizeof(void *));
+        args = (void**)malloc(2 * sizeof(void*));
         args[0] = nullptr;
         xport = engine->installTransport("cxl", args);
         ASSERT_NE(xport, nullptr);
 
-        cxl_xport = dynamic_cast<CxlTransport *>(xport);
-        base_addr = (uint8_t *)cxl_xport->getCxlBaseAddr();
-        addr = (uint8_t *)allocateMemoryPool(kDataLength, 0, false);
+        cxl_xport = dynamic_cast<CxlTransport*>(xport);
+        base_addr = (uint8_t*)cxl_xport->getCxlBaseAddr();
+        ASSERT_EQ(cxl_xport->getCxlDeviceSize(),
+                  static_cast<size_t>(FLAGS_device_size));
+        ASSERT_EQ(cxl_xport->getCxlPoolId(), "cxl-transport-test-pool");
+        ASSERT_EQ(cxl_xport->getCxlPoolStatus().provider, "faketract");
+        ASSERT_NE(cxl_xport->getCxlPoolStatus().ToJson().find(
+                      "\"lifecycle\":\"ready\""),
+                  std::string::npos);
+        addr = (uint8_t*)allocateMemoryPool(kDataLength, 0, false);
         int rc = engine->registerLocalMemory(base_addr + offset_1, len);
         ASSERT_EQ(rc, 0);
 
         segment_id = engine->openSegment(FLAGS_local_server_name.c_str());
         // bindToSocket(0);
         segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
+        ASSERT_NE(segment_desc, nullptr);
+        ASSERT_EQ(segment_desc->cxl_pool_id, "cxl-transport-test-pool");
+        ASSERT_EQ(segment_desc->cxl_map_offset, 0);
+        ASSERT_EQ(segment_desc->cxl_capacity,
+                  static_cast<uint64_t>(FLAGS_device_size));
     }
 
     void TearDown() override {
@@ -117,6 +132,9 @@ class CXLTransportTest : public ::testing::Test {
             close(tmp_fd);
             unlink(FLAGS_device_name.c_str());
         }
+        unsetenv("MC_CXL_BACKEND_KIND");
+        unsetenv("MC_CXL_PROVIDER");
+        unsetenv("MC_CXL_POOL_ID");
         free(args);
         google::ShutdownGoogleLogging();
         freeMemoryPool(addr, kDataLength);
@@ -127,13 +145,13 @@ TEST_F(CXLTransportTest, MultiWrite) {
     int times = 10;
     while (times--) {
         for (size_t offset = 0; offset < kDataLength; ++offset)
-            *((char *)(addr) + offset) = 'a' + lrand48() % 26;
+            *((char*)(addr) + offset) = 'a' + lrand48() % 26;
         auto batch_id = xport->allocateBatchID(1);
         Status s;
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
         entry.length = kDataLength;
-        entry.source = (uint8_t *)(addr);
+        entry.source = (uint8_t*)(addr);
         entry.target_id = segment_id;
         entry.target_offset = offset_1;
         // s = xport->submitTransfer(batch_id, {entry});
@@ -162,13 +180,13 @@ TEST_F(CXLTransportTest, MultipleRead) {
     int times = 10;
     while (times--) {
         for (size_t offset = 0; offset < kDataLength; ++offset)
-            *((char *)(addr) + offset) = 'a' + lrand48() % 26;
+            *((char*)(addr) + offset) = 'a' + lrand48() % 26;
         auto batch_id = xport->allocateBatchID(1);
         Status s;
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
         entry.length = kDataLength;
-        entry.source = (uint8_t *)(addr);
+        entry.source = (uint8_t*)(addr);
         entry.target_id = segment_id;
         entry.target_offset = offset_2;
         // s = xport->submitTransfer(batch_id, {entry});
@@ -198,12 +216,12 @@ TEST_F(CXLTransportTest, MultipleRead) {
     while (times--) {
         auto batch_id = xport->allocateBatchID(1);
         int ret = 0;
-        void *src = allocateMemoryPool(kDataLength, 0, false);
+        void* src = allocateMemoryPool(kDataLength, 0, false);
 
         TransferRequest entry;
         entry.opcode = TransferRequest::READ;
         entry.length = kDataLength;
-        entry.source = (uint8_t *)(src);
+        entry.source = (uint8_t*)(src);
         entry.target_id = segment_id;
         entry.target_offset = offset_2;
         Status s;
@@ -225,7 +243,7 @@ TEST_F(CXLTransportTest, MultipleRead) {
 
         s = xport->freeBatchID(batch_id);
         ASSERT_EQ(s, Status::OK());
-        ret = memcmp((uint8_t *)(src), (uint8_t *)(addr), kDataLength);
+        ret = memcmp((uint8_t*)(src), (uint8_t*)(addr), kDataLength);
         ASSERT_EQ(ret, 0);
 
         freeMemoryPool(src, kDataLength);
@@ -235,7 +253,7 @@ TEST_F(CXLTransportTest, MultipleRead) {
 
 }  // namespace mooncake
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

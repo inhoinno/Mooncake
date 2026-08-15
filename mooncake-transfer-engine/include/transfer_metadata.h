@@ -115,7 +115,12 @@ class TransferMetadata {
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
         // this is for cxl.
         std::string cxl_name;
-        uint64_t cxl_base_addr;
+        uint64_t cxl_base_addr{0};
+        // Stable topology identity and validated extent. Older descriptors do
+        // not contain these fields; readers fall back to cxl_name/zero.
+        std::string cxl_pool_id;
+        uint64_t cxl_map_offset{0};
+        uint64_t cxl_capacity{0};
         // TODO : make these two a union or a std::variant
         std::string timestamp;
         // this is for ascend

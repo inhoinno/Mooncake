@@ -10,6 +10,10 @@ install(FILES transfer_metadata.h DESTINATION include)
 install(FILES ub_allocator.h DESTINATION include)
 install(FILES common/base/status.h DESTINATION include/common/base)
 install(FILES transport/transport.h DESTINATION include/transport)
+if(USE_CXL)
+  install(FILES transport/cxl_transport/cxl_transport.h
+          DESTINATION include/transport/cxl_transport)
+endif()
 
 # Device API headers (header-only, consumed by EP kernel)
 install(FILES transport/device/device_transport.h DESTINATION include/transport/device)

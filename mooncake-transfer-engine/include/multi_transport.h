@@ -70,6 +70,8 @@ class MultiTransport {
     std::vector<Transport *> listTransports();
 
     void *getBaseAddr();
+    size_t getCxlBaseSize();
+    std::string getCxlPoolStatus();
 
    private:
     Status selectTransport(const TransferRequest &entry, Transport *&transport);

@@ -2,6 +2,48 @@
 
 This directory contains benchmark tools for Mooncake Store internals.
 
+## CacheLib Buffer Allocator Microbenchmark
+
+`cachelib_allocator_bench` isolates `CachelibBufferAllocator`, the logical
+allocator Mooncake uses over a mounted client memory segment. It creates one
+real anonymous DRAM mapping, aligns it to CacheLib's slab boundary, and allocates
+configurable fixed-size objects from that fixed address space. It does not
+start Mooncake Master, publish replicas, perform metadata RPCs, or transfer KV
+payloads; those are intentionally outside this allocator-only measurement.
+
+Build and run the four-check preflight:
+
+```bash
+cmake --build build --target cachelib_allocator_bench -j$(nproc)
+./build/mooncake-store/benchmarks/cachelib_allocator_bench --self_test
+```
+
+Or configure, build, preflight, and run the default one-million-object case in
+one command on the Linux lab box:
+
+```bash
+bash scripts/run_cachelib_allocator_bench.sh
+```
+
+The script accepts `CACHELIB_BENCH_NUM_OBJECTS`,
+`CACHELIB_BENCH_OBJECT_SIZE`, `CACHELIB_BENCH_POOL_SIZE_BYTES`, and
+`CACHELIB_BENCH_TOUCH_MEMORY=1`.
+
+Run the requested one-million-object baseline:
+
+```bash
+./build/mooncake-store/benchmarks/cachelib_allocator_bench \
+  --num_objects=1000000 \
+  --object_size=4096 \
+  --pool_size_bytes=8589934592
+```
+
+By default the mapping reserves a real virtual DRAM address range but the
+benchmark measures only allocator bookkeeping. Add `--touch_memory` to write
+every byte and include page commitment/DRAM initialization in the result. The
+output reports successful/failed objects, allocation latency and rate, logical
+bandwidth, deallocation rate, and the allocator's final requested-byte count.
+
 ## Allocation Strategy Benchmark
 
 `allocation_strategy_bench` evaluates Store allocation behavior across segment

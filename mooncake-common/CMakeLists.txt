@@ -7,6 +7,8 @@ if (STORE_USE_K8S_LEASE)
 endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+install(FILES include/cxl_pool_backend.h DESTINATION include)
+install(FILES include/faketract/cxl_pool_backend.h DESTINATION include/faketract)
 add_subdirectory(src)
 
 if (BUILD_UNIT_TESTS)

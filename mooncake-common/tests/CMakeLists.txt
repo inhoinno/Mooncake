@@ -27,3 +27,30 @@ foreach(parser_test ascii_string bool_parser integer_parser)
                                                    gtest_main pthread)
   add_test(NAME ${parser_test}_test COMMAND ${parser_test}_test)
 endforeach()
+
+# TODO 1 CXL pool backend gates are separate executables so preflight,
+# functionality, failure cleanup, and status remain independently reportable.
+foreach(cxl_backend_test preflight functional failure status)
+  set(target_name cxl_pool_backend_${cxl_backend_test}_test)
+  add_executable(
+    ${target_name}
+    cxl_pool_backend/${target_name}.cpp)
+  target_include_directories(
+    ${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cxl_pool_backend)
+  target_link_libraries(${target_name} PUBLIC mooncake_common pthread)
+  add_test(NAME ${target_name} COMMAND ${target_name})
+  set_tests_properties(${target_name} PROPERTIES LABELS "cxl;todo1;t0")
+endforeach()
+
+add_executable(
+  cxl_pool_backend_devdax_test
+  cxl_pool_backend/cxl_pool_backend_devdax_test.cpp)
+target_include_directories(
+  cxl_pool_backend_devdax_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cxl_pool_backend)
+target_link_libraries(cxl_pool_backend_devdax_test PUBLIC mooncake_common
+                                                           pthread)
+add_test(NAME cxl_pool_backend_devdax_test
+         COMMAND cxl_pool_backend_devdax_test)
+set_tests_properties(cxl_pool_backend_devdax_test
+                     PROPERTIES LABELS "cxl;todo1;t2;hardware")
