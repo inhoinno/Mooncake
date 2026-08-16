@@ -64,6 +64,10 @@ The CPU wrapper explicitly disables `USE_NVMEOF`, `USE_MNNVL`,
 `USE_VRAM_SEGMENT`, NCCL device/host, MUSA, and MACA because those cached
 features can enable the GPU device transport or turn CUDA back on.
 
+Wheel staging uses `python3` when the optional `python` compatibility command
+is absent. Set `PYTHON_BIN=/absolute/path/to/python3` to force the interpreter;
+it must match the Python ABI used by CMake for `engine.so` and `store.so`.
+
 The script creates `build-todo1/`, builds and installs the pinned
 `extern/yalantinglibs` submodule into `build-todo1/_deps/` (no `sudo`), enables
 CXL, Store, HTTP metadata, unit tests, and examples, runs every `todo1` CTest

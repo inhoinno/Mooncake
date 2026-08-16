@@ -6,8 +6,28 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
-# Get Python version from environment variable or argument
-PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
+# Select one interpreter and use it throughout the wheel build. Ubuntu may
+# provide python3 without the optional /usr/bin/python compatibility symlink.
+REQUESTED_PYTHON_VERSION=${PYTHON_VERSION:-${1:-}}
+if [ -n "${PYTHON_BIN:-}" ]; then
+    SELECTED_PYTHON="$PYTHON_BIN"
+elif [ -n "$REQUESTED_PYTHON_VERSION" ] && command -v "python${REQUESTED_PYTHON_VERSION}" >/dev/null 2>&1; then
+    SELECTED_PYTHON="python${REQUESTED_PYTHON_VERSION}"
+elif command -v python3 >/dev/null 2>&1; then
+    SELECTED_PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+    SELECTED_PYTHON=python
+else
+    echo "Error: no Python interpreter found; set PYTHON_BIN explicitly" >&2
+    exit 1
+fi
+
+DETECTED_PYTHON_VERSION=$("$SELECTED_PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+if [ -n "$REQUESTED_PYTHON_VERSION" ] && [ "$REQUESTED_PYTHON_VERSION" != "$DETECTED_PYTHON_VERSION" ]; then
+    echo "Error: $SELECTED_PYTHON is Python $DETECTED_PYTHON_VERSION, requested $REQUESTED_PYTHON_VERSION" >&2
+    exit 1
+fi
+PYTHON_VERSION=${REQUESTED_PYTHON_VERSION:-$DETECTED_PYTHON_VERSION}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # CMake build directory (default: build).  EP/PG extensions are staged under
@@ -292,15 +312,10 @@ mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
 if [ "$NPU_BUILD" = "1" ]; then
-    PYTHON_CMD="python${PYTHON_VERSION}"
-    if ! command -v "$PYTHON_CMD" &>/dev/null; then
-        echo "Error: $PYTHON_CMD not found for NPU wheel build"
-        exit 1
-    fi
     max_attempts=3
     attempt=1
     while [ $attempt -le $max_attempts ]; do
-        if "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel numpy; then
+        if "$SELECTED_PYTHON" -m pip install --upgrade pip build setuptools wheel auditwheel numpy; then
             break
         fi
         echo "pip install attempt $attempt/$max_attempts failed, retrying in 5s..."
@@ -311,13 +326,13 @@ if [ "$NPU_BUILD" = "1" ]; then
         echo "Error: pip install failed after $max_attempts attempts"
         exit 1
     fi
-elif command -v pip &>/dev/null; then
-    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
+elif "$SELECTED_PYTHON" -m pip --version >/dev/null 2>&1; then
+    "$SELECTED_PYTHON" -m pip install --upgrade pip build setuptools wheel auditwheel
 elif command -v uv &>/dev/null; then
-    uv pip install --upgrade pip
-    uv pip install build setuptools wheel auditwheel
+    uv pip install --python "$SELECTED_PYTHON" --upgrade pip
+    uv pip install --python "$SELECTED_PYTHON" build setuptools wheel auditwheel
 else
-    echo "Error: Neither python${PYTHON_VERSION}, pip nor uv found"
+    echo "Error: Neither $SELECTED_PYTHON -m pip nor uv is available"
     exit 1
 fi
 
@@ -381,14 +396,12 @@ echo "Using platform tag: $PLATFORM_TAG"
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
 if [ "$NPU_BUILD" = "1" ]; then
-    python${PYTHON_VERSION} -m build --wheel --no-isolation --outdir ${OUTPUT_DIR}
-    AUDITWHEEL_CMD="python${PYTHON_VERSION} -m auditwheel"
+    "$SELECTED_PYTHON" -m build --wheel --no-isolation --outdir ${OUTPUT_DIR}
 else
-    python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR}
-    AUDITWHEEL_CMD="auditwheel"
+    "$SELECTED_PYTHON" -m build --wheel --outdir ${OUTPUT_DIR}
 fi
 
-${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
+"$SELECTED_PYTHON" -m auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
     --exclude libefa.so* \
@@ -489,7 +502,7 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
     if [ -n "$REPAIRED_WHEEL" ]; then
         echo "Injecting CUDA extension .so files into repaired wheel..."
         WHEEL_UNPACK_DIR=$(mktemp -d)
-        python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+        "$SELECTED_PYTHON" -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
         UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
         for so_file in "$CUDA_EP_STAGING_DIR"/*.so; do
             if [ -f "$so_file" ]; then
@@ -498,7 +511,7 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
             fi
         done
         rm "$REPAIRED_WHEEL"
-        python${PYTHON_VERSION} -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+        "$SELECTED_PYTHON" -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
         rm -rf "$WHEEL_UNPACK_DIR"
     fi
 else
@@ -516,7 +529,7 @@ if [ "$NPU_BUILD" = "1" ]; then
     REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
     if [ -n "$REPAIRED_WHEEL" ]; then
         WHEEL_UNPACK_DIR=$(mktemp -d)
-        python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+        "$SELECTED_PYTHON" -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
         UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
         VENDORED_LIBS_DIR=$(find "$UNPACKED_PKG_DIR" -mindepth 1 -maxdepth 1 -type d -name "*.libs" | head -1)
         if [ -n "$VENDORED_LIBS_DIR" ]; then
@@ -540,7 +553,7 @@ if [ "$NPU_BUILD" = "1" ]; then
             exit 1
         fi
         rm "$REPAIRED_WHEEL"
-        python${PYTHON_VERSION} -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+        "$SELECTED_PYTHON" -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
         rm -rf "$WHEEL_UNPACK_DIR"
     fi
 fi
