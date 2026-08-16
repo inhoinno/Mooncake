@@ -99,7 +99,35 @@ set_tests_properties(object_checksum_client_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 add_store_test(rpc_timeout_test rpc_timeout_test.cpp)
 if(USE_CXL)
+  add_test(
+    NAME cxl_allocation_endpoint_test
+    COMMAND
+      allocation_strategy_test
+      --gtest_filter=AllocationStrategyTest.CxlUsesMountedTransferEndpoint:AllocationStrategyTest.RemovingLastAllocatorClearsMountedEndpoint
+  )
+  set_tests_properties(cxl_allocation_endpoint_test
+                       PROPERTIES LABELS "cxl;todo1;t0;unit")
+
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
+  add_test(
+    NAME cxl_client_single_process_test
+    COMMAND
+      cxl_client_integration_test
+      --protocol=cxl
+      --cxl_device_name=${CMAKE_CURRENT_BINARY_DIR}/cxl_client_single_process.pool
+      --cxl_device_size=1073741824
+      --transfer_engine_metadata_url=P2PHANDSHAKE
+      --gtest_filter=ClientIntegrationTestCxl.BasicPutGetOperations:ClientIntegrationTestCxl.BatchPutGetOperations
+  )
+  set_tests_properties(
+    cxl_client_single_process_test
+    PROPERTIES
+      LABELS "cxl;todo1;t0;integration"
+      TIMEOUT 60
+      RESOURCE_LOCK cxl_client_single_process_pool
+      ENVIRONMENT
+        "MC_CXL_PROVIDER=faketract;MC_CXL_BACKEND_KIND=file;MC_CXL_POOL_ID=callosum-single-pool;MOONCAKE_STORE_CHECKSUM=1;DEFAULT_KV_LEASE_TTL=1"
+  )
 endif()
 add_store_test(master_metrics_test master_metrics_test.cpp)
 add_store_test(master_admin_server_test master_admin_server_test.cpp)

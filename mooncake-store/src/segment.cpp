@@ -133,8 +133,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                     << " segment_name=" << segment.name;
                 return ErrorCode::INVALID_PARAMS;
             }
-            segment_manager_->allocator_manager_.addAllocator(segment.name,
-                                                              allocator);
+            segment_manager_->allocator_manager_.addAllocator(
+                segment.name, allocator, segment.te_endpoint);
             segment_manager_->client_segments_[client_id].push_back(segment.id);
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator};
@@ -216,7 +216,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
+    segment_manager_->allocator_manager_.addAllocator(segment.name, allocator,
+                                                      segment.te_endpoint);
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator)};
@@ -1038,7 +1039,8 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                 mounted_segment.status == SegmentStatus::OK &&
                 mounted_segment.buf_allocator) {
                 segment_manager_->allocator_manager_.addAllocator(
-                    name, mounted_segment.buf_allocator);
+                    name, mounted_segment.buf_allocator,
+                    mounted_segment.segment.te_endpoint);
                 break;
             }
         }
@@ -1291,7 +1293,8 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     const bool is_allocatable =
         HasAllocator(allocator_manager, name, allocator);
     if (should_be_allocatable && !is_allocatable && allocator) {
-        allocator_manager.addAllocator(name, allocator);
+        allocator_manager.addAllocator(name, allocator,
+                                       mounted_segment.segment.te_endpoint);
         AddHostSegment(segment_manager_->segments_by_host_,
                        mounted_segment.segment);
     } else if (!should_be_allocatable && is_allocatable) {

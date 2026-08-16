@@ -1,6 +1,7 @@
 .cache
 .vscode
 build
+build-todo1*/
 build_ofed4
 old
 local_test

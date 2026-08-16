@@ -42,11 +42,24 @@ class AllocatorManager {
      * @param allocator the buffer allocator to add for the segment
      */
     void addAllocator(const std::string& name,
-                      const std::shared_ptr<BufferAllocatorBase>& allocator) {
+                      const std::shared_ptr<BufferAllocatorBase>& allocator,
+                      const std::string& transport_endpoint = std::string()) {
         if (!allocators_.contains(name)) {
             names_.push_back(name);
         }
         allocators_[name].push_back(allocator);
+
+        // Most allocators embed their endpoint directly. CXL is different:
+        // one Master-owned allocator is mounted under a client's logical
+        // segment name, while P2PHANDSHAKE may assign that client's Transfer
+        // Engine a different, dynamic endpoint. Preserve that mount binding
+        // independently so allocation policy can still select by logical name
+        // without publishing a stale network address in replica metadata.
+        if (!transport_endpoint.empty()) {
+            transport_endpoints_[name] = transport_endpoint;
+        } else if (!transport_endpoints_.contains(name) && allocator) {
+            transport_endpoints_[name] = allocator->getTransportEndpoint();
+        }
     }
 
     /**
@@ -78,6 +91,7 @@ class AllocatorManager {
         if (it->second.empty()) {
             // If there is no allocator left, remove the name too.
             allocators_.erase(name);
+            transport_endpoints_.erase(name);
             auto name_it = std::find(names_.begin(), names_.end(), name);
             if (name_it != names_.end()) {
                 std::swap(*name_it, names_.back());
@@ -136,6 +150,11 @@ class AllocatorManager {
         }
     }
 
+    std::string getTransportEndpoint(const std::string& name) const {
+        auto it = transport_endpoints_.find(name);
+        return it == transport_endpoints_.end() ? std::string() : it->second;
+    }
+
    private:
     // Name array for randomly picking allocators.
     std::vector<std::string> names_;
@@ -143,6 +162,8 @@ class AllocatorManager {
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BufferAllocatorBase>>>
         allocators_;
+    // Logical segment name -> routable Transfer Engine endpoint.
+    std::unordered_map<std::string, std::string> transport_endpoints_;
     friend class SegmentSerializer;  // for fork serialize
 };
 
@@ -752,6 +773,14 @@ class CxlAllocationStrategy : public AllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
+        const std::string cxl_transport_endpoint =
+            allocator_manager.getTransportEndpoint(cxl_segment_name);
+        if (cxl_transport_endpoint.empty()) {
+            LOG(ERROR) << "No transfer endpoint for CXL segment "
+                       << cxl_segment_name;
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
 
@@ -760,7 +789,7 @@ class CxlAllocationStrategy : public AllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        buffer->change_to_cxl(cxl_segment_name);
+        buffer->change_to_cxl(cxl_transport_endpoint);
         replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING,
                               replica_type);
 

@@ -124,6 +124,45 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
+TEST_F(AllocationStrategyTest, CxlUsesMountedTransferEndpoint) {
+    const std::string logical_segment = "localhost:17813";
+    const std::string transfer_endpoint = "localhost:15487";
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "cxl-pool", DEFAULT_CXL_BASE, 64 * MiB, "/tmp/cxl-pool");
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator(logical_segment, allocator,
+                                   transfer_endpoint);
+
+    CxlAllocationStrategy strategy;
+    auto result =
+        strategy.Allocate(allocator_manager, 4096, 1, {logical_segment});
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+
+    auto descriptor = result->front().get_descriptor();
+    ASSERT_TRUE(descriptor.is_memory_replica());
+    const auto& handle = descriptor.get_memory_descriptor().buffer_descriptor;
+    EXPECT_EQ(handle.protocol_, "cxl");
+    EXPECT_EQ(handle.transport_endpoint_, transfer_endpoint);
+    EXPECT_EQ(handle.buffer_address_, 0u);
+}
+
+TEST_F(AllocationStrategyTest, RemovingLastAllocatorClearsMountedEndpoint) {
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "cxl-pool", DEFAULT_CXL_BASE, 64 * MiB, "/tmp/cxl-pool");
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("logical-segment", allocator,
+                                   "127.0.0.1:12345");
+    ASSERT_EQ(allocator_manager.getTransportEndpoint("logical-segment"),
+              "127.0.0.1:12345");
+
+    ASSERT_TRUE(
+        allocator_manager.removeAllocator("logical-segment", allocator));
+    EXPECT_TRUE(
+        allocator_manager.getTransportEndpoint("logical-segment").empty());
+}
+
 // Test preferred segment allocation when available
 TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentAllocation) {
     auto allocator1 = CreateTestAllocator("segment1", 0);

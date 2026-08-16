@@ -36,21 +36,51 @@ Run this on Linux in an ABI-compatible environment, preferably the same image
 used by the vLLM/LMCache launcher:
 
 ```bash
-git submodule update --init --recursive extern/pybind11 extern/yalantinglibs
-sudo apt-get install -y \
-  libcurl4-openssl-dev libxxhash-dev libzstd-dev libmsgpack-dev \
-  libboost-dev libnuma-dev libibverbs-dev libasio-dev
-MOONCAKE_USE_CUDA=OFF bash scripts/build_todo1_overlay.sh
+bash scripts/bootstrap_todo1_lab.sh
 ```
 
-Use the final line by itself on subsequent CPU-only rebuilds. The default CUDA
-build remains:
+This is the canonical fresh-lab and subsequent CPU rebuild command. It installs
+the complete Ubuntu/Debian dependency manifest, initializes the pinned pybind11
+and yalantinglibs submodules, creates `build-todo1-cpu/.venv`, passes that same
+Python interpreter to CMake and wheel packaging, builds with at most 16 jobs by
+default, runs all TODO#1 tests, and validates the staged overlay and repaired
+wheel. It never writes to system Python, so Ubuntu's PEP 668 policy does not
+require `--break-system-packages`.
+
+Useful diagnostic and restricted modes are:
+
+```bash
+bash scripts/bootstrap_todo1_lab.sh --preflight
+bash scripts/bootstrap_todo1_lab.sh --status
+bash scripts/bootstrap_todo1_lab.sh --skip-apt --skip-submodules
+```
+
+Every invocation records a timestamped transcript in
+`build-todo1-cpu/setup-logs/`; `latest.log` points to the newest one. A failed
+run prints the relevant compiler/CMake lines plus diagnoses for the known lab
+failures: incomplete submodule copies, local yalantinglibs packaging, missing
+yaml-cpp/curl/xxHash headers, missing pybind11, Ninja invoked after a failed
+configure, CUDA cache contamination, incorrect `venv activate`, missing `python`,
+PEP 668, hidden Unicode in pasted environment assignments, and misleading
+warning-only output.
+
+The lower-level CPU build command remains available when dependencies,
+submodules, and a private Python environment have already been prepared:
+
+```bash
+MOONCAKE_USE_CUDA=OFF MOONCAKE_BUILD_DIR=build-todo1-cpu \
+MOONCAKE_BUILD_JOBS=16 PYTHON_BIN="$PWD/build-todo1-cpu/.venv/bin/python" \
+bash scripts/build_todo1_overlay.sh
+```
+
+The default CUDA build remains:
 
 ```bash
 bash scripts/build_todo1_overlay.sh
 ```
 
-Keep CPU-only and CUDA configurations in separate build directories. If an
+Keep CPU-only and CUDA configurations in separate build directories. The
+bootstrap enforces this by using `build-todo1-cpu`. If an
 existing cache unexpectedly compiles `device/p2p_device_transport.cpp` during
 an `MOONCAKE_USE_CUDA=OFF` build, preserve it for inspection and start a clean
 CPU graph without deleting anything:
@@ -117,13 +147,49 @@ unregistered provider fails closed. It never falls back to FakeTraCT.
 After building:
 
 ```bash
-ctest --test-dir build-todo1 --output-on-failure -L todo1
+ctest --test-dir build-todo1-cpu --output-on-failure -L todo1 -LE hardware
 ```
 
-The four T0 tests independently cover preflight/provider selection, functional
-allocation and checksum, failure cleanup, and status. The device-DAX test skips
-unless `MC_CXL_DEV_PATH` names `/dev/dax*`; run it only against a dedicated
-test extent whose contents may be modified.
+The four T0 backend-contract tests independently cover preflight/provider
+selection, functional allocation and checksum, failure cleanup, and status.
+The endpoint-projection unit gate and Store integration gate add two more T0
+CTest targets. The device-DAX test skips unless `MC_CXL_DEV_PATH` names
+`/dev/dax*`; run it only against a dedicated test extent whose contents may be
+modified. Hardware is excluded from the bootstrap and must be requested
+explicitly:
+
+```bash
+MC_CXL_PROVIDER=faketract MC_CXL_BACKEND_KIND=devdax \
+MC_CXL_POOL_ID=rack0-pool0 MC_CXL_TEST_DESTRUCTIVE=1 \
+MC_CXL_DEV_PATH=/dev/dax0.0 MC_CXL_DEV_SIZE=<device-bytes> \
+ctest --test-dir build-todo1-cpu --output-on-failure -V \
+  -R '^cxl_pool_backend_devdax_test$'
+```
+
+### Single-process Mooncake Store integration
+
+The shortest real Store integration starts an in-process Master, mounts a
+file-backed FakeTraCT pool, runs Put/Get and BatchPut/BatchGet through
+`CxlTransport`, and validates payload checksums:
+
+```bash
+bash scripts/run_todo1_single_cxl_test.sh
+```
+
+The runner resolves the binary relative to the repository, so it works from any
+current directory. It creates a unique disposable `/tmp` file and the test
+unlinks that file during teardown; no manual `truncate` is required. Override
+`MOONCAKE_BUILD_DIR` when the binary is in another build tree. To request a
+specific disposable regular file, set `MC_CXL_TEST_FILE=/tmp/randomfile`; the
+file will be truncated and unlinked. Device nodes are rejected because this is
+the T0 file-backed gate, not the destructive T2 devdax test.
+
+The same two cases are registered as `cxl_client_single_process_test` with the
+`todo1` CTest label. A TODO#1 bootstrap is not green unless this complete path
+passes. In `P2PHANDSHAKE` mode, Mooncake keeps the logical segment name for
+placement but publishes the dynamically bound Transfer Engine endpoint in the
+replica descriptor; otherwise Put would connect to the logical port and fail
+with `TRANSFER_FAIL`/`ECONNREFUSED`.
 
 ## Minimal standalone CXL startup
 

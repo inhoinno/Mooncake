@@ -137,7 +137,7 @@ fi
 echo "[build] source=$repo_dir build=$build_dir jobs=$build_jobs USE_CUDA=$use_cuda"
 cmake "${cmake_args[@]}"
 cmake --build "$build_dir" --parallel "$build_jobs"
-ctest --test-dir "$build_dir" --output-on-failure -L todo1
+ctest --test-dir "$build_dir" --output-on-failure -L todo1 -LE hardware
 
 (
   cd "$repo_dir"
