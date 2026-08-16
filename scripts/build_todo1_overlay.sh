@@ -108,6 +108,24 @@ cmake_args=(
   -Dyalantinglibs_DIR="$ylt_config_dir"
 )
 
+# Mooncake can turn USE_CUDA back on when any of these cached features is ON.
+# A CPU-only TODO#1 build must exclude the CUDA device transport completely;
+# otherwise older CUDA headers fail on fabric-handle symbols even though the
+# caller explicitly supplied MOONCAKE_USE_CUDA=OFF.
+case "$use_cuda" in
+  OFF|off|FALSE|false|NO|no|0)
+    cmake_args+=(
+      -DUSE_NVMEOF=OFF
+      -DUSE_MNNVL=OFF
+      -DUSE_VRAM_SEGMENT=OFF
+      -DUSE_NCCL_DEVICE=OFF
+      -DUSE_NCCL_HOST=OFF
+      -DUSE_MUSA=OFF
+      -DUSE_MACA=OFF
+    )
+    ;;
+esac
+
 if [ ! -f "$build_dir/CMakeCache.txt" ] && command -v ninja >/dev/null 2>&1; then
   cmake_args+=( -G Ninja )
 fi

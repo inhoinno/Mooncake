@@ -50,6 +50,20 @@ build remains:
 bash scripts/build_todo1_overlay.sh
 ```
 
+Keep CPU-only and CUDA configurations in separate build directories. If an
+existing cache unexpectedly compiles `device/p2p_device_transport.cpp` during
+an `MOONCAKE_USE_CUDA=OFF` build, preserve it for inspection and start a clean
+CPU graph without deleting anything:
+
+```bash
+MOONCAKE_USE_CUDA=OFF MOONCAKE_BUILD_DIR=build-todo1-cpu \
+MOONCAKE_BUILD_JOBS=16 bash scripts/build_todo1_overlay.sh
+```
+
+The CPU wrapper explicitly disables `USE_NVMEOF`, `USE_MNNVL`,
+`USE_VRAM_SEGMENT`, NCCL device/host, MUSA, and MACA because those cached
+features can enable the GPU device transport or turn CUDA back on.
+
 The script creates `build-todo1/`, builds and installs the pinned
 `extern/yalantinglibs` submodule into `build-todo1/_deps/` (no `sudo`), enables
 CXL, Store, HTTP metadata, unit tests, and examples, runs every `todo1` CTest
