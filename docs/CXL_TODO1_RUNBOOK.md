@@ -166,6 +166,27 @@ ctest --test-dir build-todo1-cpu --output-on-failure -V \
   -R '^cxl_pool_backend_devdax_test$'
 ```
 
+### Allocator-only diagnostic benchmark
+
+The isolated Cachelib allocator benchmark uses anonymous DRAM and measures the
+current Mooncake Master-side logical allocator. It does not measure FakeTraCT,
+TraCT, device-DAX, or CXL bandwidth:
+
+```bash
+CACHELIB_BENCH_NUM_OBJECTS=1000000 \
+CACHELIB_BENCH_OBJECT_SIZE=4096 \
+CACHELIB_BENCH_POOL_SIZE_BYTES=8589934592 \
+bash scripts/run_cachelib_allocator_bench.sh
+```
+
+Set `CACHELIB_BENCH_TOUCH_MEMORY=1` to include one `memset` per successful
+allocation. The runner first reuses the pinned `yalantinglibs` package installed
+by `build-todo1-cpu`; if it is absent, the runner builds and installs the pinned
+submodule under `build-cachelib-bench/_deps`. An explicit
+`MOONCAKE_YALANTINGLIBS_DIR` always takes precedence. The runner also forces all
+known CUDA-triggering options off so a stale cache cannot compile device
+transports into this CPU-only allocator probe.
+
 ### Single-process Mooncake Store integration
 
 The shortest real Store integration starts an in-process Master, mounts a
