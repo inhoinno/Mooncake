@@ -3407,7 +3407,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 << "component=mooncake_store event=gpu_read_path "
                    "api=get_into protocol="
                 << replica.get_memory_descriptor().buffer_descriptor.protocol_
-                << " path=" << ToString(gpu_path) << " bytes=" << length;
+                << " path=" << ToString(gpu_path) << " bytes=" << size;
         }
         if (destination_is_gpu && (gpu_path == GpuReadPath::kRdmaHostStaged ||
                                    client_->IsHotCacheEnabled())) {
@@ -3557,7 +3557,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         LOG(INFO) << "component=mooncake_store event=gpu_read_path "
                      "api=get_into_partial protocol="
                   << replica.get_memory_descriptor().buffer_descriptor.protocol_
-                  << " path=" << ToString(gpu_path) << " bytes=" << length;
+                  << " path=" << ToString(gpu_path) << " bytes=" << size;
     }
     if (destination_is_gpu && gpu_path == GpuReadPath::kRdmaHostStaged) {
         if (!client_buffer_allocator_) {
