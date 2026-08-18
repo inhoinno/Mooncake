@@ -304,6 +304,11 @@ class MasterService {
         uint64_t size_bytes{0};
         std::string te_endpoint;
         std::string protocol;
+        bool cxl_master_managed_allocation{false};
+        std::string cxl_pool_id;
+        uint64_t cxl_pool_capacity_bytes{0};
+        uint64_t cxl_owned_offset_bytes{0};
+        uint64_t cxl_owned_capacity_bytes{0};
         SegmentStatus status{SegmentStatus::UNDEFINED};
         uint64_t allocator_used_bytes{0};
         uint64_t allocator_capacity_bytes{0};

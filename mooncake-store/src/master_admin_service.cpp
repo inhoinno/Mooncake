@@ -680,6 +680,11 @@ struct HttpSegmentDetailItem {
     std::string size_human;
     std::string te_endpoint;
     std::string protocol;
+    bool cxl_master_managed_allocation{false};
+    std::string cxl_pool_id;
+    uint64_t cxl_pool_capacity_bytes{0};
+    uint64_t cxl_owned_offset_bytes{0};
+    uint64_t cxl_owned_capacity_bytes{0};
     std::string status;
     uint64_t allocator_used_bytes{0};
     uint64_t allocator_capacity_bytes{0};
@@ -687,8 +692,9 @@ struct HttpSegmentDetailItem {
 };
 YLT_REFL(HttpSegmentDetailItem, segment_name, segment_id, client_id,
          base_address, size_bytes, size_human, te_endpoint, protocol, status,
-         allocator_used_bytes, allocator_capacity_bytes,
-         allocator_usage_percent);
+         cxl_master_managed_allocation, cxl_pool_id, cxl_pool_capacity_bytes,
+         cxl_owned_offset_bytes, cxl_owned_capacity_bytes, allocator_used_bytes,
+         allocator_capacity_bytes, allocator_usage_percent);
 
 struct HttpSegmentsDetailResponse {
     uint64_t total_segments{0};
@@ -715,9 +721,13 @@ void MasterAdminServer::HandleGetSegmentsDetail(
             item.segment_id = UuidToString(info.segment_id);
             item.client_id = UuidToString(info.client_id);
 
-            std::ostringstream addr_oss;
-            addr_oss << "0x" << std::hex << info.base_address;
-            item.base_address = addr_oss.str();
+            if (info.cxl_master_managed_allocation) {
+                item.base_address = "<process-local-redacted>";
+            } else {
+                std::ostringstream addr_oss;
+                addr_oss << "0x" << std::hex << info.base_address;
+                item.base_address = addr_oss.str();
+            }
 
             item.size_bytes = info.size_bytes;
             std::ostringstream size_oss;
@@ -726,6 +736,12 @@ void MasterAdminServer::HandleGetSegmentsDetail(
 
             item.te_endpoint = info.te_endpoint;
             item.protocol = info.protocol;
+            item.cxl_master_managed_allocation =
+                info.cxl_master_managed_allocation;
+            item.cxl_pool_id = info.cxl_pool_id;
+            item.cxl_pool_capacity_bytes = info.cxl_pool_capacity_bytes;
+            item.cxl_owned_offset_bytes = info.cxl_owned_offset_bytes;
+            item.cxl_owned_capacity_bytes = info.cxl_owned_capacity_bytes;
             item.status = EnumToString(info.status);
             item.allocator_used_bytes = info.allocator_used_bytes;
             item.allocator_capacity_bytes = info.allocator_capacity_bytes;

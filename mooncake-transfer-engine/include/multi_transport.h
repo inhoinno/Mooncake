@@ -71,6 +71,10 @@ class MultiTransport {
 
     void *getBaseAddr();
     size_t getCxlBaseSize();
+    std::string getCxlPoolId();
+    size_t getCxlOwnedOffset();
+    size_t getCxlOwnedSize();
+    bool isCxlAllocationMasterManaged();
     std::string getCxlPoolStatus();
 
    private:

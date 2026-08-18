@@ -415,6 +415,14 @@ class Replica {
         return true;
     }
 
+    bool set_memory_protocol(std::string protocol) {
+        if (!is_memory_replica()) return false;
+        auto& buffer = std::get<MemoryReplicaData>(data_).buffer;
+        if (!buffer) return false;
+        buffer->set_protocol(std::move(protocol));
+        return true;
+    }
+
     [[nodiscard]] bool has_invalid_nof_handle() const {
         if (is_nof_replica()) {
             const auto& nof_data = std::get<NoFReplicaData>(data_);

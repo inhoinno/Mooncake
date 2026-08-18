@@ -44,6 +44,15 @@ every byte and include page commitment/DRAM initialization in the result. The
 output reports successful/failed objects, allocation latency and rate, logical
 bandwidth, deallocation rate, and the allocator's final requested-byte count.
 
+Interpret the timing fields separately. `mean_ns`, `p50_ns`, and `p99_ns` time
+only the `CachelibBufferAllocator::allocate()` call. `elapsed_ms`,
+`objects_per_second`, and `logical_gbps` cover the complete allocation loop and
+therefore include `memset` when `--touch_memory` is enabled. Consequently, a
+touched run can retain nearly identical allocator percentiles while reporting
+much lower end-to-end throughput. The touched logical GB/s is a single-threaded
+first-write rate over anonymous DRAM, including allocation and page commitment;
+it is not an isolated DRAM read/write result and is not CXL bandwidth.
+
 ## Allocation Strategy Benchmark
 
 `allocation_strategy_bench` evaluates Store allocation behavior across segment

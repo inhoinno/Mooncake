@@ -305,6 +305,18 @@ void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
 
 size_t TransferEngine::getCxlBaseSize() { return impl_->getCxlBaseSize(); }
 
+std::string TransferEngine::getCxlPoolId() { return impl_->getCxlPoolId(); }
+
+size_t TransferEngine::getCxlOwnedOffset() {
+    return impl_->getCxlOwnedOffset();
+}
+
+size_t TransferEngine::getCxlOwnedSize() { return impl_->getCxlOwnedSize(); }
+
+bool TransferEngine::isCxlAllocationMasterManaged() {
+    return impl_->isCxlAllocationMasterManaged();
+}
+
 std::string TransferEngine::getCxlPoolStatus() {
     return impl_->getCxlPoolStatus();
 }
@@ -887,6 +899,22 @@ void* TransferEngine::getBaseAddr() {
 
 size_t TransferEngine::getCxlBaseSize() {
     return use_tent_ ? 0 : impl_->getCxlBaseSize();
+}
+
+std::string TransferEngine::getCxlPoolId() {
+    return use_tent_ ? std::string() : impl_->getCxlPoolId();
+}
+
+size_t TransferEngine::getCxlOwnedOffset() {
+    return use_tent_ ? 0 : impl_->getCxlOwnedOffset();
+}
+
+size_t TransferEngine::getCxlOwnedSize() {
+    return use_tent_ ? 0 : impl_->getCxlOwnedSize();
+}
+
+bool TransferEngine::isCxlAllocationMasterManaged() {
+    return !use_tent_ && impl_->isCxlAllocationMasterManaged();
 }
 
 std::string TransferEngine::getCxlPoolStatus() {

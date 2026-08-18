@@ -263,6 +263,10 @@ class TransferEngine {
 
     void* getBaseAddr();
     size_t getCxlBaseSize();
+    std::string getCxlPoolId();
+    size_t getCxlOwnedOffset();
+    size_t getCxlOwnedSize();
+    bool isCxlAllocationMasterManaged();
     std::string getCxlPoolStatus();
 
     void setWhitelistFilters(std::vector<std::string>&& filters);

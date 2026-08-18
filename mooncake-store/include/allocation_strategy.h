@@ -43,7 +43,8 @@ class AllocatorManager {
      */
     void addAllocator(const std::string& name,
                       const std::shared_ptr<BufferAllocatorBase>& allocator,
-                      const std::string& transport_endpoint = std::string()) {
+                      const std::string& transport_endpoint = std::string(),
+                      const std::string& protocol = std::string()) {
         if (!allocators_.contains(name)) {
             names_.push_back(name);
         }
@@ -60,6 +61,7 @@ class AllocatorManager {
         } else if (!transport_endpoints_.contains(name) && allocator) {
             transport_endpoints_[name] = allocator->getTransportEndpoint();
         }
+        if (!protocol.empty()) protocols_[name] = protocol;
     }
 
     /**
@@ -92,6 +94,7 @@ class AllocatorManager {
             // If there is no allocator left, remove the name too.
             allocators_.erase(name);
             transport_endpoints_.erase(name);
+            protocols_.erase(name);
             auto name_it = std::find(names_.begin(), names_.end(), name);
             if (name_it != names_.end()) {
                 std::swap(*name_it, names_.back());
@@ -155,6 +158,11 @@ class AllocatorManager {
         return it == transport_endpoints_.end() ? std::string() : it->second;
     }
 
+    std::string getProtocol(const std::string& name) const {
+        auto it = protocols_.find(name);
+        return it == protocols_.end() ? std::string() : it->second;
+    }
+
    private:
     // Name array for randomly picking allocators.
     std::vector<std::string> names_;
@@ -164,6 +172,9 @@ class AllocatorManager {
         allocators_;
     // Logical segment name -> routable Transfer Engine endpoint.
     std::unordered_map<std::string, std::string> transport_endpoints_;
+    // Logical segment name -> data-plane protocol. Allocation policy uses
+    // this to keep CXL's offset descriptors out of normal pointer allocators.
+    std::unordered_map<std::string, std::string> protocols_;
     friend class SegmentSerializer;  // for fork serialize
 };
 
@@ -801,8 +812,105 @@ class CxlAllocationStrategy : public AllocationStrategy {
     tl::expected<Replica, ErrorCode> AllocateFrom(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const std::string& segment_name) {
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        auto result =
+            Allocate(allocator_manager, slice_length, 1, {segment_name});
+        if (!result) return tl::make_unexpected(result.error());
+        return std::move(result->front());
     }
+};
+
+// Routes explicitly CXL-preferred writes through CxlAllocationStrategy while
+// retaining the configured strategy for ordinary DRAM/RDMA segments. This is
+// required for one Master to host objects on both source types: a normal
+// strategy must never return a synthetic CXL pointer without offset
+// projection, and CxlAllocationStrategy must not consume an RDMA segment.
+class CxlAwareAllocationStrategy final : public AllocationStrategy {
+   public:
+    explicit CxlAwareAllocationStrategy(
+        std::shared_ptr<AllocationStrategy> fallback)
+        : fallback_(std::move(fallback)) {}
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments = {},
+        const std::set<std::string>& excluded_segments = {},
+        const ReplicaType replica_type = ReplicaType::MEMORY) override {
+        return AllocateImpl(allocator_manager, slice_length, replica_num,
+                            preferred_segments, excluded_segments, replica_type,
+                            nullptr);
+    }
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num,
+        const std::vector<std::string>& preferred_segments,
+        const std::set<std::string>& excluded_segments,
+        const ReplicaType replica_type,
+        const SsdMetricsProvider* ssd_provider) override {
+        return AllocateImpl(allocator_manager, slice_length, replica_num,
+                            preferred_segments, excluded_segments, replica_type,
+                            ssd_provider);
+    }
+
+    tl::expected<Replica, ErrorCode> AllocateFrom(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const std::string& segment_name) override {
+        if (allocator_manager.getProtocol(segment_name) == "cxl") {
+            return cxl_.AllocateFrom(allocator_manager, slice_length,
+                                     segment_name);
+        }
+        auto result = fallback_->AllocateFrom(allocator_manager, slice_length,
+                                              segment_name);
+        if (result) {
+            const auto protocol = allocator_manager.getProtocol(segment_name);
+            if (!protocol.empty()) result->set_memory_protocol(protocol);
+        }
+        return result;
+    }
+
+   private:
+    tl::expected<std::vector<Replica>, ErrorCode> AllocateImpl(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num,
+        const std::vector<std::string>& preferred_segments,
+        const std::set<std::string>& excluded_segments,
+        const ReplicaType replica_type,
+        const SsdMetricsProvider* ssd_provider) {
+        if (!preferred_segments.empty() &&
+            allocator_manager.getProtocol(preferred_segments.front()) ==
+                "cxl") {
+            return cxl_.Allocate(allocator_manager, slice_length, replica_num,
+                                 preferred_segments, excluded_segments,
+                                 replica_type);
+        }
+
+        std::set<std::string> network_exclusions = excluded_segments;
+        for (const auto& name : allocator_manager.getNames()) {
+            if (allocator_manager.getProtocol(name) == "cxl") {
+                network_exclusions.insert(name);
+            }
+        }
+        auto result = fallback_->Allocate(
+            allocator_manager, slice_length, replica_num, preferred_segments,
+            network_exclusions, replica_type, ssd_provider);
+        if (!result) return result;
+        for (auto& replica : result.value()) {
+            const auto segment_names = replica.get_segment_names();
+            if (segment_names.empty() || !segment_names.front().has_value()) {
+                continue;
+            }
+            const auto protocol =
+                allocator_manager.getProtocol(*segment_names.front());
+            if (!protocol.empty()) {
+                replica.set_memory_protocol(protocol);
+            }
+        }
+        return result;
+    }
+
+    std::shared_ptr<AllocationStrategy> fallback_;
+    CxlAllocationStrategy cxl_;
 };
 
 /**

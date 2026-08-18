@@ -1441,6 +1441,13 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
 TransferStrategy TransferSubmitter::selectStrategy(
     const AllocatedBuffer::Descriptor& handle,
     const std::vector<Slice>& /* slices */) const {
+    // CXL descriptors carry a pool-relative offset, not a process virtual
+    // address. Even when the endpoint is local, only CxlTransport may resolve
+    // that offset against the local mapping (and select CUDA copy for a GPU
+    // destination). Treating it as LOCAL_MEMCPY would dereference the offset.
+    if (handle.protocol_ == "cxl") {
+        return TransferStrategy::TRANSFER_ENGINE;
+    }
     return canUseLocalMemcpy(handle.transport_endpoint_)
                ? TransferStrategy::LOCAL_MEMCPY
                : TransferStrategy::TRANSFER_ENGINE;

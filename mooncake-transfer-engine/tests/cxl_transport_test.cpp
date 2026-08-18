@@ -18,12 +18,18 @@
 #include <sys/time.h>
 
 #include <cstdlib>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <vector>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+
+#ifdef USE_CUDA
+#include <cuda_runtime_api.h>
+#endif
 
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -250,6 +256,69 @@ TEST_F(CXLTransportTest, MultipleRead) {
     }
     engine->unregisterLocalMemory(addr);
 }
+
+#ifdef USE_CUDA
+TEST_F(CXLTransportTest, FunctionalCxlToGpuAndGpuToCxl) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        cudaGetLastError();
+        GTEST_SKIP() << "CUDA device is not available";
+    }
+
+    auto transfer_and_wait = [&](TransferRequest request) {
+        auto batch_id = xport->allocateBatchID(1);
+        EXPECT_TRUE(engine->submitTransfer(batch_id, {request}).ok());
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        do {
+            EXPECT_TRUE(xport->getTransferStatus(batch_id, 0, status).ok());
+            if (std::chrono::steady_clock::now() >= deadline) {
+                ADD_FAILURE() << "CXL CUDA transfer timed out";
+                break;
+            }
+        } while (status.s == TransferStatusEnum::WAITING ||
+                 status.s == TransferStatusEnum::PENDING);
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_TRUE(xport->freeBatchID(batch_id).ok());
+    };
+
+    for (size_t i = 0; i < kDataLength; ++i) addr[i] = i % 251;
+    transfer_and_wait(TransferRequest{.opcode = TransferRequest::WRITE,
+                                      .source = addr,
+                                      .target_id = segment_id,
+                                      .target_offset = offset_1,
+                                      .length = kDataLength});
+
+    void* gpu_buffer = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_buffer, kDataLength), cudaSuccess);
+    ASSERT_EQ(cudaMemset(gpu_buffer, 0, kDataLength), cudaSuccess);
+    transfer_and_wait(TransferRequest{.opcode = TransferRequest::READ,
+                                      .source = gpu_buffer,
+                                      .target_id = segment_id,
+                                      .target_offset = offset_1,
+                                      .length = kDataLength});
+
+    std::vector<uint8_t> observed(kDataLength);
+    ASSERT_EQ(cudaMemcpy(observed.data(), gpu_buffer, kDataLength,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(std::memcmp(observed.data(), addr, kDataLength), 0);
+
+    for (size_t i = 0; i < kDataLength; ++i) observed[i] = (i * 7) % 251;
+    ASSERT_EQ(cudaMemcpy(gpu_buffer, observed.data(), kDataLength,
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+    transfer_and_wait(TransferRequest{.opcode = TransferRequest::WRITE,
+                                      .source = gpu_buffer,
+                                      .target_id = segment_id,
+                                      .target_offset = offset_1,
+                                      .length = kDataLength});
+    EXPECT_EQ(std::memcmp(base_addr + offset_1, observed.data(), kDataLength),
+              0);
+    EXPECT_EQ(cudaFree(gpu_buffer), cudaSuccess);
+}
+#endif
 
 }  // namespace mooncake
 

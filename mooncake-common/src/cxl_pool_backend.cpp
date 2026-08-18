@@ -40,6 +40,7 @@ namespace {
 constexpr std::uint64_t kDefaultDevDaxAlignment = 2ULL * 1024 * 1024;
 constexpr std::uint64_t kDefaultAllocationAlignment = 64;
 constexpr std::string_view kFakeTraCTProvider = "faketract";
+constexpr std::string_view kMooncakeProvider = "mooncake";
 
 using CxlPoolBackendProviderRegistry =
     std::unordered_map<std::string, CxlPoolBackendProviderFactory>;
@@ -247,6 +248,8 @@ class MmapCxlPoolBackend final
         status_.mapping_offset = config_.mapping_offset;
         status_.mapping_alignment = config_.mapping_alignment;
         status_.allocation_alignment = config_.allocation_alignment;
+        status_.owned_offset = config_.owned_offset;
+        status_.owned_capacity = config_.owned_capacity;
         status_.lifecycle = "ready";
         status_.last_operation = "open";
         status_.last_result = "ok";
@@ -605,6 +608,115 @@ void MmapCxlAllocation::abort() noexcept {
 
 }  // namespace faketract
 
+namespace {
+
+// Mapping-only backend for the Mooncake-owned CXL topology. Unlike
+// FakeTraCT, this object intentionally has no object index and no extent
+// allocator: Mooncake Master owns both through SegmentManager and its replica
+// metadata. The backend's sole data-plane job is safe shared-pool offset
+// translation for CxlTransport.
+class MooncakeMmapCxlPoolBackend final : public CxlPoolBackend {
+   public:
+    MooncakeMmapCxlPoolBackend(CxlPoolConfig config, int fd, void* base)
+        : config_(std::move(config)), fd_(fd), base_(base) {
+        status_.provider = std::string(kMooncakeProvider);
+        status_.logical_pool_id = config_.logical_pool_id;
+        status_.backend_kind = config_.backend_kind;
+        status_.path = config_.path;
+        status_.capacity = config_.capacity;
+        status_.mapping_offset = config_.mapping_offset;
+        status_.mapping_alignment = config_.mapping_alignment;
+        status_.allocation_alignment = config_.allocation_alignment;
+        status_.owned_offset = config_.owned_offset;
+        status_.owned_capacity = config_.owned_capacity;
+        status_.lifecycle = "ready";
+        status_.last_operation = "open";
+        status_.last_result = "ok";
+    }
+
+    ~MooncakeMmapCxlPoolBackend() override {
+        if (base_ != nullptr && base_ != MAP_FAILED && config_.capacity != 0) {
+            ::munmap(base_, static_cast<std::size_t>(config_.capacity));
+        }
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+
+    const CxlPoolConfig& config() const noexcept override { return config_; }
+    void* base() const noexcept override { return base_; }
+
+    void* resolve(std::uint64_t offset, std::uint64_t length,
+                  CxlPoolError* error) const override {
+        ClearError(error);
+        if (base_ == nullptr || base_ == MAP_FAILED) {
+            SetError(error, CxlPoolErrorCode::kBackendClosed, "resolve",
+                     "backend", "CXL pool mapping is not open");
+            return nullptr;
+        }
+        if (offset > config_.capacity || length > config_.capacity - offset) {
+            SetError(error, CxlPoolErrorCode::kOutOfBounds, "resolve", "extent",
+                     "offset and length exceed CXL pool capacity");
+            return nullptr;
+        }
+        return static_cast<char*>(base_) + offset;
+    }
+
+    bool contains(const void* address,
+                  std::uint64_t length) const noexcept override {
+        if (address == nullptr || base_ == nullptr || base_ == MAP_FAILED) {
+            return false;
+        }
+        const auto base_value = reinterpret_cast<std::uintptr_t>(base_);
+        const auto address_value = reinterpret_cast<std::uintptr_t>(address);
+        if (address_value < base_value) {
+            return false;
+        }
+        const std::uint64_t offset = address_value - base_value;
+        return offset <= config_.capacity &&
+               length <= config_.capacity - offset;
+    }
+
+    std::optional<std::uint64_t> offset_of(const void* address,
+                                           std::uint64_t length,
+                                           CxlPoolError* error) const override {
+        ClearError(error);
+        if (!contains(address, length)) {
+            SetError(error, CxlPoolErrorCode::kOutOfBounds, "offset_of",
+                     "extent", "address range exceeds CXL pool capacity");
+            return std::nullopt;
+        }
+        return reinterpret_cast<std::uintptr_t>(address) -
+               reinterpret_cast<std::uintptr_t>(base_);
+    }
+
+    CxlLookupResult metadata_lookup(std::string_view,
+                                    CxlPoolError* error) const override {
+        SetError(error, CxlPoolErrorCode::kUnsupportedBackend,
+                 "metadata_lookup", "ownership",
+                 "Mooncake Master owns CXL object metadata");
+        return std::nullopt;
+    }
+
+    std::unique_ptr<CxlAllocation> alloc(std::string_view, std::uint64_t,
+                                         CxlPoolError* error) override {
+        SetError(error, CxlPoolErrorCode::kUnsupportedBackend, "alloc",
+                 "ownership", "Mooncake Master owns CXL extent allocation");
+        return nullptr;
+    }
+
+    CxlPoolStatusSnapshot status() const override { return status_; }
+    bool master_managed_allocation() const noexcept override { return true; }
+
+   private:
+    CxlPoolConfig config_;
+    int fd_{-1};
+    void* base_{nullptr};
+    CxlPoolStatusSnapshot status_;
+};
+
+}  // namespace
+
 const char* ToString(CxlPoolBackendKind kind) noexcept {
     switch (kind) {
         case CxlPoolBackendKind::kFile:
@@ -728,6 +840,22 @@ bool LoadCxlPoolConfigFromEnvironment(CxlPoolConfig* config,
     parsed.allocation_alignment =
         allocation_alignment.value_or(kDefaultAllocationAlignment);
 
+    const auto owned_offset =
+        ParseUnsignedEnvironment("MC_CXL_OWNED_OFFSET", false, &parse_error);
+    if (parse_error) {
+        if (error != nullptr) *error = std::move(parse_error);
+        return false;
+    }
+    parsed.owned_offset = owned_offset.value_or(0);
+
+    const auto owned_capacity =
+        ParseUnsignedEnvironment("MC_CXL_OWNED_SIZE", false, &parse_error);
+    if (parse_error) {
+        if (error != nullptr) *error = std::move(parse_error);
+        return false;
+    }
+    parsed.owned_capacity = owned_capacity.value_or(0);
+
     *config = std::move(parsed);
     return ValidateCxlPoolConfig(*config, error);
 }
@@ -793,6 +921,30 @@ bool ValidateCxlPoolConfig(const CxlPoolConfig& config, CxlPoolError* error) {
                  "capacity", "mapping offset plus capacity overflows");
         return false;
     }
+    if (config.owned_capacity == 0 && config.owned_offset != 0) {
+        SetError(error, CxlPoolErrorCode::kInvalidConfig, "validate_config",
+                 "owned_capacity",
+                 "owned offset requires a non-zero owned capacity");
+        return false;
+    }
+    if (config.owned_capacity != 0) {
+        if (config.owned_offset % config.allocation_alignment != 0 ||
+            config.owned_capacity % config.allocation_alignment != 0) {
+            SetError(error, CxlPoolErrorCode::kInvalidConfig, "validate_config",
+                     "owned_extent",
+                     "owned offset and capacity must be allocation aligned");
+            return false;
+        }
+        if (AddOverflows(config.owned_offset, config.owned_capacity) ||
+            (config.capacity != 0 &&
+             (config.owned_offset > config.capacity ||
+              config.owned_capacity > config.capacity - config.owned_offset))) {
+            SetError(error, CxlPoolErrorCode::kInvalidConfig, "validate_config",
+                     "owned_extent",
+                     "owned extent exceeds the mapped CXL pool");
+            return false;
+        }
+    }
     return true;
 }
 
@@ -807,6 +959,8 @@ std::string CxlPoolStatusSnapshot::ToJson() const {
            << ",\"mapping_offset\":" << mapping_offset
            << ",\"mapping_alignment\":" << mapping_alignment
            << ",\"allocation_alignment\":" << allocation_alignment
+           << ",\"owned_offset\":" << owned_offset
+           << ",\"owned_capacity\":" << owned_capacity
            << ",\"reserved_bytes\":" << reserved_bytes
            << ",\"committed_bytes\":" << committed_bytes
            << ",\"active_reservations\":" << active_reservations
@@ -914,6 +1068,102 @@ std::shared_ptr<CxlPoolBackend> OpenMmapCxlPoolBackendFromEnvironment(
 
 }  // namespace faketract
 
+namespace {
+
+std::shared_ptr<CxlPoolBackend> OpenMooncakeMmapCxlPoolBackend(
+    CxlPoolConfig config, CxlPoolError* error) {
+    ClearError(error);
+    if (!ValidateCxlPoolConfig(config, error)) {
+        return nullptr;
+    }
+    if (config.capacity == 0) {
+        auto discovered = DiscoverDevDaxSize(config.path, error);
+        if (!discovered.has_value()) {
+            return nullptr;
+        }
+        if (*discovered <= config.mapping_offset) {
+            SetError(error, CxlPoolErrorCode::kInvalidConfig, "open",
+                     "mapping_offset",
+                     "mapping offset is outside discovered devdax capacity");
+            return nullptr;
+        }
+        config.capacity = *discovered - config.mapping_offset;
+        if (!ValidateCxlPoolConfig(config, error)) {
+            return nullptr;
+        }
+    }
+    if (config.owned_capacity == 0) {
+        SetError(error, CxlPoolErrorCode::kInvalidConfig, "open_backend",
+                 "MC_CXL_OWNED_SIZE",
+                 "the Mooncake provider requires a non-zero owned extent");
+        return nullptr;
+    }
+    if (config.capacity > std::numeric_limits<std::size_t>::max() ||
+        config.mapping_offset >
+            static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+        SetError(error, CxlPoolErrorCode::kInvalidConfig, "open", "extent",
+                 "mapping extent is not representable on this platform");
+        return nullptr;
+    }
+
+    const int fd = ::open(config.path.c_str(), O_RDWR);
+    if (fd < 0) {
+        SetError(
+            error, CxlPoolErrorCode::kOpenFailed, "open", "path",
+            "cannot open CXL pool path: " + std::string(std::strerror(errno)),
+            errno);
+        return nullptr;
+    }
+    if (config.backend_kind == CxlPoolBackendKind::kFile) {
+        struct stat stat_buffer{};
+        if (::fstat(fd, &stat_buffer) != 0) {
+            const int saved_errno = errno;
+            ::close(fd);
+            SetError(error, CxlPoolErrorCode::kOpenFailed, "fstat", "path",
+                     "cannot inspect file-backed CXL pool: " +
+                         std::string(std::strerror(saved_errno)),
+                     saved_errno);
+            return nullptr;
+        }
+        const std::uint64_t required_size =
+            config.mapping_offset + config.capacity;
+        if (stat_buffer.st_size < 0 ||
+            static_cast<std::uint64_t>(stat_buffer.st_size) < required_size) {
+            ::close(fd);
+            SetError(error, CxlPoolErrorCode::kInvalidConfig, "open",
+                     "capacity",
+                     "file-backed CXL pool is smaller than mapping extent");
+            return nullptr;
+        }
+    }
+
+    void* base = ::mmap(nullptr, static_cast<std::size_t>(config.capacity),
+                        PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                        static_cast<off_t>(config.mapping_offset));
+    if (base == MAP_FAILED) {
+        const int saved_errno = errno;
+        ::close(fd);
+        SetError(
+            error, CxlPoolErrorCode::kMapFailed, "mmap", "extent",
+            "cannot map CXL pool: " + std::string(std::strerror(saved_errno)),
+            saved_errno);
+        return nullptr;
+    }
+    return std::make_shared<MooncakeMmapCxlPoolBackend>(std::move(config), fd,
+                                                        base);
+}
+
+std::shared_ptr<CxlPoolBackend> OpenMooncakeMmapCxlPoolBackendFromEnvironment(
+    CxlPoolError* error) {
+    CxlPoolConfig config;
+    if (!LoadCxlPoolConfigFromEnvironment(&config, error)) {
+        return nullptr;
+    }
+    return OpenMooncakeMmapCxlPoolBackend(std::move(config), error);
+}
+
+}  // namespace
+
 std::shared_ptr<CxlPoolBackend> OpenMmapCxlPoolBackend(CxlPoolConfig config,
                                                        CxlPoolError* error) {
     return faketract::OpenMmapCxlPoolBackend(std::move(config), error);
@@ -939,10 +1189,11 @@ bool RegisterCxlPoolBackendProvider(std::string_view provider_name,
                  "factory", "CXL backend provider factory must not be null");
         return false;
     }
-    if (provider_name == kFakeTraCTProvider) {
+    if (provider_name == kFakeTraCTProvider ||
+        provider_name == kMooncakeProvider) {
         SetError(error, CxlPoolErrorCode::kProviderRegistrationConflict,
                  "register_provider", "provider_name",
-                 "faketract is the reserved built-in development provider");
+                 "faketract and mooncake are reserved built-in providers");
         return false;
     }
 
@@ -970,6 +1221,9 @@ std::shared_ptr<CxlPoolBackend> OpenCxlPoolBackendFromEnvironment(
 
     if (provider == kFakeTraCTProvider) {
         return faketract::OpenMmapCxlPoolBackendFromEnvironment(error);
+    }
+    if (provider == kMooncakeProvider) {
+        return OpenMooncakeMmapCxlPoolBackendFromEnvironment(error);
     }
 
     CxlPoolBackendProviderFactory factory = nullptr;

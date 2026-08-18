@@ -187,6 +187,12 @@ submodule under `build-cachelib-bench/_deps`. An explicit
 known CUDA-triggering options off so a stale cache cannot compile device
 transports into this CPU-only allocator probe.
 
+The allocator latency fields (`mean_ns`, `p50_ns`, and `p99_ns`) surround only
+the `allocate()` call. Overall elapsed time, objects/s, and logical GB/s surround
+the whole loop and include `memset` when touching is enabled. Do not interpret
+stable allocator percentiles in a touched run as evidence that the writes were
+free, and do not report touched anonymous-DRAM throughput as CXL bandwidth.
+
 ### Single-process Mooncake Store integration
 
 The shortest real Store integration starts an in-process Master, mounts a
@@ -211,6 +217,53 @@ passes. In `P2PHANDSHAKE` mode, Mooncake keeps the logical segment name for
 placement but publishes the dynamically bound Transfer Engine endpoint in the
 replica descriptor; otherwise Put would connect to the logical port and fail
 with `TRANSFER_FAIL`/`ECONNREFUSED`.
+
+### Single-node Store benchmark
+
+Run the staged Python binding, a private Mooncake Master, and a disposable
+file-backed FakeTraCT pool as one command:
+
+```bash
+bash scripts/run_todo1_cxl_store_bench.sh
+```
+
+The command above is one configurable object size. The mandatory mini-test
+matrix has a separate launcher so a default cannot silently cover only one
+size or only the batch API:
+
+```bash
+bash scripts/run_todo1_cxl_store_matrix.sh
+```
+
+It runs eight isolated cases: plain `put/get` and `put_batch/get_batch`, each
+at 4 KiB, 64 KiB, 1 MiB, and 16 MiB. Every case starts its own private legacy
+Master and disposable file-backed FakeTraCT pool, uses deterministic bytes,
+enables Store checksums, verifies exact payload equality, and preserves a JSON
+summary under the printed output directory. This is still T0 mmap behavior,
+not shared-CXL hardware evidence.
+
+The runner fixes a common lab error where `mooncake-wheel/mooncake/store.so`
+exists but `import mooncake.store` fails: it selects the TODO#1 virtualenv and
+adds `mooncake-wheel` to `PYTHONPATH` before starting anything. It then checks
+that the Master and metrics ports are free, starts only its own Master with the
+CXL allocation strategy, waits for RPC readiness, and executes checksum
+verified Put/Get through `store_kv_bench.py`. The exact Master PID is stopped
+on exit; no `killall` is used. The JSON summary and both process logs remain in
+the printed `/tmp/callosum-cxl-store-bench.*` directory.
+
+Useful overrides are:
+
+```bash
+CXL_BENCH_NUM_OBJECTS=1024 \
+CXL_BENCH_VALUE_SIZE=1048576 \
+CXL_BENCH_BATCH_SIZE=16 \
+CXL_BENCH_POOL_SIZE_BYTES=8589934592 \
+bash scripts/run_todo1_cxl_store_bench.sh
+```
+
+This is a T0 software benchmark. Its write/read phase MiB/s includes Mooncake
+Store, checksum, CxlTransport, and file-backed `mmap` behavior; it is not a
+device-DAX or physical CXL bandwidth claim.
 
 ## Minimal standalone CXL startup
 
@@ -274,3 +327,6 @@ Search logs by structured component/event rather than private TraCT internals:
 
 Status intentionally omits payload bytes, raw pointers, private metadata nodes,
 locks, and RDMA keys.
+
+After the single-node device-DAX gate passes, continue with the two-physical-node
+shared-pool milestone in `docs/CXL_TODO15_TWO_NODE_RUNBOOK.md` before adding vLLM.

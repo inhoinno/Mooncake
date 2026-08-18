@@ -75,13 +75,21 @@ struct CxlPoolConfig {
     std::uint64_t mapping_offset{0};
     std::uint64_t mapping_alignment{0};
     std::uint64_t allocation_alignment{64};
+    // TODO #2 separates the extent mapped for reads from the extent this
+    // client contributes to the single Mooncake Master's allocator. Every
+    // client maps the complete shared pool, but advertises one disjoint
+    // allocation-owned subrange. A zero owned_capacity means the legacy
+    // full-pool ownership model.
+    std::uint64_t owned_offset{0};
+    std::uint64_t owned_capacity{0};
 };
 
 // Environment compatibility:
 //   existing: MC_CXL_DEV_PATH, MC_CXL_DEV_SIZE
 //   new:      MC_CXL_POOL_ID, MC_CXL_BACKEND_KIND,
 //             MC_CXL_MAP_OFFSET, MC_CXL_MAP_ALIGNMENT,
-//             MC_CXL_ALLOC_ALIGNMENT
+//             MC_CXL_ALLOC_ALIGNMENT, MC_CXL_OWNED_OFFSET,
+//             MC_CXL_OWNED_SIZE
 // If MC_CXL_BACKEND_KIND is absent, /dev/dax* paths select devdax and all
 // other paths select the file-backed model.
 bool LoadCxlPoolConfigFromEnvironment(CxlPoolConfig* config,
@@ -124,8 +132,9 @@ class CxlAllocation {
 };
 
 struct CxlPoolStatusSnapshot {
-    // Backend provider name, for example "faketract" or a future private
-    // TraCT adapter name. This is diagnostic identity, not placement policy.
+    // Backend provider name, for example "faketract", "mooncake", or a
+    // future private TraCT adapter. This is diagnostic identity, not
+    // placement policy.
     std::string provider{"unspecified"};
     std::string logical_pool_id;
     CxlPoolBackendKind backend_kind{CxlPoolBackendKind::kFile};
@@ -134,6 +143,8 @@ struct CxlPoolStatusSnapshot {
     std::uint64_t mapping_offset{0};
     std::uint64_t mapping_alignment{0};
     std::uint64_t allocation_alignment{0};
+    std::uint64_t owned_offset{0};
+    std::uint64_t owned_capacity{0};
     std::uint64_t reserved_bytes{0};
     std::uint64_t committed_bytes{0};
     std::uint64_t active_reservations{0};
@@ -178,6 +189,11 @@ class CxlPoolBackend {
         CxlPoolError* error = nullptr) = 0;
 
     virtual CxlPoolStatusSnapshot status() const = 0;
+
+    // True only when Mooncake Master, rather than this backend, owns object
+    // metadata and extent allocation. The built-in "mooncake" provider uses
+    // this mode; FakeTraCT and confidential adapters keep their own contract.
+    virtual bool master_managed_allocation() const noexcept { return false; }
 };
 
 // A provider factory is the only production hook required by CxlTransport.
@@ -190,7 +206,7 @@ using CxlPoolBackendProviderFactory =
 
 // Registers an out-of-tree backend provider. Registration is process-local,
 // thread-safe, and idempotent only when the same name/factory pair is supplied.
-// "faketract" is reserved for the built-in development provider.
+// "faketract" and "mooncake" are reserved built-in providers.
 bool RegisterCxlPoolBackendProvider(std::string_view provider_name,
                                     CxlPoolBackendProviderFactory factory,
                                     CxlPoolError* error = nullptr);

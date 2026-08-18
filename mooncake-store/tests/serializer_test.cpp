@@ -175,6 +175,12 @@ TEST_F(SerializerTest, MountedSegmentSerializationPreservesHostId) {
     original.segment.size = 1024 * 1024;
     original.segment.te_endpoint = "segment_host1";
     original.segment.host_id = "host1";
+    original.segment.protocol = "cxl";
+    original.segment.cxl_master_managed_allocation = true;
+    original.segment.cxl_pool_id = "pool0";
+    original.segment.cxl_pool_capacity = 128 * 1024 * 1024;
+    original.segment.cxl_owned_offset = 64 * 1024 * 1024;
+    original.segment.cxl_owned_capacity = 64 * 1024 * 1024;
     original.status = SegmentStatus::OK;
 
     msgpack::sbuffer buffer;
@@ -189,6 +195,16 @@ TEST_F(SerializerTest, MountedSegmentSerializationPreservesHostId) {
     EXPECT_EQ(restored->segment.id, original.segment.id);
     EXPECT_EQ(restored->segment.name, original.segment.name);
     EXPECT_EQ(restored->segment.host_id, original.segment.host_id);
+    EXPECT_EQ(restored->segment.protocol, original.segment.protocol);
+    EXPECT_EQ(restored->segment.cxl_master_managed_allocation,
+              original.segment.cxl_master_managed_allocation);
+    EXPECT_EQ(restored->segment.cxl_pool_id, original.segment.cxl_pool_id);
+    EXPECT_EQ(restored->segment.cxl_pool_capacity,
+              original.segment.cxl_pool_capacity);
+    EXPECT_EQ(restored->segment.cxl_owned_offset,
+              original.segment.cxl_owned_offset);
+    EXPECT_EQ(restored->segment.cxl_owned_capacity,
+              original.segment.cxl_owned_capacity);
     EXPECT_EQ(restored->status, original.status);
 }
 

@@ -88,6 +88,7 @@ class AllocatedBuffer {
     };
 
     void change_to_cxl(std::string transport_endpoint);
+    void set_protocol(std::string value) { protocol = std::move(value); }
     void* get_vaddr_from_cxl();
 
    private:

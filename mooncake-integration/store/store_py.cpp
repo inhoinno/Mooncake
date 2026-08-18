@@ -1995,12 +1995,12 @@ PYBIND11_MODULE(store, m) {
                  &Replica::Descriptor::is_local_disk_replica))
         .def(
             "get_memory_descriptor",
-            static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()
+            static_cast<const MemoryDescriptor& (Replica::Descriptor::*)()
                             const>(&Replica::Descriptor::get_memory_descriptor),
             py::return_value_policy::reference_internal)
         .def(
             "get_disk_descriptor",
-            static_cast<const DiskDescriptor &(Replica::Descriptor::*)() const>(
+            static_cast<const DiskDescriptor& (Replica::Descriptor::*)() const>(
                 &Replica::Descriptor::get_disk_descriptor),
             py::return_value_policy::reference_internal);
 
@@ -2012,11 +2012,13 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("size", &AllocatedBuffer::Descriptor::size_)
         .def_readwrite("buffer_address",
                        &AllocatedBuffer::Descriptor::buffer_address_)
+        .def_readwrite("protocol", &AllocatedBuffer::Descriptor::protocol_)
         .def_readwrite("transport_endpoint",
                        &AllocatedBuffer::Descriptor::transport_endpoint_)
-        .def("__repr__", [](const AllocatedBuffer::Descriptor &desc) {
+        .def("__repr__", [](const AllocatedBuffer::Descriptor& desc) {
             return "<Descriptor size=" + std::to_string(desc.size_) +
                    " buffer_address=" + std::to_string(desc.buffer_address_) +
+                   " protocol=" + desc.protocol_ +
                    " transport_endpoint=" + desc.transport_endpoint_ + ">";
         });
 

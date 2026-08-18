@@ -183,6 +183,11 @@ class Transport {
             } nvmeof;
             struct {
                 void *dest_addr;
+                // Completion state for an asynchronous CXL <-> GPU copy.
+                // These stay opaque so CPU-only builds do not expose CUDA
+                // runtime types through the public transport header.
+                void *cuda_event;
+                int device_id;
             } cxl;
             struct {
                 uint64_t dest_addr;

@@ -30,6 +30,10 @@
 #include "transport/transport.h"
 #include <cstring>
 
+#ifdef USE_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 namespace mooncake {
 namespace {
 
@@ -41,19 +45,48 @@ void LogCxlError(const char* event, const CxlPoolError& error) {
                << error.message << "\"";
 }
 
+#ifdef USE_CUDA
+bool CudaDeviceForPointer(void* pointer, int* device_id) {
+    if (pointer == nullptr) return false;
+    cudaPointerAttributes attributes{};
+    const auto result = cudaPointerGetAttributes(&attributes, pointer);
+    if (result != cudaSuccess) {
+        // Unregistered host mappings are expected here. Clear CUDA's sticky
+        // error so a normal CXL host pointer does not poison the next call.
+        cudaGetLastError();
+        return false;
+    }
+    if (attributes.type != cudaMemoryTypeDevice) return false;
+    if (device_id != nullptr) *device_id = attributes.device;
+    return true;
+}
+
+void CleanupCxlCudaEvent(Transport::Slice* slice) {
+    if (slice == nullptr || slice->cxl.cuda_event == nullptr) return;
+    int previous_device = -1;
+    cudaGetDevice(&previous_device);
+    cudaSetDevice(slice->cxl.device_id);
+    cudaEventDestroy(static_cast<cudaEvent_t>(slice->cxl.cuda_event));
+    slice->cxl.cuda_event = nullptr;
+    if (previous_device >= 0) cudaSetDevice(previous_device);
+}
+#endif
+
 }  // namespace
 
 CxlTransport::CxlTransport(std::shared_ptr<CxlPoolBackend> cxl_backend)
     : cxl_backend_(std::move(cxl_backend)) {}
 
 CxlTransport::~CxlTransport() {
+    destroyCudaStreams();
     if (metadata_ != nullptr && !local_server_name_.empty()) {
         metadata_->removeSegmentDesc(local_server_name_);
         metadata_->removeLocalSegment(local_server_name_);
     }
 }
 
-int CxlTransport::cxlMemcpy(void* dest, void* src, size_t size) {
+int CxlTransport::cxlMemcpy(Transport::Slice* slice, void* dest, void* src,
+                            size_t size) {
     // Input validation
     if (!src || !dest) {
         LOG(ERROR) << "CxlTransport::cxlMemcpy invalid arguments: null pointer "
@@ -66,7 +99,89 @@ int CxlTransport::cxlMemcpy(void* dest, void* src, size_t size) {
         return -1;  // validation failed
     }
 
-    // Perform the memory copy
+#ifdef USE_CUDA
+    int src_device = -1;
+    int dest_device = -1;
+    const bool src_is_device = CudaDeviceForPointer(src, &src_device);
+    const bool dest_is_device = CudaDeviceForPointer(dest, &dest_device);
+    if (src_is_device || dest_is_device) {
+        if (slice == nullptr ||
+            (src_is_device && dest_is_device && src_device != dest_device)) {
+            LOG(ERROR) << "component=cxl_transport event=cuda_copy_rejected "
+                          "error_code=invalid_device_pair";
+            return -1;
+        }
+
+        const int device_id = src_is_device ? src_device : dest_device;
+        int previous_device = -1;
+        cudaGetDevice(&previous_device);
+        if (cudaSetDevice(device_id) != cudaSuccess) {
+            LOG(ERROR) << "component=cxl_transport event=cuda_set_device_failed"
+                       << " device=" << device_id;
+            cudaGetLastError();
+            return -1;
+        }
+
+        cudaStream_t stream = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(cuda_stream_mutex_);
+            auto it = cuda_streams_.find(device_id);
+            if (it == cuda_streams_.end()) {
+                if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) !=
+                    cudaSuccess) {
+                    LOG(ERROR) << "component=cxl_transport "
+                                  "event=cuda_stream_create_failed device="
+                               << device_id;
+                    cudaGetLastError();
+                    if (previous_device >= 0) cudaSetDevice(previous_device);
+                    return -1;
+                }
+                cuda_streams_.emplace(device_id, static_cast<void*>(stream));
+            } else {
+                stream = static_cast<cudaStream_t>(it->second);
+            }
+        }
+
+        cudaEvent_t event = nullptr;
+        if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) !=
+            cudaSuccess) {
+            LOG(ERROR) << "component=cxl_transport "
+                          "event=cuda_event_create_failed device="
+                       << device_id;
+            cudaGetLastError();
+            if (previous_device >= 0) cudaSetDevice(previous_device);
+            return -1;
+        }
+
+        // A committed CXL producer must be visible before the GPU copy engine
+        // starts reading the mapped range.
+        if (isAddressInCxlRange(src)) __sync_synchronize();
+        const cudaMemcpyKind kind =
+            src_is_device ? (dest_is_device ? cudaMemcpyDeviceToDevice
+                                            : cudaMemcpyDeviceToHost)
+                          : cudaMemcpyHostToDevice;
+        auto result = cudaMemcpyAsync(dest, src, size, kind, stream);
+        if (result == cudaSuccess) result = cudaEventRecord(event, stream);
+        if (result != cudaSuccess) {
+            LOG(ERROR) << "component=cxl_transport event=cuda_copy_failed"
+                       << " device=" << device_id << " size=" << size
+                       << " message=\"" << cudaGetErrorString(result) << "\"";
+            cudaEventDestroy(event);
+            cudaGetLastError();
+            if (previous_device >= 0) cudaSetDevice(previous_device);
+            return -1;
+        }
+
+        slice->cxl.cuda_event = static_cast<void*>(event);
+        slice->cxl.device_id = device_id;
+        slice->cleanup_callback = CleanupCxlCudaEvent;
+        slice->status = Transport::Slice::POSTED;
+        if (previous_device >= 0) cudaSetDevice(previous_device);
+        return 1;
+    }
+#endif
+
+    // CPU-addressable CXL paths remain a regular memcpy.
     std::memcpy(dest, src, size);
 
     // Memory barriers and cache operations
@@ -76,6 +191,55 @@ int CxlTransport::cxlMemcpy(void* dest, void* src, size_t size) {
     }
 
     return 0;  // success
+}
+
+void CxlTransport::pollCudaCompletions(Transport::TransferTask& task) {
+#ifdef USE_CUDA
+    for (auto* slice : task.slice_list) {
+        if (slice == nullptr || slice->status != Transport::Slice::POSTED ||
+            slice->cxl.cuda_event == nullptr) {
+            continue;
+        }
+        int previous_device = -1;
+        cudaGetDevice(&previous_device);
+        cudaSetDevice(slice->cxl.device_id);
+        const auto result =
+            cudaEventQuery(static_cast<cudaEvent_t>(slice->cxl.cuda_event));
+        if (previous_device >= 0) cudaSetDevice(previous_device);
+        if (result == cudaErrorNotReady) continue;
+        if (result != cudaSuccess) {
+            LOG(ERROR) << "component=cxl_transport "
+                          "event=cuda_completion_failed device="
+                       << slice->cxl.device_id << " message=\""
+                       << cudaGetErrorString(result) << "\"";
+            cudaGetLastError();
+            slice->markFailed();
+            continue;
+        }
+        // D2H completion makes a newly written CXL range visible to CPU and
+        // peer readers before the task is reported complete.
+        if (slice->opcode == TransferRequest::WRITE) __sync_synchronize();
+        slice->markSuccess();
+    }
+#else
+    (void)task;
+#endif
+}
+
+void CxlTransport::destroyCudaStreams() {
+#ifdef USE_CUDA
+    std::lock_guard<std::mutex> lock(cuda_stream_mutex_);
+    int previous_device = -1;
+    cudaGetDevice(&previous_device);
+    for (const auto& [device_id, opaque_stream] : cuda_streams_) {
+        cudaSetDevice(device_id);
+        auto stream = static_cast<cudaStream_t>(opaque_stream);
+        cudaStreamSynchronize(stream);
+        cudaStreamDestroy(stream);
+    }
+    cuda_streams_.clear();
+    if (previous_device >= 0) cudaSetDevice(previous_device);
+#endif
 }
 
 bool CxlTransport::validateMemoryBounds(void* dest, void* src, size_t size) {
@@ -238,6 +402,7 @@ Status CxlTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto& task = batch_desc.task_list[task_id];
+    pollCudaCompletions(task);
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
@@ -279,6 +444,10 @@ Status CxlTransport::submitTransfer(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
+        slice->cxl.cuda_event = nullptr;
+        slice->cxl.device_id = -1;
+        slice->cleanup_callback = nullptr;
+        task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         CxlPoolError resolve_error;
         slice->cxl.dest_addr = cxl_backend_->resolve(
@@ -290,16 +459,16 @@ Status CxlTransport::submitTransfer(
         }
         int err;
         if (slice->opcode == TransferRequest::READ)
-            // READ: Source is in local memory, Destination is on CXL
-            err = cxlMemcpy(slice->source_addr, (void*)slice->cxl.dest_addr,
-                            slice->length);
+            // READ: CXL source -> local CPU/GPU destination.
+            err = cxlMemcpy(slice, slice->source_addr,
+                            (void*)slice->cxl.dest_addr, slice->length);
         else
-            // WRITE: Source is in local memory, Destination is on CXL
-            err = cxlMemcpy((void*)slice->cxl.dest_addr, slice->source_addr,
-                            slice->length);
-        if (err != 0)
+            // WRITE: local CPU/GPU source -> CXL destination.
+            err = cxlMemcpy(slice, (void*)slice->cxl.dest_addr,
+                            slice->source_addr, slice->length);
+        if (err < 0)
             slice->markFailed();
-        else
+        else if (err == 0)
             slice->markSuccess();
     }
 
@@ -322,6 +491,9 @@ Status CxlTransport::submitTransferTask(
         slice->task = &task;
         slice->target_id = request.target_id;
         slice->status = Slice::PENDING;
+        slice->cxl.cuda_event = nullptr;
+        slice->cxl.device_id = -1;
+        slice->cleanup_callback = nullptr;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         CxlPoolError resolve_error;
@@ -334,16 +506,16 @@ Status CxlTransport::submitTransferTask(
         }
         int err;
         if (slice->opcode == TransferRequest::READ)
-            // READ: Source is in local memory, Destination is on CXL
-            err = cxlMemcpy(slice->source_addr, (void*)slice->cxl.dest_addr,
-                            slice->length);
+            // READ: CXL source -> local CPU/GPU destination.
+            err = cxlMemcpy(slice, slice->source_addr,
+                            (void*)slice->cxl.dest_addr, slice->length);
         else
-            // WRITE: Source is in local memory, Destination is on CXL
-            err = cxlMemcpy((void*)slice->cxl.dest_addr, slice->source_addr,
-                            slice->length);
-        if (err != 0)
+            // WRITE: local CPU/GPU source -> CXL destination.
+            err = cxlMemcpy(slice, (void*)slice->cxl.dest_addr,
+                            slice->source_addr, slice->length);
+        if (err < 0)
             slice->markFailed();
-        else
+        else if (err == 0)
             slice->markSuccess();
     }
     return Status::OK();

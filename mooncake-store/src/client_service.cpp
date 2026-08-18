@@ -3274,6 +3274,14 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.size = size;
         segment.protocol = protocol;
         segment.host_id = host_id_;
+        if (protocol == "cxl" &&
+            transfer_engine_->isCxlAllocationMasterManaged()) {
+            segment.cxl_master_managed_allocation = true;
+            segment.cxl_pool_id = transfer_engine_->getCxlPoolId();
+            segment.cxl_pool_capacity = transfer_engine_->getCxlBaseSize();
+            segment.cxl_owned_offset = transfer_engine_->getCxlOwnedOffset();
+            segment.cxl_owned_capacity = transfer_engine_->getCxlOwnedSize();
+        }
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {

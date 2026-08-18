@@ -54,3 +54,16 @@ add_test(NAME cxl_pool_backend_devdax_test
          COMMAND cxl_pool_backend_devdax_test)
 set_tests_properties(cxl_pool_backend_devdax_test
                      PROPERTIES LABELS "cxl;todo1;t2;hardware")
+
+add_executable(
+  cxl_native_backend_preflight_test
+  cxl_pool_backend/cxl_native_backend_preflight_test.cpp)
+target_include_directories(
+  cxl_native_backend_preflight_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cxl_pool_backend)
+target_link_libraries(cxl_native_backend_preflight_test PUBLIC mooncake_common
+                                                        pthread)
+add_test(NAME todo2_native_cxl_preflight_test
+         COMMAND cxl_native_backend_preflight_test)
+set_tests_properties(todo2_native_cxl_preflight_test
+                     PROPERTIES LABELS "cxl;todo2;t0;preflight")

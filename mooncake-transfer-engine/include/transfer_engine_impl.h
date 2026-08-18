@@ -395,6 +395,14 @@ class TransferEngineImpl {
 
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
     size_t getCxlBaseSize() { return multi_transports_->getCxlBaseSize(); }
+    std::string getCxlPoolId() { return multi_transports_->getCxlPoolId(); }
+    size_t getCxlOwnedOffset() {
+        return multi_transports_->getCxlOwnedOffset();
+    }
+    size_t getCxlOwnedSize() { return multi_transports_->getCxlOwnedSize(); }
+    bool isCxlAllocationMasterManaged() {
+        return multi_transports_->isCxlAllocationMasterManaged();
+    }
     std::string getCxlPoolStatus() {
         return multi_transports_->getCxlPoolStatus();
     }

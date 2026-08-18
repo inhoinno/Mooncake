@@ -4,6 +4,7 @@
 #include "utils/zstd_util.h"
 
 #include <functional>
+#include <limits>
 #include <stdexcept>
 
 namespace mooncake {
@@ -120,7 +121,157 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         LOG(INFO) << "Start Mounting CXL Segment.";
         if (segment_manager_->memory_allocator_ ==
             BufferAllocatorType::CACHELIB) {
+            if (segment.cxl_master_managed_allocation) {
+                if (segment_manager_->cxl_global_allocator_ == nullptr ||
+                    segment_manager_->cxl_pool_capacity_ == 0) {
+                    LOG(ERROR) << "component=segment_manager "
+                                  "event=cxl_partition_mount "
+                                  "error_code=allocator_not_initialized";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+                const size_t configured_capacity =
+                    segment_manager_->cxl_pool_capacity_;
+                const size_t slab_size = facebook::cachelib::Slab::kSize;
+                const bool extent_overflows =
+                    segment.cxl_owned_offset >
+                    std::numeric_limits<uint64_t>::max() -
+                        segment.cxl_owned_capacity;
+                if (segment.name.empty() || segment.te_endpoint.empty() ||
+                    segment.cxl_pool_id.empty() || segment.size == 0 ||
+                    segment.size != configured_capacity ||
+                    segment.cxl_pool_capacity != configured_capacity ||
+                    segment.cxl_owned_capacity == 0 || extent_overflows ||
+                    segment.cxl_owned_offset > configured_capacity ||
+                    segment.cxl_owned_capacity >
+                        configured_capacity - segment.cxl_owned_offset ||
+                    segment.cxl_owned_offset % slab_size != 0 ||
+                    segment.cxl_owned_capacity % slab_size != 0) {
+                    LOG(ERROR)
+                        << "component=segment_manager "
+                           "event=cxl_partition_mount "
+                           "error_code=invalid_partition "
+                        << "segment_name=" << segment.name
+                        << " mapped_capacity=" << segment.size
+                        << " configured_capacity=" << configured_capacity
+                        << " owned_offset=" << segment.cxl_owned_offset
+                        << " owned_capacity=" << segment.cxl_owned_capacity
+                        << " required_alignment=" << slab_size;
+                    return ErrorCode::INVALID_PARAMS;
+                }
+                if (!segment_manager_->cxl_pool_id_.empty() &&
+                    segment_manager_->cxl_pool_id_ != segment.cxl_pool_id) {
+                    LOG(ERROR)
+                        << "component=segment_manager "
+                           "event=cxl_partition_mount "
+                           "error_code=pool_id_mismatch "
+                        << "expected_pool_id=" << segment_manager_->cxl_pool_id_
+                        << " actual_pool_id=" << segment.cxl_pool_id;
+                    return ErrorCode::INVALID_PARAMS;
+                }
+                if (segment_manager_->mounted_segments_.contains(segment.id) ||
+                    segment_manager_->segment_id_by_name_.contains(
+                        segment.name)) {
+                    LOG(ERROR) << "component=segment_manager "
+                                  "event=cxl_partition_mount "
+                                  "error_code=duplicate_segment "
+                               << "segment_name=" << segment.name;
+                    return ErrorCode::SEGMENT_ALREADY_EXISTS;
+                }
+
+                const uint64_t owned_end =
+                    segment.cxl_owned_offset + segment.cxl_owned_capacity;
+                for (const auto& [mounted_id, mounted] :
+                     segment_manager_->mounted_segments_) {
+                    (void)mounted_id;
+                    const Segment& peer = mounted.segment;
+                    if (peer.protocol != "cxl") {
+                        continue;
+                    }
+                    if (!peer.cxl_master_managed_allocation) {
+                        LOG(ERROR) << "component=segment_manager "
+                                      "event=cxl_partition_mount "
+                                      "error_code=ownership_mode_mismatch "
+                                   << "segment_name=" << segment.name
+                                   << " peer_segment=" << peer.name;
+                        return ErrorCode::INVALID_PARAMS;
+                    }
+                    if (peer.cxl_pool_id != segment.cxl_pool_id) {
+                        continue;
+                    }
+                    const uint64_t peer_end =
+                        peer.cxl_owned_offset + peer.cxl_owned_capacity;
+                    if (std::max(segment.cxl_owned_offset,
+                                 peer.cxl_owned_offset) <
+                        std::min(owned_end, peer_end)) {
+                        LOG(ERROR)
+                            << "component=segment_manager "
+                               "event=cxl_partition_mount "
+                               "error_code=partition_overlap "
+                            << "segment_name=" << segment.name
+                            << " peer_segment=" << peer.name
+                            << " owned_offset=" << segment.cxl_owned_offset
+                            << " owned_capacity=" << segment.cxl_owned_capacity;
+                        return ErrorCode::INVALID_PARAMS;
+                    }
+                }
+
+                std::shared_ptr<BufferAllocatorBase> allocator;
+                try {
+                    allocator = std::make_shared<CachelibBufferAllocator>(
+                        segment.name,
+                        DEFAULT_CXL_BASE + segment.cxl_owned_offset,
+                        segment.cxl_owned_capacity, segment.te_endpoint);
+                } catch (const std::exception& exception) {
+                    LOG(ERROR) << "component=segment_manager "
+                                  "event=cxl_partition_mount "
+                                  "error_code=allocator_creation_failed "
+                               << "segment_name=" << segment.name
+                               << " message=\"" << exception.what() << "\"";
+                    return ErrorCode::INVALID_PARAMS;
+                } catch (...) {
+                    LOG(ERROR) << "component=segment_manager "
+                                  "event=cxl_partition_mount "
+                                  "error_code=allocator_creation_failed "
+                               << "segment_name=" << segment.name;
+                    return ErrorCode::INVALID_PARAMS;
+                }
+                if (!allocator) {
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+
+                segment_manager_->allocator_manager_.addAllocator(
+                    segment.name, allocator, segment.te_endpoint,
+                    segment.protocol);
+                segment_manager_->client_segments_[client_id].push_back(
+                    segment.id);
+                segment_manager_->mounted_segments_[segment.id] = {
+                    segment, SegmentStatus::OK, allocator};
+                segment_manager_->client_by_name_[segment.name] = client_id;
+                segment_manager_->segment_id_by_name_[segment.name] =
+                    segment.id;
+                AddHostSegment(segment_manager_->segments_by_host_, segment);
+                if (segment_manager_->cxl_pool_id_.empty()) {
+                    segment_manager_->cxl_pool_id_ = segment.cxl_pool_id;
+                }
+
+                LOG(INFO) << "component=segment_manager "
+                             "event=cxl_partition_mount status=ok "
+                          << "pool_id=" << segment.cxl_pool_id
+                          << " segment_name=" << segment.name
+                          << " endpoint=" << segment.te_endpoint
+                          << " mapped_capacity=" << segment.size
+                          << " owned_offset=" << segment.cxl_owned_offset
+                          << " owned_capacity=" << segment.cxl_owned_capacity;
+                return ErrorCode::OK;
+            }
+
             auto allocator = segment_manager_->cxl_global_allocator_;
+            if (!segment_manager_->cxl_pool_id_.empty()) {
+                LOG(ERROR) << "component=segment_manager event=cxl_mount "
+                              "error_code=ownership_mode_mismatch "
+                           << "segment_name=" << segment.name;
+                return ErrorCode::INVALID_PARAMS;
+            }
             if (segment_manager_->cxl_global_allocator_ == nullptr) {
                 LOG(ERROR) << "Cxl global allocator has not been initialized.";
                 return ErrorCode::INTERNAL_ERROR;
@@ -134,7 +285,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                 return ErrorCode::INVALID_PARAMS;
             }
             segment_manager_->allocator_manager_.addAllocator(
-                segment.name, allocator, segment.te_endpoint);
+                segment.name, allocator, segment.te_endpoint,
+                segment.protocol);
             segment_manager_->client_segments_[client_id].push_back(segment.id);
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator};
@@ -217,7 +369,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     }
 
     segment_manager_->allocator_manager_.addAllocator(segment.name, allocator,
-                                                      segment.te_endpoint);
+                                                      segment.te_endpoint,
+                                                      segment.protocol);
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator)};
@@ -294,7 +447,13 @@ ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
         authoritative.size != segment.size ||
         authoritative.te_endpoint != segment.te_endpoint ||
         authoritative.protocol != segment.protocol ||
-        authoritative.host_id != segment.host_id) {
+        authoritative.host_id != segment.host_id ||
+        authoritative.cxl_master_managed_allocation !=
+            segment.cxl_master_managed_allocation ||
+        authoritative.cxl_pool_id != segment.cxl_pool_id ||
+        authoritative.cxl_pool_capacity != segment.cxl_pool_capacity ||
+        authoritative.cxl_owned_offset != segment.cxl_owned_offset ||
+        authoritative.cxl_owned_capacity != segment.cxl_owned_capacity) {
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;
@@ -1040,7 +1199,8 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                 mounted_segment.buf_allocator) {
                 segment_manager_->allocator_manager_.addAllocator(
                     name, mounted_segment.buf_allocator,
-                    mounted_segment.segment.te_endpoint);
+                    mounted_segment.segment.te_endpoint,
+                    mounted_segment.segment.protocol);
                 break;
             }
         }
@@ -1294,7 +1454,8 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
         HasAllocator(allocator_manager, name, allocator);
     if (should_be_allocatable && !is_allocatable && allocator) {
         allocator_manager.addAllocator(name, allocator,
-                                       mounted_segment.segment.te_endpoint);
+                                       mounted_segment.segment.te_endpoint,
+                                       mounted_segment.segment.protocol);
         AddHostSegment(segment_manager_->segments_by_host_,
                        mounted_segment.segment);
     } else if (!should_be_allocatable && is_allocatable) {
@@ -1611,6 +1772,7 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
 
     cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
         cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
+    cxl_pool_capacity_ = cxl_size;
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
 }
 

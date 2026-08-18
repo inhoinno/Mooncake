@@ -55,6 +55,8 @@
 #include "master_snapshot_repository.h"
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
+#include "multipath_placement.h"
+#include "gpu_transfer_policy.h"
 
 namespace mooncake {
 
@@ -193,8 +195,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
-      allocation_strategy_type_(config.enable_cxl
-                                    ? AllocationStrategyType::CXL
+      allocation_strategy_type_(config.enable_cxl &&
+                                        config.allocation_strategy_type ==
+                                            AllocationStrategyType::CXL
+                                    ? AllocationStrategyType::RANDOM
                                     : config.allocation_strategy_type),
       allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
@@ -492,7 +496,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     if (config.enable_cxl) {
-        allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
+        allocation_strategy_ =
+            std::make_shared<CxlAwareAllocationStrategy>(allocation_strategy_);
         segment_manager_.initializeCxlAllocator(config.cxl_path,
                                                 config.cxl_size);
         VLOG(1) << "action=start_cxl_global_allocator";
@@ -2679,6 +2684,12 @@ auto MasterService::GetSegmentsDetail()
         info.size_bytes = segment.size;
         info.te_endpoint = segment.te_endpoint;
         info.protocol = segment.protocol;
+        info.cxl_master_managed_allocation =
+            segment.cxl_master_managed_allocation;
+        info.cxl_pool_id = segment.cxl_pool_id;
+        info.cxl_pool_capacity_bytes = segment.cxl_pool_capacity;
+        info.cxl_owned_offset_bytes = segment.cxl_owned_offset;
+        info.cxl_owned_capacity_bytes = segment.cxl_owned_capacity;
 
         // Query segment status
         segment_access.GetSegmentStatusByName(segment.name, info.status);
@@ -3619,6 +3630,19 @@ auto MasterService::AllocateAndInsertMetadata(
         } else {
             for (const auto& preferred_segment : config.preferred_segments) {
                 append_preferred_segment(preferred_segment);
+            }
+        }
+        if (preferred_segments.empty()) {
+            if (auto multipath_segment = MultipathSegmentFromEnvironment(key);
+                multipath_segment.has_value()) {
+                append_preferred_segment(*multipath_segment);
+                if (GpuTransferTraceEnabledFromEnvironment()) {
+                    LOG(INFO)
+                        << "component=mooncake_master "
+                           "event=multipath_placement mode=hash "
+                           "protocol="
+                        << allocator_manager.getProtocol(*multipath_segment);
+                }
             }
         }
         if (!writer_host_id.empty()) {

@@ -504,6 +504,10 @@ class SegmentManager {
     // Used for unified allocation and recycling of CXL shared memory.
     const bool enable_cxl_;
     std::shared_ptr<BufferAllocatorBase> cxl_global_allocator_;
+    size_t cxl_pool_capacity_{0};
+    // Established by the first native Mooncake CXL mount. Subsequent clients
+    // must advertise the same physical pool identity.
+    std::string cxl_pool_id_;
     // allocator_manager_ only contains allocators whose segment status is OK.
     AllocatorManager allocator_manager_;
     std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>

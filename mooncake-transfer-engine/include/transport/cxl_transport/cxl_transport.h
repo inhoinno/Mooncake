@@ -65,6 +65,18 @@ class CxlTransport : public Transport {
                             : std::string();
     }
 
+    size_t getCxlOwnedOffset() const {
+        return cxl_backend_ ? cxl_backend_->config().owned_offset : 0;
+    }
+
+    size_t getCxlOwnedSize() const {
+        return cxl_backend_ ? cxl_backend_->config().owned_capacity : 0;
+    }
+
+    bool isCxlAllocationMasterManaged() const {
+        return cxl_backend_ && cxl_backend_->master_managed_allocation();
+    }
+
     CxlPoolStatusSnapshot getCxlPoolStatus() const {
         return cxl_backend_ ? cxl_backend_->status()
                             : CxlPoolStatusSnapshot{};
@@ -94,7 +106,14 @@ class CxlTransport : public Transport {
 
     int cxlDevInit();
 
-    int cxlMemcpy(void *dest_addr, void *source_addr, size_t size);
+    // Returns 0 when the copy completed synchronously, 1 when a CUDA event
+    // will complete it asynchronously, and -1 on failure.
+    int cxlMemcpy(Transport::Slice *slice, void *dest_addr,
+                  void *source_addr, size_t size);
+
+    void pollCudaCompletions(Transport::TransferTask &task);
+
+    void destroyCudaStreams();
 
     bool isAddressInCxlRange(void *addr);
 
@@ -102,6 +121,9 @@ class CxlTransport : public Transport {
 
    private:
     std::shared_ptr<CxlPoolBackend> cxl_backend_;
+    std::mutex cuda_stream_mutex_;
+    // device id -> cudaStream_t, kept opaque for CPU-only builds.
+    std::unordered_map<int, void *> cuda_streams_;
 };
 }  // namespace mooncake
 

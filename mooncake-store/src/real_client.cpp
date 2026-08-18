@@ -11,6 +11,7 @@
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -20,6 +21,7 @@
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
+#include "gpu_transfer_policy.h"
 #include "common.h"
 #include "config.h"
 #include "store_rpc_client_io_context.h"
@@ -3382,8 +3384,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                            << " with error: " << toString(get_result.error());
                 return tl::unexpected(get_result.error());
             }
-            void *dst = static_cast<char *>(buffer) + dst_offset;
-            const void *src = tmp_handle.ptr();
+            void* dst = static_cast<char*>(buffer) + dst_offset;
+            const void* src = tmp_handle.ptr();
             if (auto r = scatter_host_to_maybe_device(
                     dst, src, total_size, "DISK full read, key: " + key);
                 !r) {
@@ -3394,10 +3396,21 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
-        void *dst = static_cast<char *>(buffer) + dst_offset;
-        if (runtime_accelerator.FindDeviceForPointer(dst) &&
-            (!client_->CanUseLocalMemcpy(replica) ||
-             client_->IsHotCacheEnabled())) {
+        void* dst = static_cast<char*>(buffer) + dst_offset;
+        const bool destination_is_gpu =
+            runtime_accelerator.FindDeviceForPointer(dst) != nullptr;
+        const auto gpu_path = SelectGpuReadPath(
+            replica.get_memory_descriptor().buffer_descriptor.protocol_,
+            destination_is_gpu, RdmaGpuDirectEnabledFromEnvironment());
+        if (destination_is_gpu && GpuTransferTraceEnabledFromEnvironment()) {
+            LOG(INFO)
+                << "component=mooncake_store event=gpu_read_path "
+                   "api=get_into protocol="
+                << replica.get_memory_descriptor().buffer_descriptor.protocol_
+                << " path=" << ToString(gpu_path) << " bytes=" << length;
+        }
+        if (destination_is_gpu && (gpu_path == GpuReadPath::kRdmaHostStaged ||
+                                   client_->IsHotCacheEnabled())) {
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3451,7 +3464,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     // LOCAL_DISK can use src_offset + size (offload RPC transfers
     // sequentially from remote offset 0).
     auto partial_disk_read =
-        [&](auto &&read_op,
+        [&](auto&& read_op,
             size_t buf_size) -> tl::expected<int64_t, ErrorCode> {
         auto alloc_result = client_buffer_allocator_->allocate(buf_size);
         if (!alloc_result) {
@@ -3462,9 +3475,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         BufferHandle tmp_handle(std::move(*alloc_result));
         auto read_result = read_op(tmp_handle.ptr());
         if (!read_result) return tl::unexpected(read_result.error());
-        void *dst = static_cast<char *>(buffer) + dst_offset;
-        const void *src =
-            static_cast<const char *>(tmp_handle.ptr()) + src_offset;
+        void* dst = static_cast<char*>(buffer) + dst_offset;
+        const void* src =
+            static_cast<const char*>(tmp_handle.ptr()) + src_offset;
         if (auto r = scatter_host_to_maybe_device(
                 dst, src, size, "ranged disk read, key: " + key);
             !r) {
@@ -3474,9 +3487,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     };
 
     if (replica.is_local_disk_replica()) {
-        const auto &endpoint =
+        const auto& endpoint =
             replica.get_local_disk_descriptor().transport_endpoint;
-        void *dst = static_cast<char *>(buffer) + dst_offset;
+        void* dst = static_cast<char*>(buffer) + dst_offset;
         std::unordered_map<std::string, std::vector<Slice>> objects{
             {key, {{dst, size}}}};
         if (can_use_pinned_restore_arena(endpoint, objects)) {
@@ -3494,11 +3507,11 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         // LOCAL_DISK: offload RPC transfers sequentially from remote offset
         // 0, so we only need src_offset + size bytes (not total_size).
         return partial_disk_read(
-            [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
+            [&](void* tmp_buf) -> tl::expected<void, ErrorCode> {
                 std::unordered_map<std::string, std::vector<Slice>> objects;
                 objects.emplace(
-                    key, std::vector<Slice>{{static_cast<char *>(tmp_buf),
-                                             src_offset + size}});
+                    key, std::vector<Slice>{
+                             {static_cast<char*>(tmp_buf), src_offset + size}});
                 return batch_get_into_offload_object_internal(endpoint,
                                                               objects);
             },
@@ -3509,7 +3522,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         // DISK: client_->Get + allocateSlices requires full-object slices,
         // so we must allocate total_size.
         return partial_disk_read(
-            [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
+            [&](void* tmp_buf) -> tl::expected<void, ErrorCode> {
                 std::vector<mooncake::Slice> tmp_slices;
                 allocateSlices(tmp_slices, replica, tmp_buf);
                 auto filtered_qr =
@@ -3533,10 +3546,20 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
-    void *dst = static_cast<char *>(buffer) + dst_offset;
+    void* dst = static_cast<char*>(buffer) + dst_offset;
     auto filtered_qr = FilterQueryResult(query_result, replica, false);
-    if (runtime_accelerator.FindDeviceForPointer(dst) &&
-        !client_->CanUseLocalMemcpy(replica)) {
+    const bool destination_is_gpu =
+        runtime_accelerator.FindDeviceForPointer(dst) != nullptr;
+    const auto gpu_path = SelectGpuReadPath(
+        replica.get_memory_descriptor().buffer_descriptor.protocol_,
+        destination_is_gpu, RdmaGpuDirectEnabledFromEnvironment());
+    if (destination_is_gpu && GpuTransferTraceEnabledFromEnvironment()) {
+        LOG(INFO) << "component=mooncake_store event=gpu_read_path "
+                     "api=get_into_partial protocol="
+                  << replica.get_memory_descriptor().buffer_descriptor.protocol_
+                  << " path=" << ToString(gpu_path) << " bytes=" << length;
+    }
+    if (destination_is_gpu && gpu_path == GpuReadPath::kRdmaHostStaged) {
         if (!client_buffer_allocator_) {
             LOG(ERROR) << "Client buffer allocator is not provided";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3645,7 +3668,7 @@ RealClient::get_into_ranges_internal(
 
     std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
         metadata_cache;
-    auto metadata_for = [&](const std::string &key) -> auto & {
+    auto metadata_for = [&](const std::string& key) -> auto& {
         auto found = metadata_cache.find(key);
         if (found != metadata_cache.end()) return found->second;
         return metadata_cache
@@ -3659,16 +3682,30 @@ RealClient::get_into_ranges_internal(
         std::chrono::steady_clock::time_point expires_at;
         std::optional<ErrorCode> error;
     };
+    struct StagedGpuRead {
+        std::unique_ptr<BufferHandle> host_buffer;
+        void* gpu_buffer = nullptr;
+        std::vector<size_t> host_offsets;
+        std::vector<size_t> gpu_offsets;
+        std::vector<size_t> remote_offsets;
+        std::vector<size_t> lengths;
+        std::vector<std::optional<ErrorCode>> transfer_errors;
+        std::vector<tl::expected<int64_t, ErrorCode>>* results = nullptr;
+        ScatterLease* lease = nullptr;
+    };
     std::unordered_map<std::string, ScatterLease> scatter_leases;
+    // deque keeps callback-captured StagedGpuRead addresses stable while more
+    // keys are planned.
+    std::deque<StagedGpuRead> staged_gpu_reads;
     std::vector<TransferEngine::ScatterTransferRange> memory_transfers;
     for (size_t i = 0; i < buffer_count; ++i) {
         if (!buffers[i] || (!buffer_capacities && capacities[i] == 0)) {
             continue;
         }
-        const auto &keys = all_keys[i];
-        const auto &dst_groups = all_dst_offsets[i];
-        const auto &src_groups = all_src_offsets[i];
-        const auto &size_groups = all_sizes[i];
+        const auto& keys = all_keys[i];
+        const auto& dst_groups = all_dst_offsets[i];
+        const auto& src_groups = all_src_offsets[i];
+        const auto& size_groups = all_sizes[i];
         if (keys.size() != dst_groups.size() ||
             keys.size() != src_groups.size() ||
             keys.size() != size_groups.size()) {
@@ -3676,25 +3713,43 @@ RealClient::get_into_ranges_internal(
         }
 
         for (size_t j = 0; j < keys.size(); ++j) {
-            const auto &dst_offsets = dst_groups[j];
-            const auto &src_offsets = src_groups[j];
-            const auto &sizes = size_groups[j];
-            auto &range_results = results[i][j];
+            const auto& dst_offsets = dst_groups[j];
+            const auto& src_offsets = src_groups[j];
+            const auto& sizes = size_groups[j];
+            auto& range_results = results[i][j];
             if (dst_offsets.size() != src_offsets.size() ||
                 dst_offsets.size() != sizes.size()) {
                 continue;
             }
-            auto &metadata_result = metadata_for(keys[j]);
+            auto& metadata_result = metadata_for(keys[j]);
             if (!metadata_result) {
                 std::fill(range_results.begin(), range_results.end(),
                           tl::unexpected(metadata_result.error()));
                 continue;
             }
 
-            const auto &metadata = metadata_result.value();
+            const auto& metadata = metadata_result.value();
             if (metadata.replica.is_memory_replica()) {
-                if (client_->CanUseLocalMemcpy(metadata.replica) &&
-                    runtime_accelerator.FindDeviceForPointer(buffers[i])) {
+                const auto& handle =
+                    metadata.replica.get_memory_descriptor().buffer_descriptor;
+                const bool destination_is_gpu =
+                    runtime_accelerator.FindDeviceForPointer(buffers[i]) !=
+                    nullptr;
+                const auto gpu_path =
+                    SelectGpuReadPath(handle.protocol_, destination_is_gpu,
+                                      RdmaGpuDirectEnabledFromEnvironment());
+                if (destination_is_gpu &&
+                    GpuTransferTraceEnabledFromEnvironment()) {
+                    LOG(INFO)
+                        << "component=mooncake_store "
+                           "event=gpu_read_path api=get_into_ranges "
+                           "protocol="
+                        << handle.protocol_ << " path=" << ToString(gpu_path)
+                        << " fragments=" << sizes.size();
+                }
+                if (handle.protocol_ != "cxl" &&
+                    client_->CanUseLocalMemcpy(metadata.replica) &&
+                    destination_is_gpu) {
                     // Planning cache entries may be close to expiry. Renew and
                     // reselect the replica before copying into device memory.
                     auto refresh_result = resolve_ranged_read_metadata(keys[j]);
@@ -3706,7 +3761,7 @@ RealClient::get_into_ranges_internal(
                     std::optional<RangedReadMetadata> refreshed_metadata;
                     refreshed_metadata.emplace(std::move(*refresh_result));
                     auto lease_refresh_at =
-                        [](const RangedReadMetadata &value) {
+                        [](const RangedReadMetadata& value) {
                             const auto now = std::chrono::steady_clock::now();
                             return now +
                                    (value.query_result.lease_timeout - now) / 2;
@@ -3740,12 +3795,94 @@ RealClient::get_into_ranges_internal(
                     }
                     continue;
                 }
-                const auto &handle =
-                    metadata.replica.get_memory_descriptor().buffer_descriptor;
                 auto [lease_it, inserted] = scatter_leases.try_emplace(keys[j]);
                 if (inserted)
                     lease_it->second.expires_at =
                         metadata.query_result.lease_timeout;
+
+                if (gpu_path == GpuReadPath::kRdmaHostStaged) {
+                    size_t staging_size = 0;
+                    bool size_overflow = false;
+                    for (const size_t length : sizes) {
+                        if (length >
+                            std::numeric_limits<size_t>::max() - staging_size) {
+                            size_overflow = true;
+                            break;
+                        }
+                        staging_size += length;
+                    }
+                    if (size_overflow || staging_size == 0 ||
+                        !client_buffer_allocator_) {
+                        const auto error =
+                            size_overflow
+                                ? ErrorCode::INVALID_PARAMS
+                                : (staging_size == 0
+                                       ? ErrorCode::INVALID_PARAMS
+                                       : ErrorCode::NO_AVAILABLE_HANDLE);
+                        std::fill(range_results.begin(), range_results.end(),
+                                  tl::unexpected(error));
+                        continue;
+                    }
+                    auto allocation =
+                        client_buffer_allocator_->allocate(staging_size);
+                    if (!allocation) {
+                        std::fill(
+                            range_results.begin(), range_results.end(),
+                            tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+                        continue;
+                    }
+
+                    staged_gpu_reads.emplace_back();
+                    auto& staged = staged_gpu_reads.back();
+                    staged.host_buffer =
+                        std::make_unique<BufferHandle>(std::move(*allocation));
+                    staged.gpu_buffer = buffers[i];
+                    staged.gpu_offsets.assign(dst_offsets.begin(),
+                                              dst_offsets.end());
+                    staged.remote_offsets.assign(src_offsets.begin(),
+                                                 src_offsets.end());
+                    staged.lengths.assign(sizes.begin(), sizes.end());
+                    staged.transfer_errors.resize(sizes.size());
+                    staged.results = &range_results;
+                    staged.lease = &lease_it->second;
+                    staged.host_offsets.reserve(sizes.size());
+                    size_t host_offset = 0;
+                    for (const size_t length : sizes) {
+                        staged.host_offsets.push_back(host_offset);
+                        host_offset += length;
+                    }
+
+                    memory_transfers.push_back(
+                        TransferEngine::ScatterTransferRange{
+                            .opcode = TransferRequest::READ,
+                            .remote_segment = handle.transport_endpoint_,
+                            .remote_base_offset = handle.buffer_address_,
+                            .remote_size = handle.size_,
+                            .local_buffer = staged.host_buffer->ptr(),
+                            .local_capacity = staging_size,
+                            .local_offsets = staged.host_offsets,
+                            .remote_offsets = staged.remote_offsets,
+                            .lengths = staged.lengths,
+                            .on_fragment_complete =
+                                [&staged](size_t k, const Status& status) {
+                                    if (!status.ok()) {
+                                        staged.transfer_errors[k] =
+                                            scatter_transfer_error(status);
+                                    } else if (staged.lease->error
+                                                   .has_value()) {
+                                        staged.transfer_errors[k] =
+                                            staged.lease->error;
+                                    } else if (std::chrono::steady_clock::
+                                                   now() >=
+                                               staged.lease->expires_at) {
+                                        staged.transfer_errors[k] =
+                                            ErrorCode::LEASE_EXPIRED;
+                                    }
+                                },
+                        });
+                    continue;
+                }
+
                 memory_transfers.push_back(TransferEngine::ScatterTransferRange{
                     .opcode = TransferRequest::READ,
                     .remote_segment = handle.transport_endpoint_,
@@ -3759,7 +3896,7 @@ RealClient::get_into_ranges_internal(
                     .on_fragment_complete =
                         [results = &range_results, sizes = &sizes,
                          lease = &lease_it->second](size_t k,
-                                                    const Status &status) {
+                                                    const Status& status) {
                             if (status.ok() && !lease->error.has_value() &&
                                 std::chrono::steady_clock::now() <
                                     lease->expires_at) {
@@ -3793,7 +3930,7 @@ RealClient::get_into_ranges_internal(
     auto next_refresh_delay = [&]() {
         const auto now = std::chrono::steady_clock::now();
         auto delay = std::chrono::nanoseconds::max();
-        for (const auto &[key, lease] : scatter_leases) {
+        for (const auto& [key, lease] : scatter_leases) {
             (void)key;
             if (lease.error.has_value()) continue;
             const auto remaining =
@@ -3807,11 +3944,11 @@ RealClient::get_into_ranges_internal(
     auto refresh_leases = [&]() {
         std::vector<std::string> keys;
         keys.reserve(scatter_leases.size());
-        for (const auto &[key, lease] : scatter_leases)
+        for (const auto& [key, lease] : scatter_leases)
             if (!lease.error.has_value()) keys.push_back(key);
         auto refreshed = client_->BatchQuery(keys);
         for (size_t i = 0; i < refreshed.size(); ++i) {
-            auto &lease = scatter_leases.at(keys[i]);
+            auto& lease = scatter_leases.at(keys[i]);
             if (!refreshed[i]) {
                 lease.error = refreshed[i].error();
                 continue;
@@ -3826,7 +3963,7 @@ RealClient::get_into_ranges_internal(
     if (!operation.has_value()) {
         const auto failure =
             Status::InvalidArgument("TransferSubmitter not initialized");
-        for (const auto &transfer : memory_transfers) {
+        for (const auto& transfer : memory_transfers) {
             for (size_t i = 0; i < transfer.lengths.size(); ++i)
                 transfer.on_fragment_complete(i, failure);
         }
@@ -3841,16 +3978,47 @@ RealClient::get_into_ranges_internal(
         if (!status.IsClock()) break;
         refresh_leases();
     }
+
+    // RDMA staging and direct CXL CUDA copies were submitted together above,
+    // so the source links make progress concurrently. Materialize completed
+    // RDMA fragments from registered host buffers into the destination GPU
+    // only after network completion has made those bytes safe to consume.
+    for (auto& staged : staged_gpu_reads) {
+        for (size_t k = 0; k < staged.lengths.size(); ++k) {
+            if (staged.transfer_errors[k].has_value()) {
+                (*staged.results)[k] =
+                    tl::unexpected(*staged.transfer_errors[k]);
+                continue;
+            }
+            if (staged.lease->error.has_value() ||
+                std::chrono::steady_clock::now() >= staged.lease->expires_at) {
+                (*staged.results)[k] = tl::unexpected(
+                    staged.lease->error.value_or(ErrorCode::LEASE_EXPIRED));
+                continue;
+            }
+            auto* dst =
+                static_cast<char*>(staged.gpu_buffer) + staged.gpu_offsets[k];
+            auto* src = static_cast<char*>(staged.host_buffer->ptr()) +
+                        staged.host_offsets[k];
+            if (auto copied = scatter_host_to_maybe_device(
+                    dst, src, staged.lengths[k], "RDMA staged GPU read");
+                !copied) {
+                (*staged.results)[k] = tl::unexpected(copied.error());
+                continue;
+            }
+            (*staged.results)[k] = static_cast<int64_t>(staged.lengths[k]);
+        }
+    }
     return results;
 }
 
 std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
-    const std::vector<void *> &buffers,
-    const std::vector<std::vector<std::string>> &all_keys,
-    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
-    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
-    const QueryResultCache *query_result_cache) {
+    const std::vector<void*>& buffers,
+    const std::vector<std::vector<std::string>>& all_keys,
+    const std::vector<std::vector<std::vector<size_t>>>& all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_sizes,
+    const QueryResultCache* query_result_cache) {
     auto results =
         execute_timed_operation<std::vector<std::vector<std::vector<int64_t>>>>(
             [&]() {
@@ -4860,12 +5028,14 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         QueryResult query_result;
         std::vector<Slice> slices;
         uint64_t total_size;
+        void* gpu_destination = nullptr;
+        std::unique_ptr<BufferHandle> staged_buffer;
     };
     struct DiskKeyInfo {
         std::string key;
         size_t original_index;
         QueryResult query_result;
-        void *dst_buffer;
+        void* dst_buffer;
         uint64_t total_size;
     };
 
@@ -4876,7 +5046,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
-        const auto &key = keys[i];
+        const auto& key = keys[i];
 
         // Handle query failures
         if (!query_results[i]) {
@@ -4900,7 +5070,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
-        const auto *best_replica =
+        const auto* best_replica =
             SelectBestReplica(query_result_values.replicas, local_endpoints);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
@@ -4946,15 +5116,51 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        // MEMORY: RDMA directly to user buffer.
+        // MEMORY: CXL may copy directly into GPU memory through its CUDA
+        // transport path. Network transports stage through registered host
+        // memory unless GPUDirect is explicitly enabled.
+        const auto& handle = replica.get_memory_descriptor().buffer_descriptor;
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        const bool destination_is_gpu =
+            runtime_accelerator.FindDeviceForPointer(buffers[i]) != nullptr;
+        const auto gpu_path =
+            SelectGpuReadPath(handle.protocol_, destination_is_gpu,
+                              RdmaGpuDirectEnabledFromEnvironment());
+        if (destination_is_gpu && GpuTransferTraceEnabledFromEnvironment()) {
+            LOG(INFO) << "component=mooncake_store event=gpu_read_path "
+                         "api=batch_get_into protocol="
+                      << handle.protocol_ << " path=" << ToString(gpu_path)
+                      << " bytes=" << total_size;
+        }
+        void* transfer_destination = buffers[i];
+        std::unique_ptr<BufferHandle> staged_buffer;
+        if (gpu_path == GpuReadPath::kRdmaHostStaged) {
+            if (!client_buffer_allocator_) {
+                results[i] = tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                continue;
+            }
+            auto allocation = client_buffer_allocator_->allocate(total_size);
+            if (!allocation) {
+                results[i] = tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                continue;
+            }
+            staged_buffer =
+                std::make_unique<BufferHandle>(std::move(*allocation));
+            transfer_destination = staged_buffer->ptr();
+        }
         std::vector<Slice> key_slices;
-        allocateSlices(key_slices, replica, buffers[i]);
+        allocateSlices(key_slices, replica, transfer_destination);
         valid_operations.push_back(
             {.key = key,
              .original_index = i,
              .query_result = FilterQueryResult(query_result_values, replica),
              .slices = std::move(key_slices),
-             .total_size = total_size});
+             .total_size = total_size,
+             .gpu_destination = gpu_path == GpuReadPath::kRdmaHostStaged
+                                    ? buffers[i]
+                                    : nullptr,
+             .staged_buffer = std::move(staged_buffer)});
 
         // Set success result (actual bytes transferred)
         results[i] = static_cast<int64_t>(total_size);
@@ -4974,7 +5180,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     batch_keys.reserve(valid_operations.size());
     batch_query_results.reserve(valid_operations.size());
 
-    for (const auto &op : valid_operations) {
+    for (const auto& op : valid_operations) {
         batch_keys.push_back(op.key);
         batch_query_results.push_back(op.query_result);
         batch_slices[op.key] = op.slices;
@@ -4986,13 +5192,23 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
         // Process transfer results
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
-            const auto &op = valid_operations[j];
+            const auto& op = valid_operations[j];
 
             if (!batch_get_results[j]) {
                 const auto error = batch_get_results[j].error();
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
                            << "': " << toString(error);
                 results[op.original_index] = tl::unexpected(error);
+                continue;
+            }
+            if (op.staged_buffer) {
+                if (auto copied = scatter_host_to_maybe_device(
+                        op.gpu_destination, op.staged_buffer->ptr(),
+                        op.total_size,
+                        "RDMA staged batch GPU read, key: " + op.key);
+                    !copied) {
+                    results[op.original_index] = tl::unexpected(copied.error());
+                }
             }
         }
     }
@@ -5007,7 +5223,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             disk_temp_handles;
 
         for (size_t di = 0; di < disk_operations.size(); ++di) {
-            auto &op = disk_operations[di];
+            auto& op = disk_operations[di];
             // Find the DISK replica.
             const Replica::Descriptor *replica_ptr = nullptr;
             for (const auto &r : op.query_result.replicas) {
@@ -5919,13 +6135,16 @@ RealClient::batch_get_into_multi_buffers_internal(
         QueryResult query_result;
         std::vector<Slice> slices;
         uint64_t total_size;
+        std::vector<void*> gpu_destinations;
+        std::vector<size_t> copy_lengths;
+        std::unique_ptr<BufferHandle> staged_buffer;
     };
 
     struct DiskKeyInfo {
         std::string key;
         size_t original_index;
         QueryResult query_result;
-        std::vector<void *> buffers;
+        std::vector<void*> buffers;
         std::vector<size_t> sizes;
         uint64_t total_size;
         bool is_local_disk;  // true=LOCAL_DISK (offload RPC), false=DISK
@@ -5937,7 +6156,7 @@ RealClient::batch_get_into_multi_buffers_internal(
     valid_operations.reserve(num_keys);
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
-        const auto &key = keys[i];
+        const auto& key = keys[i];
         // Handle query failures
         if (!query_results[i]) {
             const auto error = query_results[i].error();
@@ -5958,7 +6177,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         // Select best replica: prefer MEMORY (direct RDMA to GPU), then
         // LOCAL_DISK, then DISK. Master may return multiple replicas in any
         // order, so always scan rather than blindly taking replicas[0].
-        const auto *best_replica =
+        const auto* best_replica =
             SelectBestReplica(query_result_values.replicas, local_endpoints);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
@@ -5967,9 +6186,9 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
-        const auto &sizes = all_sizes[i];
+        const auto& sizes = all_sizes[i];
         uint64_t dst_total_size = 0;
-        for (auto &size : sizes) {
+        for (auto& size : sizes) {
             dst_total_size += size;
         }
         if (dst_total_size < total_size) {
@@ -5980,14 +6199,84 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         // Create slices for this key's buffer
-        const auto &buffers = all_buffers[i];
+        const auto& buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
         if (replica.is_memory_replica()) {
-            // MEMORY: RDMA from remote memory directly to GPU (GPUDirect).
-            for (size_t j = 0; j < buffers.size(); ++j) {
-                key_slices.emplace_back(Slice{buffers[j], sizes[j]});
+            const auto& handle =
+                replica.get_memory_descriptor().buffer_descriptor;
+            auto runtime_accelerator =
+                device::GetAcceleratorRegistry().RuntimeAccelerators();
+            const bool destination_is_gpu =
+                std::any_of(buffers.begin(), buffers.end(), [&](void* buffer) {
+                    return runtime_accelerator.FindDeviceForPointer(buffer) !=
+                           nullptr;
+                });
+            const auto gpu_path =
+                SelectGpuReadPath(handle.protocol_, destination_is_gpu,
+                                  RdmaGpuDirectEnabledFromEnvironment());
+            if (destination_is_gpu &&
+                GpuTransferTraceEnabledFromEnvironment()) {
+                LOG(INFO) << "component=mooncake_store "
+                             "event=gpu_read_path "
+                             "api=batch_get_into_multi_buffers protocol="
+                          << handle.protocol_ << " path=" << ToString(gpu_path)
+                          << " bytes=" << total_size;
             }
+
+            std::unique_ptr<BufferHandle> staged_buffer;
+            std::vector<void*> gpu_destinations;
+            std::vector<size_t> copy_lengths;
+            if (gpu_path == GpuReadPath::kRdmaHostStaged) {
+                if (!client_buffer_allocator_) {
+                    results.emplace_back(
+                        tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+                    continue;
+                }
+                auto allocation =
+                    client_buffer_allocator_->allocate(total_size);
+                if (!allocation) {
+                    results.emplace_back(
+                        tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+                    continue;
+                }
+                staged_buffer =
+                    std::make_unique<BufferHandle>(std::move(*allocation));
+                size_t copied = 0;
+                for (size_t j = 0; j < buffers.size() && copied < total_size;
+                     ++j) {
+                    const size_t length =
+                        std::min<size_t>(sizes[j], total_size - copied);
+                    key_slices.emplace_back(
+                        Slice{static_cast<char*>(staged_buffer->ptr()) + copied,
+                              length});
+                    gpu_destinations.push_back(buffers[j]);
+                    copy_lengths.push_back(length);
+                    copied += length;
+                }
+                if (copied != total_size) {
+                    results.emplace_back(
+                        tl::unexpected(ErrorCode::INVALID_PARAMS));
+                    continue;
+                }
+            } else {
+                for (size_t j = 0; j < buffers.size(); ++j) {
+                    key_slices.emplace_back(Slice{buffers[j], sizes[j]});
+                }
+            }
+
+            valid_operations.push_back(
+                {.key = key,
+                 .original_index = i,
+                 .query_result =
+                     FilterQueryResult(query_result_values, replica),
+                 .slices = std::move(key_slices),
+                 .total_size = total_size,
+                 .gpu_destinations = std::move(gpu_destinations),
+                 .copy_lengths = std::move(copy_lengths),
+                 .staged_buffer = std::move(staged_buffer)});
+            results.emplace_back(static_cast<int64_t>(total_size));
+            continue;
         } else if (replica.is_local_disk_replica() ||
                    replica.is_disk_replica()) {
             // LOCAL_DISK: GPU buffers passed directly as scatter-gather slices
@@ -6010,14 +6299,8 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
 
-        valid_operations.push_back(
-            {.key = key,
-             .original_index = i,
-             .query_result = FilterQueryResult(query_result_values, replica),
-             .slices = std::move(key_slices),
-             .total_size = total_size});
-        // Set success result (actual bytes transferred)
-        results.emplace_back(static_cast<int64_t>(total_size));
+        // MEMORY replicas continue above. Other replica types either continue
+        // from their dedicated branch or fail above.
     }
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_ops.empty()) {
@@ -6031,7 +6314,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         std::unordered_map<std::string, std::vector<Slice>> batch_slices;
         batch_keys.reserve(valid_operations.size());
         batch_query_results.reserve(valid_operations.size());
-        for (auto &op : valid_operations) {
+        for (auto& op : valid_operations) {
             batch_keys.push_back(op.key);
             batch_query_results.push_back(op.query_result);
             batch_slices[op.key] = op.slices;
@@ -6042,12 +6325,29 @@ RealClient::batch_get_into_multi_buffers_internal(
                               prefer_alloc_in_same_node);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
-            const auto &op = valid_operations[j];
+            const auto& op = valid_operations[j];
             if (!batch_get_results[j]) {
                 const auto error = batch_get_results[j].error();
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
                            << "': " << toString(error);
                 results[op.original_index] = tl::unexpected(error);
+                continue;
+            }
+            if (op.staged_buffer) {
+                size_t host_offset = 0;
+                for (size_t k = 0; k < op.copy_lengths.size(); ++k) {
+                    auto* source = static_cast<char*>(op.staged_buffer->ptr()) +
+                                   host_offset;
+                    if (auto copied = scatter_host_to_maybe_device(
+                            op.gpu_destinations[k], source, op.copy_lengths[k],
+                            "RDMA staged multi-buffer GPU read");
+                        !copied) {
+                        results[op.original_index] =
+                            tl::unexpected(copied.error());
+                        break;
+                    }
+                    host_offset += op.copy_lengths[k];
+                }
             }
         }
     }

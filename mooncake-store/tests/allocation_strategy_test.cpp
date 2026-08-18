@@ -163,6 +163,60 @@ TEST_F(AllocationStrategyTest, RemovingLastAllocatorClearsMountedEndpoint) {
         allocator_manager.getTransportEndpoint("logical-segment").empty());
 }
 
+TEST_F(AllocationStrategyTest, CxlAwareRoutesCxlAndRdmaSegments) {
+    auto cxl_allocator = std::make_shared<OffsetBufferAllocator>(
+        "cxl-pool", DEFAULT_CXL_BASE, 64 * MiB, "cxl-logical");
+    auto rdma_allocator = std::make_shared<OffsetBufferAllocator>(
+        "rdma-logical", 0x200000000ULL, 64 * MiB, "rdma-endpoint");
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("cxl-logical", cxl_allocator, "cxl-endpoint",
+                                   "cxl");
+    allocator_manager.addAllocator("rdma-logical", rdma_allocator,
+                                   "rdma-endpoint", "rdma");
+
+    CxlAwareAllocationStrategy strategy(
+        std::make_shared<RandomAllocationStrategy>());
+    auto cxl = strategy.Allocate(allocator_manager, 4096, 1, {"cxl-logical"});
+    ASSERT_TRUE(cxl.has_value());
+    auto cxl_descriptor = cxl->front().get_descriptor();
+    EXPECT_EQ(
+        cxl_descriptor.get_memory_descriptor().buffer_descriptor.protocol_,
+        "cxl");
+    EXPECT_EQ(cxl_descriptor.get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "cxl-endpoint");
+
+    auto rdma = strategy.Allocate(allocator_manager, 4096, 1, {"rdma-logical"});
+    ASSERT_TRUE(rdma.has_value());
+    auto rdma_descriptor = rdma->front().get_descriptor();
+    EXPECT_EQ(
+        rdma_descriptor.get_memory_descriptor().buffer_descriptor.protocol_,
+        "rdma");
+    EXPECT_EQ(rdma_descriptor.get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "rdma-endpoint");
+}
+
+TEST_F(AllocationStrategyTest, CxlAwareDefaultPlacementExcludesCxl) {
+    auto cxl_allocator = std::make_shared<OffsetBufferAllocator>(
+        "cxl-pool", DEFAULT_CXL_BASE, 64 * MiB, "cxl-logical");
+    auto rdma_allocator = std::make_shared<OffsetBufferAllocator>(
+        "rdma-logical", 0x200000000ULL, 64 * MiB, "rdma-endpoint");
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("cxl-logical", cxl_allocator, "cxl-endpoint",
+                                   "cxl");
+    allocator_manager.addAllocator("rdma-logical", rdma_allocator,
+                                   "rdma-endpoint", "rdma");
+
+    CxlAwareAllocationStrategy strategy(
+        std::make_shared<RandomAllocationStrategy>());
+    auto result = strategy.Allocate(allocator_manager, 4096);
+    ASSERT_TRUE(result.has_value());
+    auto descriptor = result->front().get_descriptor();
+    EXPECT_EQ(descriptor.get_memory_descriptor().buffer_descriptor.protocol_,
+              "rdma");
+}
+
 // Test preferred segment allocation when available
 TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentAllocation) {
     auto allocator1 = CreateTestAllocator("segment1", 0);

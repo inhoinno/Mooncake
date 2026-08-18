@@ -446,9 +446,19 @@ struct Segment {
     std::string te_endpoint{};
     std::string protocol;
     std::string host_id{};
+    // Native Mooncake CXL ownership descriptor. base/size still describe the
+    // complete local mapping used by CxlTransport; this subrange is the only
+    // extent the single Master may allocate on behalf of this client.
+    bool cxl_master_managed_allocation{false};
+    std::string cxl_pool_id{};
+    uint64_t cxl_pool_capacity{0};
+    uint64_t cxl_owned_offset{0};
+    uint64_t cxl_owned_capacity{0};
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id,
+         cxl_master_managed_allocation, cxl_pool_id, cxl_pool_capacity,
+         cxl_owned_offset, cxl_owned_capacity);
 
 /**
  * @brief Allocation strategy type for segment allocation

@@ -684,6 +684,50 @@ size_t MultiTransport::getCxlBaseSize() {
     return 0;
 }
 
+std::string MultiTransport::getCxlPoolId() {
+#ifdef USE_CXL
+    Transport* transport = getTransport("cxl");
+    if (transport) {
+        auto* cxl_transport = dynamic_cast<CxlTransport*>(transport);
+        return cxl_transport ? cxl_transport->getCxlPoolId() : std::string();
+    }
+#endif
+    return {};
+}
+
+size_t MultiTransport::getCxlOwnedOffset() {
+#ifdef USE_CXL
+    Transport* transport = getTransport("cxl");
+    if (transport) {
+        auto* cxl_transport = dynamic_cast<CxlTransport*>(transport);
+        return cxl_transport ? cxl_transport->getCxlOwnedOffset() : 0;
+    }
+#endif
+    return 0;
+}
+
+size_t MultiTransport::getCxlOwnedSize() {
+#ifdef USE_CXL
+    Transport* transport = getTransport("cxl");
+    if (transport) {
+        auto* cxl_transport = dynamic_cast<CxlTransport*>(transport);
+        return cxl_transport ? cxl_transport->getCxlOwnedSize() : 0;
+    }
+#endif
+    return 0;
+}
+
+bool MultiTransport::isCxlAllocationMasterManaged() {
+#ifdef USE_CXL
+    Transport* transport = getTransport("cxl");
+    if (transport) {
+        auto* cxl_transport = dynamic_cast<CxlTransport*>(transport);
+        return cxl_transport && cxl_transport->isCxlAllocationMasterManaged();
+    }
+#endif
+    return false;
+}
+
 std::string MultiTransport::getCxlPoolStatus() {
 #ifdef USE_CXL
     Transport* transport = getTransport("cxl");

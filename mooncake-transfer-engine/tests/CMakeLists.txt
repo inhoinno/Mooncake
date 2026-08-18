@@ -91,6 +91,15 @@ if(USE_CXL)
   target_link_libraries(cxl_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME cxl_transport_test COMMAND cxl_transport_test)
+  if(USE_CUDA)
+    add_test(
+      NAME cxl_gpu_transfer_functional_test
+      COMMAND cxl_transport_test
+              --gtest_filter=CXLTransportTest.FunctionalCxlToGpuAndGpuToCxl)
+    set_tests_properties(
+      cxl_gpu_transfer_functional_test
+      PROPERTIES LABELS "cxl;gpu;multisource;t1;functional" TIMEOUT 60)
+  endif()
 endif()
 
 if(USE_NVMEOF)

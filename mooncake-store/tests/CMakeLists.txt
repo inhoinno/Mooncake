@@ -38,6 +38,45 @@ add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
+add_store_test(gpu_transfer_policy_test gpu_transfer_policy_test.cpp)
+add_store_test(multipath_placement_test multipath_placement_test.cpp)
+foreach(
+  gpu_path_case
+  CpuDestinationUsesHostAddressablePath
+  CxlGpuDestinationUsesCudaCopy
+  RdmaGpuDestinationStagesByDefault
+  GpuDirectRequiresExplicitOptIn
+  TraceFlagIsFailClosed)
+  string(TOLOWER "${gpu_path_case}" gpu_path_case_lower)
+  add_test(
+    NAME "gpu_transfer_${gpu_path_case_lower}"
+    COMMAND
+      gpu_transfer_policy_test
+      "--gtest_filter=GpuTransferPolicyTest.${gpu_path_case}")
+  set_tests_properties(
+    "gpu_transfer_${gpu_path_case_lower}"
+    PROPERTIES LABELS "gpu;multisource;t0;unit")
+endforeach()
+add_test(
+  NAME gpu_multipath_preflight_test
+  COMMAND gpu_transfer_policy_test
+          --gtest_filter=GpuTransferPolicyTest.CxlGpuDestinationUsesCudaCopy:GpuTransferPolicyTest.RdmaGpuDestinationStagesByDefault)
+add_test(
+  NAME gpu_multipath_functional_test
+  COMMAND allocation_strategy_test
+          --gtest_filter=AllocationStrategyTest.CxlAwareRoutesCxlAndRdmaSegments)
+add_test(
+  NAME gpu_multipath_failure_test
+  COMMAND allocation_strategy_test
+          --gtest_filter=AllocationStrategyTest.CxlAwareDefaultPlacementExcludesCxl)
+add_test(
+  NAME gpu_multipath_status_test
+  COMMAND gpu_transfer_policy_test
+          --gtest_filter=GpuTransferPolicyTest.TraceFlagIsFailClosed)
+set_tests_properties(
+  gpu_multipath_preflight_test gpu_multipath_functional_test
+  gpu_multipath_failure_test gpu_multipath_status_test
+  PROPERTIES LABELS "gpu;multisource;t0;unit" TIMEOUT 30)
 add_test(
   NAME replica_selection_env_opt_in_test
   COMMAND replica_selection_test
@@ -128,7 +167,90 @@ if(USE_CXL)
       ENVIRONMENT
         "MC_CXL_PROVIDER=faketract;MC_CXL_BACKEND_KIND=file;MC_CXL_POOL_ID=callosum-single-pool;MOONCAKE_STORE_CHECKSUM=1;DEFAULT_KV_LEASE_TTL=1"
   )
+
+  add_store_test(cxl_native_partition_test cxl_native_partition_test.cpp)
+  add_test(
+    NAME todo2_native_cxl_functional_test
+    COMMAND cxl_native_partition_test
+            --gtest_filter=CxlNativePartitionTest.FunctionalDisjointAllocationAndReclaim)
+  add_test(
+    NAME todo2_native_cxl_failure_test
+    COMMAND cxl_native_partition_test
+            --gtest_filter=CxlNativePartitionTest.FailureRejectsOverlapBoundsAndPoolMismatch:CxlNativePartitionTest.ConcurrentOverlapHasSingleWinner)
+  add_test(
+    NAME todo2_native_cxl_status_test
+    COMMAND cxl_native_partition_test
+            --gtest_filter=CxlNativePartitionTest.StatusExposesPortableOwnershipFields)
+  set_tests_properties(
+    todo2_native_cxl_functional_test todo2_native_cxl_failure_test
+    todo2_native_cxl_status_test
+    PROPERTIES LABELS "cxl;todo2;t0;unit" TIMEOUT 30)
+
+  add_test(
+    NAME todo2_native_cxl_single_process_store_test
+    COMMAND
+      cxl_client_integration_test
+      --protocol=cxl
+      --cxl_device_name=${CMAKE_CURRENT_BINARY_DIR}/todo2_native_cxl_single_process.pool
+      --cxl_device_size=1073741824
+      --transfer_engine_metadata_url=P2PHANDSHAKE
+      --gtest_filter=ClientIntegrationTestCxl.BasicPutGetOperations:ClientIntegrationTestCxl.BatchPutGetOperations)
+  set_tests_properties(
+    todo2_native_cxl_single_process_store_test
+    PROPERTIES
+      LABELS "cxl;todo2;t0;integration"
+      TIMEOUT 60
+      RESOURCE_LOCK todo2_native_cxl_single_process_pool
+      ENVIRONMENT
+        "MC_CXL_PROVIDER=mooncake;MC_CXL_BACKEND_KIND=file;MC_CXL_POOL_ID=todo2-native-single-pool;MC_CXL_OWNED_OFFSET=0;MC_CXL_OWNED_SIZE=1073741824;MOONCAKE_STORE_CHECKSUM=1;DEFAULT_KV_LEASE_TTL=1")
 endif()
+
+# TODO1.5 protocol gates are deliberately portable.  They validate the
+# two-process orchestration and fail-closed checksum/publication behavior; the
+# real shared-CXL acceptance run is launched separately on two lab nodes.
+set(TODO15_SHARED_CXL_TEST_CASES
+    preflight_validation
+    functional_bidirectional_single_and_batch
+    failure_checksum_mismatch_blocks_publication
+    status_summary_is_safe_and_complete)
+foreach(todo15_case IN LISTS TODO15_SHARED_CXL_TEST_CASES)
+  set(todo15_test_name "todo15_shared_cxl_${todo15_case}_test")
+  add_test(
+    NAME ${todo15_test_name}
+    COMMAND
+      ${PYTHON_EXECUTABLE} -m unittest -v
+      test_todo15_shared_cxl.Todo15SharedCxlProtocolTest.test_${todo15_case})
+  set_tests_properties(
+    ${todo15_test_name}
+    PROPERTIES
+      LABELS "cxl;todo15;t0;unit"
+      TIMEOUT 30
+      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/scripts")
+endforeach()
+
+# The WSS protocol tests remain dependency-light and use a bounded in-memory
+# Store model. The 500 GiB plan test verifies exact accounting without
+# allocating the payload; only the two-node launcher can close the T2 gate.
+set(TODO2_CXL_WSS_TEST_CASES
+    preflight_500g_plan_and_capacity
+    functional_single_put_peer_get
+    failure_corruption_blocks_verified
+    status_is_bounded_and_safe)
+foreach(todo2_wss_case IN LISTS TODO2_CXL_WSS_TEST_CASES)
+  set(todo2_wss_test_name "todo2_cxl_wss_${todo2_wss_case}_test")
+  add_test(
+    NAME ${todo2_wss_test_name}
+    COMMAND
+      ${PYTHON_EXECUTABLE} -m unittest -v
+      test_todo2_cxl_wss.Todo2CxlWssTest.test_${todo2_wss_case})
+  set_tests_properties(
+    ${todo2_wss_test_name}
+    PROPERTIES
+      LABELS "cxl;todo2;wss;t0;unit"
+      TIMEOUT 30
+      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/scripts")
+endforeach()
+
 add_store_test(master_metrics_test master_metrics_test.cpp)
 add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
