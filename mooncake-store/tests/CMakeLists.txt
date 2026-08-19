@@ -225,7 +225,7 @@ foreach(todo15_case IN LISTS TODO15_SHARED_CXL_TEST_CASES)
     PROPERTIES
       LABELS "cxl;todo15;t0;unit"
       TIMEOUT 30
-      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/scripts")
+      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/scripts")
 endforeach()
 
 # The WSS protocol tests remain dependency-light and use a bounded in-memory
@@ -248,7 +248,7 @@ foreach(todo2_wss_case IN LISTS TODO2_CXL_WSS_TEST_CASES)
     PROPERTIES
       LABELS "cxl;todo2;wss;t0;unit"
       TIMEOUT 30
-      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/scripts")
+      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/scripts")
 endforeach()
 
 add_store_test(master_metrics_test master_metrics_test.cpp)
