@@ -395,10 +395,20 @@ create_python_environment() {
   if [ ! -x "$venv_dir/bin/python" ]; then
     python3 -m venv "$venv_dir"
   fi
+  # auditwheel >= 6 requires patchelf >= 0.14.5, but Ubuntu 22.04 apt ships
+  # 0.14.3, which fails the wheel-repair step. The PyPI patchelf package bundles
+  # a modern static binary into the venv; putting $venv_dir/bin ahead of PATH in
+  # the build step (see run_all) makes both auditwheel and the direct patchelf
+  # calls in build_wheel.sh use it instead of the too-old system copy.
   "$venv_dir/bin/python" -m pip install --upgrade \
-    pip build setuptools wheel auditwheel
+    pip build setuptools wheel auditwheel patchelf
   "$venv_dir/bin/python" -c 'import auditwheel, build, setuptools, wheel'
-  pass "python_venv" "path=$venv_dir version=$("$venv_dir/bin/python" -c 'import platform; print(platform.python_version())')"
+  local venv_patchelf_version
+  venv_patchelf_version="$("$venv_dir/bin/patchelf" --version 2>/dev/null |
+    grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)"
+  [ -n "$venv_patchelf_version" ] ||
+    fatal "patchelf did not install into $venv_dir/bin"
+  pass "python_venv" "path=$venv_dir version=$("$venv_dir/bin/python" -c 'import platform; print(platform.python_version())') patchelf=$venv_patchelf_version"
 }
 
 cache_value() {
@@ -490,12 +500,16 @@ run_all() {
     cmake_extra="$cmake_extra $MOONCAKE_CMAKE_ARGS"
   fi
 
+  # Prefer the venv's modern patchelf over the system one so auditwheel repair
+  # (which resolves patchelf through PATH) and build_wheel.sh's direct patchelf
+  # calls both meet auditwheel's >= 0.14.5 requirement.
   MOONCAKE_USE_CUDA=OFF \
   MOONCAKE_BUILD_DIR="$build_dir_name" \
   MOONCAKE_BUILD_JOBS="$build_jobs" \
   MOONCAKE_CMAKE_ARGS="$cmake_extra" \
   PYTHON_BIN="$venv_dir/bin/python" \
   PYTHON_VERSION="$python_version" \
+  PATH="$venv_dir/bin:$PATH" \
     bash "$repo_dir/scripts/build_todo1_overlay.sh"
 
   verify_cpu_cache
