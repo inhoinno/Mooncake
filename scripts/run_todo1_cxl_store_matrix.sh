@@ -31,7 +31,7 @@ else
   mkdir -p "$output_root"
 fi
 
-object_sizes=(4096 65536 1048576 16777216)
+object_sizes=(4096 65536 1048576 16773120)  # 16 MiB - 4 KiB: under kMaxSliceSize (Slab::kSize - 16)
 apis=(single batch)
 summaries=()
 

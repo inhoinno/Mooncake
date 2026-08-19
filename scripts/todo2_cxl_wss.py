@@ -27,6 +27,12 @@ from collections.abc import Iterator, Sequence
 from typing import Any, Optional
 
 
+# NOTE: the 16 MiB entry exceeds the CacheLib single-slice cap
+# kMaxSliceSize = Slab::kSize - 16 (mooncake-store/include/types.h), so a full
+# 16 MiB Put is rejected with invalid_slice_size on the single-replica CXL path.
+# This tuple also drives the 500 GiB plan accounting asserted in
+# test_todo2_cxl_wss.py (plan.object_count == 120020); shrinking it requires
+# recomputing that plan. Tracked as a separate WSS follow-up.
 OBJECT_SIZES = (4 * 1024, 64 * 1024, 1024 * 1024, 16 * 1024 * 1024)
 DEFAULT_WSS_BYTES = 500 * 1024**3
 DEFAULT_HEADROOM_BYTES = 8 * 1024**3

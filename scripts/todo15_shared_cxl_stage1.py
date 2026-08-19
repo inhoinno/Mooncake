@@ -25,7 +25,12 @@ import time
 from typing import Any, Iterable, Optional, Sequence
 
 
-REQUIRED_OBJECT_SIZES = (4 * 1024, 64 * 1024, 1024 * 1024, 16 * 1024 * 1024)
+# The largest object must stay under the CacheLib single-slice cap,
+# kMaxSliceSize = Slab::kSize - 16 = 16 MiB - 16 B (mooncake-store/include/types.h).
+# The CXL allocation strategy is single-replica, so an object cannot be split
+# across slabs; a full 16 MiB object overflows the cap by 16 B and PutStart
+# rejects it with invalid_slice_size. Use 16 MiB - 4 KiB (16,773,120 B).
+REQUIRED_OBJECT_SIZES = (4 * 1024, 64 * 1024, 1024 * 1024, 16 * 1024 * 1024 - 4096)
 VALID_ROLES = ("node0", "node1")
 DEFAULT_COMPONENT = "todo15_shared_cxl"
 DEFAULT_TIER = "T2_SHARED_CXL"
