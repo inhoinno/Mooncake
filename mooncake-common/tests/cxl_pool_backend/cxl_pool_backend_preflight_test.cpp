@@ -75,6 +75,21 @@ std::shared_ptr<CxlPoolBackend> OpenInconsistentContractBackend(
 
 int main() {
     TestContext test("T1.1_preflight");
+
+    // Sanitize the ambient environment. This preflight asserts default/FakeTraCT
+    // behavior, but OpenCxlPoolBackendFromEnvironment reads every MC_CXL_* knob
+    // from the process environment. A lab shell that exported the TODO1.5
+    // two-node vars (e.g. MC_CXL_BACKEND_KIND=devdax) would otherwise force the
+    // 1 MiB file-backed pool open as devdax and fail. The test sets the inputs
+    // it needs itself; clear the rest so it is not sensitive to the caller.
+    for (const char* key :
+         {"MC_CXL_PROVIDER", "MC_CXL_BACKEND_KIND", "MC_CXL_DEV_PATH",
+          "MC_CXL_DEV_SIZE", "MC_CXL_POOL_ID", "MC_CXL_MAP_OFFSET",
+          "MC_CXL_MAP_ALIGNMENT", "MC_CXL_ALLOC_ALIGNMENT", "MC_CXL_OWNED_OFFSET",
+          "MC_CXL_OWNED_SIZE"}) {
+        ::unsetenv(key);
+    }
+
     TemporaryPoolFile file(1U << 20);
     test.Expect(file.valid(), "temporary file-backed pool is available");
     if (!file.valid()) return test.Finish();
