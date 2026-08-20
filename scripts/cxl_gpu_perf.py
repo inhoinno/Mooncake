@@ -30,6 +30,7 @@ import hashlib
 import importlib
 import json
 import os
+import signal
 import sys
 import time
 from typing import Any
@@ -90,33 +91,55 @@ def _open_store(args: argparse.Namespace) -> tuple[Any, Any]:
     return module, store
 
 
+def _write_objects(store: Any, module: Any, args: argparse.Namespace) -> int:
+    config = module.ReplicateConfig()
+    config.replica_num = 1
+    config.nof_replica_num = 0
+    payload = _payload(f"{args.key_prefix}-blk", args.block_bytes)
+    written = 0
+    for i in range(args.num_objects):
+        key = _object_key(args.key_prefix, i)
+        if int(store.is_exist(key)) == 1:  # idempotent
+            written += args.block_bytes
+            continue
+        rc = int(store.put(key, payload, config))
+        if rc != 0:
+            raise PerfError(f"put {key} failed rc={rc}")
+        written += args.block_bytes
+    return written
+
+
 def run_prep(args: argparse.Namespace) -> dict[str, Any]:
     module, store = _open_store(args)
     try:
-        config = module.ReplicateConfig()
-        config.replica_num = 1
-        config.nof_replica_num = 0
-        payload = _payload(f"{args.key_prefix}-blk", args.block_bytes)
-        written = 0
-        for i in range(args.num_objects):
-            key = _object_key(args.key_prefix, i)
-            # idempotent: skip if a prior prep already placed it
-            if int(store.is_exist(key)) == 1:
-                written += args.block_bytes
-                continue
-            rc = int(store.put(key, payload, config))
-            if rc != 0:
-                raise PerfError(f"put {key} failed rc={rc}")
-            written += args.block_bytes
-        return {
-            "role": "prep",
-            "status": "PASS",
-            "num_objects": args.num_objects,
-            "block_bytes": args.block_bytes,
-            "bytes_written": written,
-        }
+        written = _write_objects(store, module, args)
+        return {"role": "prep", "status": "PASS",
+                "num_objects": args.num_objects, "block_bytes": args.block_bytes,
+                "bytes_written": written}
     finally:
         store.close()
+
+
+def run_server(args: argparse.Namespace) -> dict[str, Any]:
+    # Write the objects, then STAY ALIVE so the allocating segment descriptor
+    # remains resolvable. A CXL replica references the writer's segment endpoint;
+    # if the writer exits (and its descriptor is deleted from the metadata store)
+    # readers get 404 -> TRANSFER_FAIL when resolving the object.
+    module, store = _open_store(args)
+    written = _write_objects(store, module, args)
+    print(json.dumps({"role": "server", "status": "READY",
+                      "num_objects": args.num_objects,
+                      "block_bytes": args.block_bytes,
+                      "bytes_written": written}), flush=True)
+    stop = {"v": False}
+    signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("v", True))
+    signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("v", True))
+    try:
+        while not stop["v"]:
+            time.sleep(0.2)
+    finally:
+        store.close()
+    return {"role": "server", "status": "PASS"}
 
 
 def run_client(args: argparse.Namespace) -> dict[str, Any]:
@@ -192,7 +215,7 @@ def run_client(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--role", choices=["prep", "client"], required=True)
+    p.add_argument("--role", choices=["prep", "server", "client"], required=True)
     p.add_argument("--store-module", default="mooncake.store")
     # topology / endpoints
     p.add_argument("--local-hostname", required=True, help="unique host:port")
@@ -229,7 +252,12 @@ def main(argv: list[str]) -> int:
 
     _apply_cxl_env(args)
     try:
-        summary = run_prep(args) if args.role == "prep" else run_client(args)
+        if args.role == "prep":
+            summary = run_prep(args)
+        elif args.role == "server":
+            summary = run_server(args)
+        else:
+            summary = run_client(args)
     except Exception as err:  # structured failure, nonzero exit
         summary = {"role": args.role, "status": "FAIL", "error": repr(err)}
         print(json.dumps(summary), flush=True)

@@ -49,8 +49,9 @@ meta_py="$pkg_root/mooncake/http_metadata_server.py"
 [ -f "$meta_py" ] || fatal "missing http_metadata_server.py"
 
 mkdir -p "$OUT_DIR"
-META_PID=""; MASTER_PID=""
+META_PID=""; MASTER_PID=""; WRITER_PID=""
 cleanup() {
+  [ -n "$WRITER_PID" ] && kill "$WRITER_PID" 2>/dev/null || true
   [ -n "$MASTER_PID" ] && kill "$MASTER_PID" 2>/dev/null || true
   [ -n "$META_PID" ] && kill "$META_PID" 2>/dev/null || true
 }
@@ -84,10 +85,20 @@ common=( --store-module mooncake.store
          --block-bytes "$BLOCK_BYTES" --num-objects "$NUM_OBJECTS" )
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)"
-echo "[perf] prep: writing $NUM_OBJECTS x $BLOCK_BYTES blocks into the pool"
-"$python_bin" "$repo_dir/scripts/cxl_gpu_perf.py" --role prep \
+writer_log="$OUT_DIR/${run_id}-writer.log"
+echo "[perf] writer(server): writing $NUM_OBJECTS x $BLOCK_BYTES blocks; stays alive"
+# The writer must persist: a CXL replica references the allocating segment's
+# endpoint, so readers 404 if the writer exits and its descriptor is deleted.
+"$python_bin" "$repo_dir/scripts/cxl_gpu_perf.py" --role server \
   --local-hostname "$MASTER_HOST:50060" --key-prefix "$run_id" \
-  "${common[@]}" || fatal "prep failed"
+  "${common[@]}" >"$writer_log" 2>&1 &
+WRITER_PID=$!
+t=0; until grep -q '"status": "READY"' "$writer_log" 2>/dev/null; do
+  sleep 0.3; t=$((t+1))
+  kill -0 "$WRITER_PID" 2>/dev/null || fatal "writer died; see $writer_log"
+  [ "$t" -gt 200 ] && fatal "writer not READY; see $writer_log"
+done
+echo "[perf] writer READY (objects resident, segment held open)"
 
 echo
 printf '%-8s %-14s %-16s\n' "clients" "aggregate_GB/s" "per_client_GB/s(avg)"
