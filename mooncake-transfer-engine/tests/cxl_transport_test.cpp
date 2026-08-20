@@ -42,7 +42,11 @@ namespace mooncake {
 
 DEFINE_string(local_server_name, getHostname(),
               "Local server name for segment discovery");
-DEFINE_string(metadata_server, "127.0.0.1:2379", "etcd server host address");
+// This is a self-contained single-process CXL transport test (file-backed sim
+// pool); it does not need an external metadata store. Default to P2P handshake
+// so ctest passes without an etcd at 127.0.0.1:2379. Override for etcd runs.
+DEFINE_string(metadata_server, "P2PHANDSHAKE",
+              "Transfer Engine metadata server (P2PHANDSHAKE, or etcd host:port)");
 DEFINE_string(mode, "initiator",
               "Running mode: initiator or target. Initiator node read/write "
               "data blocks from target node");
