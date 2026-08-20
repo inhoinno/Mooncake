@@ -42,11 +42,16 @@ namespace mooncake {
 
 DEFINE_string(local_server_name, getHostname(),
               "Local server name for segment discovery");
-// This is a self-contained single-process CXL transport test (file-backed sim
-// pool); it does not need an external metadata store. Default to P2P handshake
-// so ctest passes without an etcd at 127.0.0.1:2379. Override for etcd runs.
-DEFINE_string(metadata_server, "P2PHANDSHAKE",
-              "Transfer Engine metadata server (P2PHANDSHAKE, or etcd host:port)");
+// SetUp() publishes and then resolves this process's own CXL segment by name
+// (openSegment -> getSegmentDescByID), which needs a real metadata store; P2P
+// handshake cannot resolve a process's own bare-name segment. Match the rest of
+// the suite (scripts/run_tests.sh) and default to the lightweight HTTP metadata
+// server, which requires no etcd. Start it first:
+//   mooncake_http_metadata_server --port 8080 &
+// Override with --metadata_server=<etcd host:port> for an etcd deployment.
+DEFINE_string(metadata_server, "http://127.0.0.1:8080/metadata",
+              "Transfer Engine metadata server "
+              "(http://host:port/metadata, or etcd host:port)");
 DEFINE_string(mode, "initiator",
               "Running mode: initiator or target. Initiator node read/write "
               "data blocks from target node");
