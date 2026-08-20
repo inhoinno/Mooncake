@@ -323,7 +323,10 @@ TEST_F(CXLTransportTest, FunctionalCxlToGpuAndGpuToCxl) {
 }  // namespace mooncake
 
 int main(int argc, char** argv) {
-    gflags::ParseCommandLineFlags(&argc, &argv, false);
+    // InitGoogleTest must run first so it strips --gtest_* from argv; otherwise
+    // gflags::ParseCommandLineFlags aborts with "unknown command line flag
+    // 'gtest_filter'" when ctest selects a single case by filter.
     ::testing::InitGoogleTest(&argc, argv);
+    gflags::ParseCommandLineFlags(&argc, &argv, false);
     return RUN_ALL_TESTS();
 }
