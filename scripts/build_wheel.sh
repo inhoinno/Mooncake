@@ -394,6 +394,21 @@ echo "Detected architecture: $ARCH_SUFFIX"
 echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
+# auditwheel repair requires patchelf >= 0.14.5, but Ubuntu 22.04 apt ships
+# 0.14.3. The PyPI patchelf package provides a modern static binary; install it
+# into SELECTED_PYTHON and put its script dir ahead of PATH so auditwheel's
+# shutil.which("patchelf") resolves it instead of the system copy. This makes
+# direct build_wheel.sh / build_todo1_overlay.sh runs work without the bootstrap.
+"$SELECTED_PYTHON" -m pip install --upgrade "patchelf>=0.17" || true
+for _pf_dir in \
+    "$("$SELECTED_PYTHON" -c 'import sysconfig;print(sysconfig.get_path("scripts"))' 2>/dev/null)" \
+    "$("$SELECTED_PYTHON" -m site --user-base 2>/dev/null)/bin"; do
+    if [ -n "$_pf_dir" ] && [ -x "$_pf_dir/patchelf" ]; then
+        PATH="$_pf_dir:$PATH"; export PATH
+    fi
+done
+echo "Using patchelf: $(command -v patchelf) version=$(patchelf --version 2>/dev/null)"
+
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
 if [ "$NPU_BUILD" = "1" ]; then
     "$SELECTED_PYTHON" -m build --wheel --no-isolation --outdir ${OUTPUT_DIR}
