@@ -461,7 +461,7 @@ report_status() {
                 USE_VRAM_SEGMENT USE_NCCL_DEVICE USE_NCCL_HOST USE_MUSA USE_MACA; do
       echo "[status] cmake.$flag=$(cache_value "$flag")"
     done
-    ctest --test-dir "$build_dir" -N -L todo1
+    ctest --test-dir "$build_dir" -N -L 'todo1|multisource'
   else
     echo "[status] cmake_cache=not_built"
   fi
@@ -514,8 +514,12 @@ run_all() {
 
   verify_cpu_cache
   stage="final TODO#1 test gate"
-  ctest --test-dir "$build_dir" --output-on-failure -L todo1 -LE hardware
-  pass "todo1_ctest" "all configured TODO#1 tests passed"
+  # Include the multisource/GPU-path policy tests (gpu_transfer_policy_test,
+  # multipath_placement_test, CxlAware allocation): they are CPU-only logic
+  # gates for the CXL+RDMA->GPU multipath story and were previously hidden
+  # because they carry the "multisource" label, not "todo1".
+  ctest --test-dir "$build_dir" --output-on-failure -L 'todo1|multisource' -LE hardware
+  pass "todo1_ctest" "TODO#1 and multisource GPU-path policy tests passed"
   verify_artifacts
   report_status
 
