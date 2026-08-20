@@ -33,6 +33,7 @@ import os
 import signal
 import sys
 import time
+import random
 from typing import Any
 
 # 16 MiB - 4 KiB: largest block under the Store single-slice cap (Slab::kSize-16).
@@ -50,6 +51,14 @@ def _payload(label: str, size: int) -> bytes:
 
 def _object_key(prefix: str, index: int) -> str:
     return f"{prefix}-obj-{index:06d}"
+
+
+def _client_object_order(offset: int, count: int, seed: int) -> list[int]:
+    if offset < 0 or count <= 0:
+        raise PerfError("object-offset must be non-negative and object-count positive")
+    order = list(range(offset, offset + count))
+    random.Random(seed).shuffle(order)
+    return order
 
 
 def _apply_cxl_env(args: argparse.Namespace) -> None:
@@ -163,12 +172,24 @@ def run_client(args: argparse.Namespace) -> dict[str, Any]:
         ptrs = [int(t.data_ptr()) for t in tensors]
         sizes = [args.block_bytes] * args.batch_size
 
+        object_count = args.object_count or args.num_objects
+        if args.object_offset + object_count > args.num_objects:
+            raise PerfError(
+                f"client range [{args.object_offset}, "
+                f"{args.object_offset + object_count}) exceeds {args.num_objects} objects"
+            )
+        order = _client_object_order(
+            args.object_offset, object_count, args.access_seed)
+
         def one_batch(base: int) -> None:
             keys = [
-                _object_key(args.key_prefix, (base + j) % args.num_objects)
+                _object_key(args.key_prefix, order[(base + j) % object_count])
                 for j in range(args.batch_size)
             ]
-            res = store.batch_get_into(keys, ptrs, sizes)
+            # The pybind call is eager: RealClient::batch_get_into_internal
+            # completes before this list is returned. Synchronize as an extra
+            # CUDA-side assertion before accounting bytes.
+            res = list(store.batch_get_into(keys, ptrs, sizes))
             torch.cuda.synchronize()
             for r in res:
                 if int(r) != args.block_bytes:
@@ -182,9 +203,18 @@ def run_client(args: argparse.Namespace) -> dict[str, Any]:
             one_batch(base)
             base += args.batch_size
 
+        # All clients in a scaling round wait for one epoch barrier. This makes
+        # aggregate throughput total_bytes / common_wall_interval rather than a
+        # physically misleading sum of partially overlapping per-client rates.
+        if args.start_at_epoch > 0:
+            delay = args.start_at_epoch - time.time()
+            if delay > 0:
+                time.sleep(delay)
+
         # Timed loop.
         bytes_read = 0
         batches = 0
+        start_epoch = time.time()
         start = time.monotonic()
         deadline = start + args.runtime
         while time.monotonic() < deadline:
@@ -193,6 +223,7 @@ def run_client(args: argparse.Namespace) -> dict[str, Any]:
             bytes_read += args.block_bytes * args.batch_size
             batches += 1
         elapsed = time.monotonic() - start
+        end_epoch = time.time()
 
         gbps = (bytes_read / elapsed) / 1e9 if elapsed > 0 else 0.0
         gibps = (bytes_read / elapsed) / (1024**3) if elapsed > 0 else 0.0
@@ -205,6 +236,11 @@ def run_client(args: argparse.Namespace) -> dict[str, Any]:
             "batch_size": args.batch_size,
             "batches": batches,
             "bytes_read": bytes_read,
+            "object_offset": args.object_offset,
+            "object_count": object_count,
+            "access_seed": args.access_seed,
+            "start_epoch": start_epoch,
+            "end_epoch": end_epoch,
             "elapsed_sec": round(elapsed, 4),
             "throughput_GBps": round(gbps, 3),
             "throughput_GiBps": round(gibps, 3),
@@ -234,6 +270,14 @@ def main(argv: list[str]) -> int:
     # workload
     p.add_argument("--block-bytes", type=int, default=DEFAULT_BLOCK_BYTES)
     p.add_argument("--num-objects", type=int, default=64)
+    p.add_argument("--object-offset", type=int, default=0,
+                   help="first object in this client's disjoint working set")
+    p.add_argument("--object-count", type=int, default=0,
+                   help="objects in this client working set (0 = all)")
+    p.add_argument("--access-seed", type=int, default=1,
+                   help="deterministic permutation; avoids lockstep key reuse")
+    p.add_argument("--start-at-epoch", type=float, default=0.0,
+                   help="shared wall-clock barrier for one scaling round")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--runtime", type=float, default=10.0)
     p.add_argument("--warmup", type=int, default=3)

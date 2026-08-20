@@ -251,6 +251,18 @@ foreach(todo2_wss_case IN LISTS TODO2_CXL_WSS_TEST_CASES)
       WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/scripts")
 endforeach()
 
+# Perf harness protocol/accounting gates are dependency-light. Hardware
+# throughput remains a separate T1/T2 lab run.
+add_test(
+  NAME todoextra_rdma_cxl_perf_harness_test
+  COMMAND ${PYTHON_EXECUTABLE} -m unittest -v test_perf_harness.py)
+set_tests_properties(
+  todoextra_rdma_cxl_perf_harness_test
+  PROPERTIES
+    LABELS "cxl;rdma;gpu;todoextra;perf;t0;unit"
+    TIMEOUT 30
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/scripts")
+
 add_store_test(master_metrics_test master_metrics_test.cpp)
 add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)

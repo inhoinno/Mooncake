@@ -120,5 +120,5 @@ done
 echo
 echo "[rdma] JSON + logs in $OUT_DIR"
 echo "[rdma] GPUDirect note: to_GPU_gpudirect reflects MC_STORE_RDMA_GPU_DIRECT=1;"
-echo "       if the NIC/driver/registration path is not GDR-capable the read path"
-echo "       falls back to host staging (numbers will match staged). See §Plumbing."
+echo "       the selected path has no automatic fallback. Unsupported device-MR"
+echo "       registration should FAIL; confirm path=rdma_gpu_direct in the log."

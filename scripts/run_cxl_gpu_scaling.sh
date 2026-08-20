@@ -23,7 +23,7 @@ METRICS_PORT="${CXLPERF_METRICS_PORT:-19003}"
 META_PORT="${CXLPERF_META_PORT:-8080}"
 GPU_ID="${CXLPERF_GPU_ID:-0}"
 BLOCK_BYTES="${CXLPERF_BLOCK_BYTES:-16773120}"       # 16 MiB - 4 KiB (Store cap)
-NUM_OBJECTS="${CXLPERF_NUM_OBJECTS:-64}"
+OBJECTS_PER_CLIENT="${CXLPERF_OBJECTS_PER_CLIENT:-64}"
 BATCH_SIZE="${CXLPERF_BATCH_SIZE:-8}"
 RUNTIME="${CXLPERF_RUNTIME:-10}"
 WARMUP="${CXLPERF_WARMUP:-3}"
@@ -86,6 +86,15 @@ MC_CXL_DEV_PATH="$DEV_PATH" MC_CXL_DEV_SIZE="$DEV_SIZE" \
 MASTER_PID=$!
 wait_port "$MASTER_HOST" "$MASTER_PORT" 50 || fatal "master did not start"
 
+# Give every client in every round a unique working set. Reusing the same 1 GiB
+# across all clients benchmarks shared LLC hits after warmup, not dax24.0.
+total_clients=0
+for n in $CLIENTS; do total_clients=$((total_clients + n)); done
+NUM_OBJECTS=$((total_clients * OBJECTS_PER_CLIENT))
+required_bytes=$((NUM_OBJECTS * BLOCK_BYTES))
+[ "$required_bytes" -lt "$DEV_SIZE" ] ||
+  fatal "unique working sets require $required_bytes bytes but pool is $DEV_SIZE; lower CXLPERF_OBJECTS_PER_CLIENT"
+
 common=( --store-module mooncake.store
          --master-server "$MASTER_HOST:$MASTER_PORT"
          --metadata-server "http://127.0.0.1:$META_PORT/metadata"
@@ -111,14 +120,19 @@ echo "[perf] writer READY (objects resident, segment held open)"
 
 echo
 printf '%-8s %-14s %-16s\n' "clients" "aggregate_GB/s" "per_client_GB/s(avg)"
+round_base=0
 for n in $CLIENTS; do
   pids=(); files=()
+  start_at="$($python_bin -c 'import time; print(time.time()+3.0)')"
   for i in $(seq 0 $((n-1))); do
     f="$OUT_DIR/${run_id}-n${n}-c${i}.json"; files+=("$f")
     "$python_bin" "$repo_dir/scripts/cxl_gpu_perf.py" --role client \
       --local-hostname "$MASTER_HOST:$((50100 + i))" \
       --client-id "n${n}-c${i}" --gpu-id "$GPU_ID" \
       --batch-size "$BATCH_SIZE" --runtime "$RUNTIME" --warmup "$WARMUP" \
+      --object-offset "$((round_base + i * OBJECTS_PER_CLIENT))" \
+      --object-count "$OBJECTS_PER_CLIENT" --access-seed "$((1000*n+i))" \
+      --start-at-epoch "$start_at" \
       --key-prefix "$run_id" --summary-json "$f" \
       "${common[@]}" >"$OUT_DIR/${run_id}-n${n}-c${i}.log" 2>&1 &
     pids+=($!)
@@ -127,17 +141,22 @@ for n in $CLIENTS; do
   [ "$ok" -eq 1 ] || { echo "[WARN] a client in the n=$n round failed; see $OUT_DIR"; }
   agg="$("$python_bin" - "${files[@]}" <<'PY'
 import json,sys
-tot=0.0; k=0
+total_bytes=0; k=0; starts=[]; ends=[]; per=[]
 for p in sys.argv[1:]:
     try:
         d=json.load(open(p))
-        if d.get("status")=="PASS": tot+=d["throughput_GBps"]; k+=1
+        if d.get("status")=="PASS":
+            total_bytes += d["bytes_read"]; starts.append(d["start_epoch"])
+            ends.append(d["end_epoch"]); per.append(d["throughput_GBps"]); k+=1
     except Exception: pass
-print(f"{tot:.3f} {(tot/k if k else 0):.3f} {k}")
+wall=max(ends)-min(starts) if starts else 0
+aggregate=total_bytes/wall/1e9 if wall>0 else 0
+print(f"{aggregate:.3f} {(sum(per)/k if k else 0):.3f} {k}")
 PY
 )"
   read -r a per k <<<"$agg"
   printf '%-8s %-14s %-16s (%s/%s ok)\n' "$n" "$a" "$per" "$k" "$n"
+  round_base=$((round_base + n * OBJECTS_PER_CLIENT))
 done
 echo
 echo "[perf] summaries in $OUT_DIR ; master.log / metadata.log there too"
