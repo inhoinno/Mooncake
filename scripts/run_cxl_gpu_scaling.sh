@@ -36,6 +36,15 @@ fatal() { echo "[FATAL] $*" >&2; exit 2; }
 [ "$(uname -s)" = "Linux" ] || fatal "requires the Linux GPU host"
 [ -c "$DEV_PATH" ] || fatal "$DEV_PATH is not a devdax char device"
 
+# CXL objects are single-slice: kMaxSliceSize = Slab::kSize - 16 = 16773120+16.
+MAX_CXL_BLOCK=16773120
+if [ "$BLOCK_BYTES" -gt "$MAX_CXL_BLOCK" ]; then
+  fatal "CXLPERF_BLOCK_BYTES=$BLOCK_BYTES exceeds the CXL single-slice cap ($MAX_CXL_BLOCK, 16 MiB-4 KiB).
+        The CXL allocation strategy is single-replica and cannot split a block, so
+        PutStart rejects it (invalid_slice_size). For 1-16 GiB blocks that shard
+        across DRAM segments, use scripts/run_dram_rdma_baseline.sh instead."
+fi
+
 # python + wheel
 if [ -n "${PYTHON_BIN:-}" ]; then python_bin="$PYTHON_BIN"
 elif [ -x "$repo_dir/$build_dir_name/.venv/bin/python" ]; then python_bin="$repo_dir/$build_dir_name/.venv/bin/python"
