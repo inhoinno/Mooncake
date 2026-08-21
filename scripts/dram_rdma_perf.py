@@ -248,8 +248,18 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
             store.batch_get_into([args.key], [ptr], [size])
             torch.cuda.synchronize()
         t = time.monotonic()
+        transfer_to_staging_ns = 0
+        staging_to_gpu_ns = 0
         for _ in range(args.iterations):
-            res = list(store.batch_get_into([args.key], [ptr], [size]))
+            if not hasattr(store, "batch_get_into_profiled"):
+                raise PerfError(
+                    "mooncake.store is missing batch_get_into_profiled; "
+                    "rebuild and restage the CUDA store.so")
+            profile = store.batch_get_into_profiled(
+                [args.key], [ptr], [size])
+            res = list(profile["results"])
+            transfer_to_staging_ns += int(profile["transfer_to_staging_ns"])
+            staging_to_gpu_ns += int(profile["staging_to_gpu_ns"])
             torch.cuda.synchronize()
             if int(res[0]) != size:
                 raise PerfError(f"GPU get_into returned {res[0]}, expected {size}")
@@ -258,6 +268,21 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
         out["gpu_path_selected"] = path
         out["to_gpu" + ("_gpudirect" if gdr else "_staged")] = _rate(
             size * args.iterations, dt, args.iterations)
+        if not gdr:
+            transfer_sec = transfer_to_staging_ns / 1e9
+            scatter_sec = staging_to_gpu_ns / 1e9
+            measured_sec = transfer_sec + scatter_sec
+            out["staged_breakdown"] = {
+                "rdma_to_host": _rate(
+                    size * args.iterations, transfer_sec, args.iterations),
+                "host_to_gpu": _rate(
+                    size * args.iterations, scatter_sec, args.iterations),
+                "measured_phases_sec": round(measured_sec, 6),
+                "unattributed_sec": round(max(0.0, dt - measured_sec), 6),
+                "unattributed_note":
+                    "Python/pybind overhead, metadata preparation, and final "
+                    "torch.cuda.synchronize outside the two internal clocks",
+            }
         return out
     finally:
         store.close()

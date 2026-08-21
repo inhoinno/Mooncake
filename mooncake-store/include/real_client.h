@@ -157,6 +157,20 @@ class RealClient : public PyClient {
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
 
+    struct BatchGetIntoTiming {
+        uint64_t transfer_to_staging_ns{0};
+        uint64_t staging_to_gpu_ns{0};
+    };
+
+    [[nodiscard]] BatchGetIntoTiming get_last_batch_get_into_timing() const {
+        return {
+            last_batch_get_into_transfer_to_staging_ns_.load(
+                std::memory_order_relaxed),
+            last_batch_get_into_staging_to_gpu_ns_.load(
+                std::memory_order_relaxed),
+        };
+    }
+
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys
@@ -976,6 +990,12 @@ class RealClient : public PyClient {
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
+
+    // Per-call staged GPU read breakdown. The TODO Extra perf process issues
+    // one batch_get_into at a time; atomics keep the diagnostic API race-free
+    // without putting locks on the transfer path.
+    std::atomic<uint64_t> last_batch_get_into_transfer_to_staging_ns_{0};
+    std::atomic<uint64_t> last_batch_get_into_staging_to_gpu_ns_{0};
 
     // Dummy Client manage related members
     void dummy_client_monitor_func();

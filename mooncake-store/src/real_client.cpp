@@ -4655,6 +4655,10 @@ int RealClient::upsert_batch(const std::vector<std::string> &keys,
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
+    last_batch_get_into_transfer_to_staging_ns_.store(0,
+                                                       std::memory_order_relaxed);
+    last_batch_get_into_staging_to_gpu_ns_.store(0,
+                                                  std::memory_order_relaxed);
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() { return batch_get_into_internal(keys, buffers, sizes); },
@@ -5187,8 +5191,20 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
     if (!valid_operations.empty()) {
         // Execute batch transfer
+        const bool has_staged_gpu_read =
+            std::any_of(valid_operations.begin(), valid_operations.end(),
+                        [](const auto &op) { return op.staged_buffer != nullptr; });
+        const auto transfer_start = std::chrono::steady_clock::now();
         const auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+        if (has_staged_gpu_read) {
+            const auto transfer_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - transfer_start)
+                    .count();
+            last_batch_get_into_transfer_to_staging_ns_.fetch_add(
+                static_cast<uint64_t>(transfer_ns), std::memory_order_relaxed);
+        }
 
         // Process transfer results
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
@@ -5202,6 +5218,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 continue;
             }
             if (op.staged_buffer) {
+                const auto scatter_start = std::chrono::steady_clock::now();
                 if (auto copied = scatter_host_to_maybe_device(
                         op.gpu_destination, op.staged_buffer->ptr(),
                         op.total_size,
@@ -5209,6 +5226,13 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                     !copied) {
                     results[op.original_index] = tl::unexpected(copied.error());
                 }
+                const auto scatter_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - scatter_start)
+                        .count();
+                last_batch_get_into_staging_to_gpu_ns_.fetch_add(
+                    static_cast<uint64_t>(scatter_ns),
+                    std::memory_order_relaxed);
             }
         }
     }

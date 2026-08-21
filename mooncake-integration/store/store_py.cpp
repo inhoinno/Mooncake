@@ -2948,6 +2948,40 @@ PYBIND11_MODULE(store, m) {
             "multiple "
             "keys")
         .def(
+            "batch_get_into_profiled",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<size_t> &sizes) {
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                std::vector<int64_t> result;
+                {
+                    py::gil_scoped_release release;
+                    result = self.store_->batch_get_into(keys, buffers, sizes);
+                }
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) {
+                    throw std::runtime_error(
+                        "batch_get_into_profiled requires a real client");
+                }
+                const auto timing =
+                    real_client->get_last_batch_get_into_timing();
+                py::dict profile;
+                profile["results"] = result;
+                profile["transfer_to_staging_ns"] =
+                    timing.transfer_to_staging_ns;
+                profile["staging_to_gpu_ns"] = timing.staging_to_gpu_ns;
+                return profile;
+            },
+            py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            "Profile a staged GPU batch read, returning results plus separate "
+            "remote-transfer-to-host and host-to-GPU clocks")
+        .def(
             "put_from",
             [](MooncakeStorePyWrapper &self, const std::string &key,
                uintptr_t buffer_ptr, size_t size,
