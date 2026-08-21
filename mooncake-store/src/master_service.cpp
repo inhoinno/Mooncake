@@ -3686,6 +3686,23 @@ auto MasterService::AllocateAndInsertMetadata(
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
         } else {
+            ApplyMountedSegmentProtocols(allocator_manager,
+                                         allocation_result.value());
+            if (GpuTransferTraceEnabledFromEnvironment()) {
+                for (const auto& replica : allocation_result.value()) {
+                    const auto segment_names = replica.get_segment_names();
+                    if (segment_names.empty() ||
+                        !segment_names.front().has_value()) {
+                        continue;
+                    }
+                    LOG(INFO)
+                        << "component=mooncake_master "
+                           "event=replica_protocol_selected segment_name="
+                        << *segment_names.front() << " protocol="
+                        << allocator_manager.getProtocol(
+                               *segment_names.front());
+                }
+            }
             allocated_memory_replicas = allocation_result->size();
             replicas = std::move(allocation_result.value());
         }

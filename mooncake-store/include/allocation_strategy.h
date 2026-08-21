@@ -913,6 +913,27 @@ class CxlAwareAllocationStrategy final : public AllocationStrategy {
     CxlAllocationStrategy cxl_;
 };
 
+// Allocation strategies choose an allocator, but AllocatedBuffer historically
+// defaults its serialized protocol to "tcp".  The mounted segment is the
+// authoritative source of the payload transport, so apply that protocol before
+// replica metadata is published.  This must run for non-CXL Masters too (for
+// example an RDMA-only Store deployment using RandomAllocationStrategy).
+inline void ApplyMountedSegmentProtocols(
+    const AllocatorManager& allocator_manager,
+    std::vector<Replica>& replicas) {
+    for (auto& replica : replicas) {
+        const auto segment_names = replica.get_segment_names();
+        if (segment_names.empty() || !segment_names.front().has_value()) {
+            continue;
+        }
+        const auto protocol =
+            allocator_manager.getProtocol(*segment_names.front());
+        if (!protocol.empty()) {
+            replica.set_memory_protocol(protocol);
+        }
+    }
+}
+
 /**
  * @brief Factory function to create allocation strategy based on type
  */
