@@ -102,18 +102,40 @@ def run_server(args: argparse.Namespace) -> dict[str, Any]:
     return {"role": "server", "status": "PASS"}
 
 
+def _assert_placement(placement: dict[str, Any], args: argparse.Namespace) -> None:
+    # Fan-out: the object must span at least the requested number of source
+    # segments (proves "Distributed /N").
+    if len(placement["source_endpoints"]) < args.min_source_segments:
+        raise PerfError(
+            f"object spans {len(placement['source_endpoints'])} source segments; "
+            f"expected at least {args.min_source_segments}: {placement}"
+        )
+    # Transport: every source segment must be RDMA. A 'tcp' here means a source
+    # fell back (e.g. its RDMA segment did not register) and the fetch would not
+    # use RDMA -- fail loudly instead of silently measuring TCP.
+    bad = [p for p in placement["source_protocols"] if p != "rdma"]
+    if bad:
+        raise PerfError(
+            f"object placed on non-RDMA segment(s) {placement['source_protocols']}; "
+            f"expected all 'rdma'. A source likely fell back to tcp: {placement}"
+        )
+
+
 def run_prep(args: argparse.Namespace) -> dict[str, Any]:
     module, store = _open_store(args, args.prep_segment_bytes, 64 * MiB)
     try:
+        # Default: write fresh against the CURRENT sources. A pre-existing object
+        # from an earlier run (different sources / pre-MTU-fix tcp fallback)
+        # otherwise poisons the measurement via the idempotent short-circuit.
         if int(store.is_exist(args.key)) == 1:
-            placement = _placement_for_key(store, args.key)
-            if len(placement["source_endpoints"]) < args.min_source_segments:
-                raise PerfError(
-                    f"existing object spans only {placement['source_segment_count']} "
-                    f"source segments; expected {args.min_source_segments}"
-                )
-            return {"role": "prep", "status": "PASS", "note": "already present",
-                    "block_bytes": args.block_bytes, **placement}
+            if args.reuse:
+                placement = _placement_for_key(store, args.key)
+                _assert_placement(placement, args)
+                return {"role": "prep", "status": "PASS", "note": "already present",
+                        "block_bytes": args.block_bytes, **placement}
+            rc = int(store.remove(args.key, True))  # force: skip lease checks
+            if rc != 0:
+                raise PerfError(f"failed to remove stale object {args.key} rc={rc}")
         config = module.ReplicateConfig()
         config.replica_num = 1
         config.nof_replica_num = 0
@@ -129,11 +151,7 @@ def run_prep(args: argparse.Namespace) -> dict[str, Any]:
         if rc != 0:
             raise PerfError(f"put {args.key} failed rc={rc}")
         placement = _placement_for_key(store, args.key)
-        if len(placement["source_endpoints"]) < args.min_source_segments:
-            raise PerfError(
-                f"object spans {len(placement['source_endpoints'])} source segments; "
-                f"expected at least {args.min_source_segments}: {placement}"
-            )
+        _assert_placement(placement, args)
         return {"role": "prep", "status": "PASS", "block_bytes": args.block_bytes,
                 **placement}
     finally:
@@ -259,6 +277,9 @@ def main(argv: list[str]) -> int:
     p.add_argument("--segment-bytes", type=int, default=8 * GiB,
                    help="per-server DRAM contributed to the pool")
     p.add_argument("--prep-segment-bytes", type=int, default=0)
+    p.add_argument("--reuse", action="store_true",
+                   help="reuse an existing object instead of removing + re-putting "
+                        "it fresh against the current sources (default: fresh)")
     p.add_argument("--min-source-segments", type=int, default=1,
                    help="prep fails unless placement spans this many RDMA endpoints")
     # consumer sizing / behavior
