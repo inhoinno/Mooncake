@@ -51,6 +51,8 @@ trap cleanup EXIT
 wait_port() { local t=0; while ! (exec 9<>"/dev/tcp/$1/$2") 2>/dev/null; do
   sleep 0.2; t=$((t+1)); [ "$t" -gt "${3:-50}" ] && return 1; done; return 0; }
 
+"$python_bin" -c 'import aiohttp' 2>/dev/null || \
+  fatal "the HTTP metadata server needs aiohttp: $python_bin -m pip install aiohttp (do not run the metadata server under sudo/root, which lacks it)"
 echo "[rdma] metadata :$META_PORT ; master :$MASTER_PORT"
 "$python_bin" "$meta_py" --port "$META_PORT" >"$OUT_DIR/metadata.log" 2>&1 & META_PID=$!
 wait_port 127.0.0.1 "$META_PORT" 50 || fatal "metadata did not start"

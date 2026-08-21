@@ -35,6 +35,12 @@ build_dir_name="${MOONCAKE_BUILD_DIR:-build-gpu-multipath}"
 fatal() { echo "[FATAL] $*" >&2; exit 2; }
 [ "$(uname -s)" = "Linux" ] || fatal "requires the Linux GPU host"
 [ -c "$DEV_PATH" ] || fatal "$DEV_PATH is not a devdax char device"
+if [ ! -r "$DEV_PATH" ] || [ ! -w "$DEV_PATH" ]; then
+  fatal "$DEV_PATH is not readable+writable by $(id -un) (EACCES).
+        Fix: sudo chmod a+rw $DEV_PATH   (resets on reboot; or add your user to
+        the device group / add a udev rule). Do NOT run this whole script under
+        sudo -- that breaks the venv PYTHONPATH."
+fi
 
 # CXL objects are single-slice: kMaxSliceSize = Slab::kSize - 16 = 16773120+16.
 MAX_CXL_BLOCK=16773120
@@ -71,6 +77,8 @@ wait_port() { # host port timeout_s
     sleep 0.2; t=$((t+1)); [ "$t" -gt "${3:-50}" ] && return 1; done; return 0
 }
 
+"$python_bin" -c 'import aiohttp' 2>/dev/null || \
+  fatal "the HTTP metadata server needs aiohttp: $python_bin -m pip install aiohttp"
 echo "[perf] metadata server :$META_PORT"
 "$python_bin" "$meta_py" --port "$META_PORT" >"$OUT_DIR/metadata.log" 2>&1 &
 META_PID=$!
