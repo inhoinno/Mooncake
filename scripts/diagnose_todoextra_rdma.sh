@@ -42,6 +42,7 @@ section identity
 echo "role=$role host=$(hostname) local_ip=${local_ip:-unset} peer_ip=${peer_ip:-unset}"
 echo "master=$master_address metadata=$metadata_url rdma_device=$device"
 echo "source_endpoint=$source_endpoint report=$report"
+echo "MC_MTU=${MC_MTU:-unset} TODOEXTRA_RDMA_MTU=${TODOEXTRA_RDMA_MTU:-unset}"
 run uname -a
 run git -C "$repo_dir" rev-parse --short HEAD
 

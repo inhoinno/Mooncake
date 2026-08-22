@@ -54,6 +54,17 @@ segment_bytes=$((segment_gib * 1024 * 1024 * 1024))
 out_dir="${TODOEXTRA_OUT_DIR:-/tmp/todoextra-rdma}"
 mkdir -p "$out_dir"
 
+# RoCE path MTU must fit the Ethernet netdev MTU on both peers. Mooncake's
+# process-wide default is 4096 and is capped only by verbs active_mtu, which may
+# still report 4096 when the associated netdev is configured for MTU 1500.
+# Use a conservative, explicit baseline unless the lab opts into another value.
+rdma_mtu="${TODOEXTRA_RDMA_MTU:-${MC_MTU:-1024}}"
+case "$rdma_mtu" in 512|1024|2048|4096) ;; *)
+  fatal "TODOEXTRA_RDMA_MTU/MC_MTU must be 512, 1024, 2048, or 4096"
+esac
+export MC_MTU="$rdma_mtu"
+echo "[preflight] rdma_device=${device_name:-auto} MC_MTU=$MC_MTU"
+
 common=(--store-module mooncake.store --master-server "$master_address"
         --metadata-server "$metadata_url" --device-name "$device_name"
         --key "$key" --block-bytes "$block_bytes")
