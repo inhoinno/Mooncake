@@ -174,6 +174,72 @@ descriptor_bytes=34359738368
 Stop if fewer than four distinct source endpoints are reported; that placement
 cannot answer this experiment's four-source question.
 
+
+### Trouble shooting from m3 ""PerfError(\"object spans 3 source segments; expected at least 4"
+Results for prep in m3
+```
+E0822 18:30:43.207448 369003 real_client.cpp:6788] Object not found for key: todoextra-rdma-4x8g-0003
+{"role": "prep", "status": "FAIL", "error": "PerfError(\"object spans 3 source segments; expected at least 4: {'replica_slices': 3, 'source_endpoints': ['192.168.5.44:50200', '192.168.5.44:50201', '192.168.5.44:50203'], 'source_segment_count': 3, 'source_protocols': ['rdma'], 'descriptor_bytes': 25769803776}\")"}
+```
+
+Ran command in m4
+```
+(venv) labuser@solab-m4:~/inho/Multipath/Mooncake-dev$ sudo -E env \
+  PYTHON_BIN=/home/labuser/venv/bin/python3 \
+  TODOEXTRA_MASTER_ADDRESS=192.168.3.43:50051 \
+  TODOEXTRA_METADATA_URL=http://192.168.3.43:18080/metadata \
+  TODOEXTRA_LOCAL_IP=192.168.5.44 \
+  TODOEXTRA_SOURCE_COUNT=4 \
+  TODOEXTRA_SOURCE_BASE_PORT=50200 \
+  TODOEXTRA_SEGMENT_GIB=8 \
+  TODOEXTRA_OBJECT_COUNT=4 \
+  TODOEXTRA_BLOCK_GIB=8 \
+  TODOEXTRA_KEY=todoextra-rdma-4x8g \
+  TODOEXTRA_RDMA_MTU=1024 \
+  TODOEXTRA_OUT_DIR=/tmp/todoextra-rdma-4x8g \
+  RDMA_DEVICE_NAME=mlx5_0 \
+  MOONCAKE_BUILD_DIR=build-gpu-multipath \
+  bash scripts/run_dram_rdma_distributed.sh source
+[sudo] password for labuser:
+[preflight] rdma_device=mlx5_0 MC_MTU=1024
+[todoextra] 4 RDMA source clients READY on 192.168.5.44; Ctrl-C to stop
+```
+
+Prep command in m3
+```
+sudo -E env \
+PYTHON_BIN=/home/labuser/venv/bin/python3 \
+TODOEXTRA_MASTER_ADDRESS=192.168.3.43:50051 \
+TODOEXTRA_METADATA_URL=http://192.168.3.43:18080/metadata \
+  TODOEXTRA_LOCAL_IP=192.168.5.43 \
+  TODOEXTRA_EXPECT_SOURCES=4 \
+  TODOEXTRA_OBJECT_COUNT=4 \
+  TODOEXTRA_BLOCK_GIB=8 \
+  TODOEXTRA_KEY=todoextra-rdma-4x8g \
+  TODOEXTRA_RDMA_MTU=1024 \
+  TODOEXTRA_OUT_DIR=/tmp/todoextra-rdma-4x8g \
+  RDMA_DEVICE_NAME=mlx5_0 \
+  MOONCAKE_BUILD_DIR=build-gpu-multipath \
+  bash scripts/run_dram_rdma_distributed.sh prep
+```
+prep
+```
+
+(venv) labuser@solab-m3:~/inho/Multipath/Mooncake-dev$ cd /home/labuser/inho/Multipath/Mooncake-dev              sudo -E env \                                                                                                      PYTHON_BIN=/home/labuser/venv/bin/python3 \                                                                      TODOEXTRA_MASTER_ADDRESS=192.168.3.43:50051 \                                                                    TODOEXTRA_METADATA_URL=http://192.168.3.43:18080/metadata \
+  TODOEXTRA_LOCAL_IP=192.168.5.43 \
+  TODOEXTRA_EXPECT_SOURCES=4 \
+  TODOEXTRA_OBJECT_COUNT=4 \
+  TODOEXTRA_BLOCK_GIB=8 \
+  TODOEXTRA_KEY=todoextra-rdma-4x8g \
+  TODOEXTRA_RDMA_MTU=1024 \
+  TODOEXTRA_OUT_DIR=/tmp/todoextra-rdma-4x8g \
+  RDMA_DEVICE_NAME=mlx5_0 \
+  MOONCAKE_BUILD_DIR=build-gpu-multipath \
+  bash scripts/run_dram_rdma_distributed.sh prep
+[preflight] rdma_device=mlx5_0 MC_MTU=1024
+
+```
+
 ## Step 4 — run both GET baselines on m3
 
 Keep Terminals 1 and 2 running. In Terminal 3:
