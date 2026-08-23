@@ -19,10 +19,11 @@ Shared:
 
 source (run on every DRAM source node):
   TODOEXTRA_LOCAL_IP=192.168.3.44 TODOEXTRA_SOURCE_COUNT=4
-  TODOEXTRA_SOURCE_BASE_PORT=50200 TODOEXTRA_SEGMENT_GIB=8
+  TODOEXTRA_SOURCE_BASE_PORT=50200 TODOEXTRA_SEGMENT_GIB=16
 
 prep/consumer (run on the GPU consumer node):
   TODOEXTRA_LOCAL_IP=192.168.3.43 TODOEXTRA_EXPECT_SOURCES=4
+  TODOEXTRA_SOURCE_ENDPOINTS=192.168.5.44:50200,192.168.5.44:50201,...
   TODOEXTRA_ITERATIONS=3 TODOEXTRA_GPU_ID=0 TODOEXTRA_WITH_GDR=1
 EOF
 }
@@ -71,6 +72,17 @@ common=(--store-module mooncake.store --master-server "$master_address"
         --metadata-server "$metadata_url" --device-name "$device_name"
         --key "$key" --block-bytes "$block_bytes" --object-count "$object_count")
 
+source_endpoints_csv="${TODOEXTRA_SOURCE_ENDPOINTS:-}"
+if [ -n "$source_endpoints_csv" ]; then
+  IFS=',' read -r -a source_endpoints <<<"$source_endpoints_csv"
+  [ "${#source_endpoints[@]}" -ge "$object_count" ] ||
+    fatal "TODOEXTRA_SOURCE_ENDPOINTS needs at least $object_count comma-separated endpoints"
+  for endpoint in "${source_endpoints[@]}"; do
+    [[ "$endpoint" == *:* ]] || fatal "invalid source endpoint: $endpoint"
+    common+=(--source-endpoint "$endpoint")
+  done
+fi
+
 if [ "$role" = master ]; then
   [ -x "$master_bin" ] && [ -f "$meta_py" ] || fatal "missing master/metadata artifacts"
   meta_pid=""
@@ -111,6 +123,9 @@ fi
 
 expect_sources="${TODOEXTRA_EXPECT_SOURCES:-1}"
 if [ "$role" = prep ]; then
+  if [ "$object_count" -gt 1 ] && [ -z "$source_endpoints_csv" ]; then
+    fatal "multi-key prep requires TODOEXTRA_SOURCE_ENDPOINTS for deterministic placement"
+  fi
   exec "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role prep \
     --local-hostname "$local_ip:${TODOEXTRA_PREP_PORT:-50190}" \
     --min-source-segments "$expect_sources" "${common[@]}"

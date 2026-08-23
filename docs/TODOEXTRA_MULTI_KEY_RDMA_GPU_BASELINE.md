@@ -32,7 +32,7 @@ below use `X=8 GiB`, four objects, and three iterations: 32 GiB/iteration and
              m3 Master :50051 + metadata :18080
                               |
        m4:50200   m4:50201   m4:50202   m4:50203
-        8 GiB      8 GiB      8 GiB      8 GiB   RDMA segments
+       16 GiB     16 GiB     16 GiB     16 GiB   RDMA segments
              \        |        |        /
                          RDMA
                            |
@@ -41,9 +41,10 @@ below use `X=8 GiB`, four objects, and three iterations: 32 GiB/iteration and
 ```
 
 This uses four logical Mooncake source servers on m4. Prep performs four
-separate single `put_from()` calls and passes only if the four resulting object
-descriptors collectively cover four distinct RDMA endpoints. Do not mount an
-m3 source: a local replica would invalidate the remote-RDMA comparison.
+separate single `put_from()` calls and explicitly targets one endpoint per key
+through `ReplicateConfig.preferred_segments`. It passes only when every key is
+published COMPLETE on its requested endpoint. Do not mount an m3 source: a
+local replica would invalidate the remote-RDMA comparison.
 
 Required on m3: at least 32 GiB free GPU memory and about 33 GiB host staging
 capacity. Keep Master and all sources alive through prep and consumer. Every
@@ -113,7 +114,7 @@ sudo -E env \
   TODOEXTRA_LOCAL_IP=192.168.5.44 \
   TODOEXTRA_SOURCE_COUNT=4 \
   TODOEXTRA_SOURCE_BASE_PORT=50200 \
-  TODOEXTRA_SEGMENT_GIB=8 \
+  TODOEXTRA_SEGMENT_GIB=16 \
   TODOEXTRA_OBJECT_COUNT=4 \
   TODOEXTRA_BLOCK_GIB=8 \
   TODOEXTRA_KEY=todoextra-rdma-4x8g \
@@ -142,6 +143,7 @@ sudo -E env \
   TODOEXTRA_METADATA_URL=http://192.168.3.43:18080/metadata \
   TODOEXTRA_LOCAL_IP=192.168.5.43 \
   TODOEXTRA_EXPECT_SOURCES=4 \
+  TODOEXTRA_SOURCE_ENDPOINTS=192.168.5.44:50200,192.168.5.44:50201,192.168.5.44:50202,192.168.5.44:50203 \
   TODOEXTRA_OBJECT_COUNT=4 \
   TODOEXTRA_BLOCK_GIB=8 \
   TODOEXTRA_KEY=todoextra-rdma-4x8g \
@@ -156,9 +158,9 @@ This creates four objects with four separate calls:
 
 ```text
 todoextra-rdma-4x8g-0000  8 GiB  ┐
-todoextra-rdma-4x8g-0001  8 GiB  ├─ each: put_from(key, ptr, 8 GiB, config)
+todoextra-rdma-4x8g-0001  8 GiB  ├─ preferred_segments=[matching endpoint]
 todoextra-rdma-4x8g-0002  8 GiB  │
-todoextra-rdma-4x8g-0003  8 GiB  ┘
+todoextra-rdma-4x8g-0003  8 GiB  ┘  then put_from(key, ptr, 8 GiB, config)
 ```
 
 Required prep result:
@@ -171,74 +173,30 @@ source_protocols=["rdma"]
 descriptor_bytes=34359738368
 ```
 
-Stop if fewer than four distinct source endpoints are reported; that placement
-cannot answer this experiment's four-source question.
+Each source is 16 GiB while each object is 8 GiB. This replaces the broken
+zero-headroom 4×8 GiB-on-4×8 GiB setup. Prep prints one `object_published`
+record per key and fails at the exact key if PUT returns without COMPLETE
+publication or if Master places it on a different endpoint.
 
 
-### Trouble shooting from m3 ""PerfError(\"object spans 3 source segments; expected at least 4"
-Results for prep in m3
-```
-E0822 18:30:43.207448 369003 real_client.cpp:6788] Object not found for key: todoextra-rdma-4x8g-0003
-{"role": "prep", "status": "FAIL", "error": "PerfError(\"object spans 3 source segments; expected at least 4: {'replica_slices': 3, 'source_endpoints': ['192.168.5.44:50200', '192.168.5.44:50201', '192.168.5.44:50203'], 'source_segment_count': 3, 'source_protocols': ['rdma'], 'descriptor_bytes': 25769803776}\")"}
-```
+### Diagnosis of the former three-of-four failure
 
-Ran command in m4
-```
-(venv) labuser@solab-m4:~/inho/Multipath/Mooncake-dev$ sudo -E env \
-  PYTHON_BIN=/home/labuser/venv/bin/python3 \
-  TODOEXTRA_MASTER_ADDRESS=192.168.3.43:50051 \
-  TODOEXTRA_METADATA_URL=http://192.168.3.43:18080/metadata \
-  TODOEXTRA_LOCAL_IP=192.168.5.44 \
-  TODOEXTRA_SOURCE_COUNT=4 \
-  TODOEXTRA_SOURCE_BASE_PORT=50200 \
-  TODOEXTRA_SEGMENT_GIB=8 \
-  TODOEXTRA_OBJECT_COUNT=4 \
-  TODOEXTRA_BLOCK_GIB=8 \
-  TODOEXTRA_KEY=todoextra-rdma-4x8g \
-  TODOEXTRA_RDMA_MTU=1024 \
-  TODOEXTRA_OUT_DIR=/tmp/todoextra-rdma-4x8g \
-  RDMA_DEVICE_NAME=mlx5_0 \
-  MOONCAKE_BUILD_DIR=build-gpu-multipath \
-  bash scripts/run_dram_rdma_distributed.sh source
-[sudo] password for labuser:
-[preflight] rdma_device=mlx5_0 MC_MTU=1024
-[todoextra] 4 RDMA source clients READY on 192.168.5.44; Ctrl-C to stop
-```
+The old harness gave Master no preferred endpoint and used exactly 32 GiB of
+objects against exactly 32 GiB of source capacity. The observed 24 GiB/three
+endpoint result meant keys `0000..0002` were COMPLETE while `0003` was absent.
+It was an allocation/publication failure, not a GET failure. The aggregate
+placement assertion hid the exact failing PUT.
 
-Prep command in m3
-```
-sudo -E env \
-PYTHON_BIN=/home/labuser/venv/bin/python3 \
-TODOEXTRA_MASTER_ADDRESS=192.168.3.43:50051 \
-TODOEXTRA_METADATA_URL=http://192.168.3.43:18080/metadata \
-  TODOEXTRA_LOCAL_IP=192.168.5.43 \
-  TODOEXTRA_EXPECT_SOURCES=4 \
-  TODOEXTRA_OBJECT_COUNT=4 \
-  TODOEXTRA_BLOCK_GIB=8 \
-  TODOEXTRA_KEY=todoextra-rdma-4x8g \
-  TODOEXTRA_RDMA_MTU=1024 \
-  TODOEXTRA_OUT_DIR=/tmp/todoextra-rdma-4x8g \
-  RDMA_DEVICE_NAME=mlx5_0 \
-  MOONCAKE_BUILD_DIR=build-gpu-multipath \
-  bash scripts/run_dram_rdma_distributed.sh prep
-```
-prep
-```
+The corrected harness fixes both causes:
 
-(venv) labuser@solab-m3:~/inho/Multipath/Mooncake-dev$ cd /home/labuser/inho/Multipath/Mooncake-dev              sudo -E env \                                                                                                      PYTHON_BIN=/home/labuser/venv/bin/python3 \                                                                      TODOEXTRA_MASTER_ADDRESS=192.168.3.43:50051 \                                                                    TODOEXTRA_METADATA_URL=http://192.168.3.43:18080/metadata \
-  TODOEXTRA_LOCAL_IP=192.168.5.43 \
-  TODOEXTRA_EXPECT_SOURCES=4 \
-  TODOEXTRA_OBJECT_COUNT=4 \
-  TODOEXTRA_BLOCK_GIB=8 \
-  TODOEXTRA_KEY=todoextra-rdma-4x8g \
-  TODOEXTRA_RDMA_MTU=1024 \
-  TODOEXTRA_OUT_DIR=/tmp/todoextra-rdma-4x8g \
-  RDMA_DEVICE_NAME=mlx5_0 \
-  MOONCAKE_BUILD_DIR=build-gpu-multipath \
-  bash scripts/run_dram_rdma_distributed.sh prep
-[preflight] rdma_device=mlx5_0 MC_MTU=1024
+1. source capacity is 4×16 GiB for 4×8 GiB objects;
+2. key `000N` requests endpoint `5020N` through `preferred_segments`;
+3. every `put_from()` is followed by a bounded COMPLETE-publication check;
+4. prep emits one `object_published` JSON record per key.
 
-```
+Do not continue from an old Master/source session created with 8 GiB segments.
+Restart Master and all four sources with the commands above so allocator state
+and advertised capacities match this corrected gate.
 
 ## Step 4 — run both GET baselines on m3
 
@@ -252,6 +210,7 @@ sudo -E env \
   TODOEXTRA_METADATA_URL=http://192.168.3.43:18080/metadata \
   TODOEXTRA_LOCAL_IP=192.168.5.43 \
   TODOEXTRA_EXPECT_SOURCES=4 \
+  TODOEXTRA_SOURCE_ENDPOINTS=192.168.5.44:50200,192.168.5.44:50201,192.168.5.44:50202,192.168.5.44:50203 \
   TODOEXTRA_OBJECT_COUNT=4 \
   TODOEXTRA_BLOCK_GIB=8 \
   TODOEXTRA_KEY=todoextra-rdma-4x8g \

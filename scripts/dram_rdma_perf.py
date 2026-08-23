@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """TODO#Extra baseline: GPU <- RDMA fetching using the Mooncake lib.
 
-One consumer fetches a variable-size KV block that is distributed across N
-DRAM-backed Mooncake clients (the master shards the object's 16 MiB slices over
-their global segments), and times:
+One consumer fetches one or more variable-size KV objects from N DRAM-backed
+Mooncake clients.  In multi-key mode, prep deterministically places one whole
+object on each requested source segment; Mooncake does not stripe one memory
+replica across multiple source segments.  The consumer times:
 
   1. fetch to local DRAM      -- store.get(key)                (RDMA -> host)
   2. fetch to GPU (staged)    -- batch_get_into(key -> cuda)   (RDMA -> host -> GPU)
@@ -12,8 +13,8 @@ their global segments), and times:
 Roles:
   server    -- mount a DRAM global segment (protocol=rdma) and stay alive so its
                memory is registered/served over RDMA until signaled.
-  prep      -- put one object of --block-bytes into the pool (slices shard across
-               the live servers).
+  prep      -- issue one put_from() per key and verify COMPLETE publication on
+               the requested source endpoint.
   consumer  -- run the three measurements above and emit a JSON summary.
 
 Topology matches the diagram: N Mooncake clients (legacy) over one RDMA fabric,
@@ -42,6 +43,28 @@ GiB = 1024 * 1024 * 1024
 
 class PerfError(RuntimeError):
     pass
+
+
+def _target_endpoint(args: argparse.Namespace, index: int) -> str | None:
+    if not args.source_endpoints:
+        return None
+    return args.source_endpoints[index % len(args.source_endpoints)]
+
+
+def _wait_for_published_object(
+    store: Any, key: str, timeout_sec: float
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if int(store.is_exist(key)) == 1:
+            placement = _placement_for_key(store, key)
+            if placement["replica_slices"] > 0:
+                return placement
+        time.sleep(0.05)
+    raise PerfError(
+        f"put returned success but object {key!r} was not published COMPLETE "
+        f"within {timeout_sec}s"
+    )
 
 
 def _registered_payload(store: Any, label: str, size: int) -> tuple[Any, int]:
@@ -113,7 +136,7 @@ def _assert_placement(placement: dict[str, Any], args: argparse.Namespace) -> No
     # not stripe one memory replica across several source segments.
     if len(placement["source_endpoints"]) < args.min_source_segments:
         raise PerfError(
-            f"object spans {len(placement['source_endpoints'])} source segments; "
+            f"objects span {len(placement['source_endpoints'])} source segments; "
             f"expected at least {args.min_source_segments}: {placement}"
         )
     # Transport: every source segment must be RDMA. A 'tcp' here means a source
@@ -130,12 +153,15 @@ def _assert_placement(placement: dict[str, Any], args: argparse.Namespace) -> No
 def run_prep(args: argparse.Namespace) -> dict[str, Any]:
     module, store = _open_store(args, args.prep_segment_bytes, 64 * MiB)
     try:
-        config = module.ReplicateConfig()
-        config.replica_num = 1
-        config.nof_replica_num = 0
         keys = _object_keys(args)
         placements: dict[str, dict[str, Any]] = {}
-        for key in keys:
+        for index, key in enumerate(keys):
+            target = _target_endpoint(args, index)
+            config = module.ReplicateConfig()
+            config.replica_num = 1
+            config.nof_replica_num = 0
+            if target is not None:
+                config.preferred_segments = [target]
             # Default: remove stale objects so this run is placed against the
             # currently mounted RDMA source set.
             if int(store.is_exist(key)) == 1 and not args.reuse:
@@ -153,7 +179,17 @@ def run_prep(args: argparse.Namespace) -> dict[str, Any]:
                     payload.close()
                 if rc != 0:
                     raise PerfError(f"put {key} failed rc={rc}")
-            placements[key] = _placement_for_key(store, key)
+            placement = _wait_for_published_object(
+                store, key, args.publish_timeout_sec)
+            if target is not None and placement["source_endpoints"] != [target]:
+                store.remove(key, True)
+                raise PerfError(
+                    f"key {key!r} was not placed on requested source {target!r}: "
+                    f"{placement}"
+                )
+            placements[key] = placement
+            print(json.dumps({"event": "object_published", "key": key,
+                              "target_endpoint": target, **placement}), flush=True)
 
         placement = _placement_for_keys(placements)
         _assert_placement(placement, args)
@@ -232,6 +268,14 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
         placements = {key: _placement_for_key(store, key) for key in keys}
         aggregate_placement = _placement_for_keys(placements)
         _assert_placement(aggregate_placement, args)
+        if args.source_endpoints:
+            expected = sorted(args.source_endpoints[:len(keys)])
+            if aggregate_placement["source_endpoints"] != expected:
+                raise PerfError(
+                    "consumer placement differs from deterministic prep: "
+                    f"expected={expected}, actual="
+                    f"{aggregate_placement['source_endpoints']}"
+                )
         out: dict[str, Any] = {
             "role": "consumer", "status": "PASS",
             "gpu_direct_requested": gdr, "block_bytes": args.block_bytes,
@@ -357,6 +401,9 @@ def main(argv: list[str]) -> int:
     p.add_argument("--block-bytes", type=int, default=GiB, help="1..16 GiB KV block")
     p.add_argument("--object-count", type=int, default=1,
                    help="number of distinct keys/objects")
+    p.add_argument("--source-endpoint", dest="source_endpoints", action="append",
+                   default=[], help="deterministic target segment; repeat per key")
+    p.add_argument("--publish-timeout-sec", type=float, default=30.0)
     # server / prep sizing
     p.add_argument("--segment-bytes", type=int, default=8 * GiB,
                    help="per-server DRAM contributed to the pool")
@@ -383,6 +430,10 @@ def main(argv: list[str]) -> int:
         p.error("--iterations must be positive")
     if args.object_count <= 0:
         p.error("--object-count must be positive")
+    if args.publish_timeout_sec <= 0:
+        p.error("--publish-timeout-sec must be positive")
+    if args.source_endpoints and len(args.source_endpoints) < args.object_count:
+        p.error("provide at least one --source-endpoint per object")
 
     try:
         if args.role == "server":

@@ -81,6 +81,19 @@ class PerfHarnessTest(unittest.TestCase):
             rdma._object_keys(multi),
         )
 
+    def test_rdma_multi_key_targets_are_deterministic(self):
+        args = type(
+            "Args", (),
+            {"source_endpoints": ["m4:50200", "m4:50201", "m4:50202"]},
+        )()
+        self.assertEqual("m4:50200", rdma._target_endpoint(args, 0))
+        self.assertEqual("m4:50201", rdma._target_endpoint(args, 1))
+        self.assertEqual("m4:50202", rdma._target_endpoint(args, 2))
+
+    def test_rdma_target_is_optional_for_legacy_single_key(self):
+        args = type("Args", (), {"source_endpoints": []})()
+        self.assertIsNone(rdma._target_endpoint(args, 0))
+
     def test_rate_is_total_bytes_over_elapsed_time(self):
         rate = rdma._rate(4_000_000_000, 2.0, 4)
         self.assertEqual(2.0, rate["GBps"])
