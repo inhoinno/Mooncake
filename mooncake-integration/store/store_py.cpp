@@ -2906,6 +2906,32 @@ PYBIND11_MODULE(store, m) {
             "Get multiple byte ranges from multiple objects into multiple "
             "pre-allocated buffers")
         .def(
+            "get_into_profiled",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               uintptr_t buffer_ptr, size_t size) {
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                int64_t result;
+                {
+                    py::gil_scoped_release release;
+                    result = self.store_->get_into(key, buffer, size);
+                }
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) {
+                    throw std::runtime_error(
+                        "get_into_profiled requires a real client");
+                }
+                const auto timing = real_client->get_last_get_into_timing();
+                py::dict profile;
+                profile["result"] = result;
+                profile["transfer_to_staging_ns"] =
+                    timing.transfer_to_staging_ns;
+                profile["staging_to_gpu_ns"] = timing.staging_to_gpu_ns;
+                return profile;
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+            "Profile one staged GPU read and return its two internal clocks")
+        .def(
             "batch_get_into",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,

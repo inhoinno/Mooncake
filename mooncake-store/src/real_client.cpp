@@ -3427,18 +3427,34 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
             auto filtered_qr =
                 FilterQueryResult(query_result, replica, verify_checksum);
+            const auto transfer_start = std::chrono::steady_clock::now();
             auto get_result = client_->Get(key, filtered_qr, tmp_slices);
+            const auto transfer_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - transfer_start)
+                    .count();
+            last_get_into_transfer_to_staging_ns_.store(
+                static_cast<uint64_t>(transfer_ns),
+                std::memory_order_relaxed);
             if (!get_result) {
                 LOG(ERROR) << "Get failed for key: " << key
                            << " with error: " << toString(get_result.error());
                 return tl::unexpected(get_result.error());
             }
+            const auto scatter_start = std::chrono::steady_clock::now();
             if (auto r = scatter_host_to_maybe_device(
                     dst, tmp_handle.ptr(), total_size,
                     "MEMORY full read, key: " + key);
                 !r) {
                 return tl::unexpected(r.error());
             }
+            const auto scatter_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - scatter_start)
+                    .count();
+            last_get_into_staging_to_gpu_ns_.store(
+                static_cast<uint64_t>(scatter_ns),
+                std::memory_order_relaxed);
             return static_cast<int64_t>(total_size);
         }
 
@@ -3617,6 +3633,8 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
+    last_get_into_transfer_to_staging_ns_.store(0, std::memory_order_relaxed);
+    last_get_into_staging_to_gpu_ns_.store(0, std::memory_order_relaxed);
     auto result = execute_timed_operation<tl::expected<int64_t, ErrorCode>>(
         [&]() {
             return get_into_range_internal(key, buffer, 0, 0, size, true, true);

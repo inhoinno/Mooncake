@@ -54,6 +54,33 @@ class PerfHarnessTest(unittest.TestCase):
         self.assertEqual(40, placement["descriptor_bytes"])
         self.assertEqual(["rdma"], placement["source_protocols"])
 
+    def test_rdma_multi_key_placement_aggregates_distinct_sources(self):
+        placements = {
+            "key-0": {
+                "replica_slices": 1, "source_endpoints": ["m1:1"],
+                "source_segment_count": 1, "source_protocols": ["rdma"],
+                "descriptor_bytes": 8,
+            },
+            "key-1": {
+                "replica_slices": 1, "source_endpoints": ["m2:1"],
+                "source_segment_count": 1, "source_protocols": ["rdma"],
+                "descriptor_bytes": 8,
+            },
+        }
+        aggregate = rdma._placement_for_keys(placements)
+        self.assertEqual(["m1:1", "m2:1"], aggregate["source_endpoints"])
+        self.assertEqual(2, aggregate["source_segment_count"])
+        self.assertEqual(16, aggregate["descriptor_bytes"])
+
+    def test_rdma_object_keys_preserve_legacy_single_key(self):
+        single = type("Args", (), {"key": "object", "object_count": 1})()
+        multi = type("Args", (), {"key": "object", "object_count": 3})()
+        self.assertEqual(["object"], rdma._object_keys(single))
+        self.assertEqual(
+            ["object-0000", "object-0001", "object-0002"],
+            rdma._object_keys(multi),
+        )
+
     def test_rate_is_total_bytes_over_elapsed_time(self):
         rate = rdma._rate(4_000_000_000, 2.0, 4)
         self.assertEqual(2.0, rate["GBps"])

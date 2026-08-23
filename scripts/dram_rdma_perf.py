@@ -102,9 +102,15 @@ def run_server(args: argparse.Namespace) -> dict[str, Any]:
     return {"role": "server", "status": "PASS"}
 
 
+def _object_keys(args: argparse.Namespace) -> list[str]:
+    if args.object_count == 1:
+        return [args.key]
+    return [f"{args.key}-{index:04d}" for index in range(args.object_count)]
+
+
 def _assert_placement(placement: dict[str, Any], args: argparse.Namespace) -> None:
-    # Fan-out: the object must span at least the requested number of source
-    # segments (proves "Distributed /N").
+    # Multi-source coverage is measured across distinct objects. Mooncake does
+    # not stripe one memory replica across several source segments.
     if len(placement["source_endpoints"]) < args.min_source_segments:
         raise PerfError(
             f"object spans {len(placement['source_endpoints'])} source segments; "
@@ -124,36 +130,37 @@ def _assert_placement(placement: dict[str, Any], args: argparse.Namespace) -> No
 def run_prep(args: argparse.Namespace) -> dict[str, Any]:
     module, store = _open_store(args, args.prep_segment_bytes, 64 * MiB)
     try:
-        # Default: write fresh against the CURRENT sources. A pre-existing object
-        # from an earlier run (different sources / pre-MTU-fix tcp fallback)
-        # otherwise poisons the measurement via the idempotent short-circuit.
-        if int(store.is_exist(args.key)) == 1:
-            if args.reuse:
-                placement = _placement_for_key(store, args.key)
-                _assert_placement(placement, args)
-                return {"role": "prep", "status": "PASS", "note": "already present",
-                        "block_bytes": args.block_bytes, **placement}
-            rc = int(store.remove(args.key, True))  # force: skip lease checks
-            if rc != 0:
-                raise PerfError(f"failed to remove stale object {args.key} rc={rc}")
         config = module.ReplicateConfig()
         config.replica_num = 1
         config.nof_replica_num = 0
-        # put_from() avoids constructing a second multi-GiB Python bytes object.
-        # The master splits this object into <=kMaxSliceSize slices and places
-        # those slices across the live RDMA source segments.
-        payload, ptr = _registered_payload(store, args.key, args.block_bytes)
-        try:
-            rc = int(store.put_from(args.key, ptr, args.block_bytes, config))
-        finally:
-            store.unregister_buffer(ptr)
-            payload.close()
-        if rc != 0:
-            raise PerfError(f"put {args.key} failed rc={rc}")
-        placement = _placement_for_key(store, args.key)
+        keys = _object_keys(args)
+        placements: dict[str, dict[str, Any]] = {}
+        for key in keys:
+            # Default: remove stale objects so this run is placed against the
+            # currently mounted RDMA source set.
+            if int(store.is_exist(key)) == 1 and not args.reuse:
+                rc = int(store.remove(key, True))
+                if rc != 0:
+                    raise PerfError(f"failed to remove stale object {key} rc={rc}")
+            if int(store.is_exist(key)) != 1:
+                payload, ptr = _registered_payload(store, key, args.block_bytes)
+                try:
+                    # Deliberately one PUT per key. The baseline compares many
+                    # sequential single GETs with one true multi-key batch GET.
+                    rc = int(store.put_from(key, ptr, args.block_bytes, config))
+                finally:
+                    store.unregister_buffer(ptr)
+                    payload.close()
+                if rc != 0:
+                    raise PerfError(f"put {key} failed rc={rc}")
+            placements[key] = _placement_for_key(store, key)
+
+        placement = _placement_for_keys(placements)
         _assert_placement(placement, args)
-        return {"role": "prep", "status": "PASS", "block_bytes": args.block_bytes,
-                **placement}
+        return {"role": "prep", "status": "PASS", "keys": keys,
+                "object_count": len(keys), "block_bytes": args.block_bytes,
+                "total_bytes": len(keys) * args.block_bytes,
+                "per_key_placement": placements, **placement}
     finally:
         store.close()
 
@@ -180,6 +187,22 @@ def _placement_for_key(store: Any, key: str) -> dict[str, Any]:
     }
 
 
+def _placement_for_keys(
+    placements: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    endpoints = sorted({endpoint for placement in placements.values()
+                        for endpoint in placement["source_endpoints"]})
+    protocols = sorted({protocol for placement in placements.values()
+                        for protocol in placement["source_protocols"]})
+    return {
+        "replica_slices": sum(p["replica_slices"] for p in placements.values()),
+        "source_endpoints": endpoints,
+        "source_segment_count": len(endpoints),
+        "source_protocols": protocols,
+        "descriptor_bytes": sum(p["descriptor_bytes"] for p in placements.values()),
+    }
+
+
 def _rate(bytes_n: int, dt: float, iterations: int) -> dict[str, Any]:
     return {
         "iterations": iterations,
@@ -201,14 +224,21 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
         else 64 * MiB
     )
     module, store = _open_store(args, 0, local_buffer)
-    out: dict[str, Any] = {
-        "role": "consumer", "status": "PASS", "gpu_direct_requested": gdr,
-        "block_bytes": args.block_bytes, "key": args.key,
-        **_placement_for_key(store, args.key),
-    }
+    keys = _object_keys(args)
     try:
-        if int(store.is_exist(args.key)) != 1:
-            raise PerfError(f"{args.key} missing; run role=prep first")
+        missing = [key for key in keys if int(store.is_exist(key)) != 1]
+        if missing:
+            raise PerfError(f"missing keys {missing}; run role=prep first")
+        placements = {key: _placement_for_key(store, key) for key in keys}
+        aggregate_placement = _placement_for_keys(placements)
+        _assert_placement(aggregate_placement, args)
+        out: dict[str, Any] = {
+            "role": "consumer", "status": "PASS",
+            "gpu_direct_requested": gdr, "block_bytes": args.block_bytes,
+            "keys": keys, "object_count": len(keys),
+            "gpu_pattern": args.gpu_pattern,
+            "per_key_placement": placements, **aggregate_placement,
+        }
 
         # --- (1) fetch to local DRAM ---------------------------------------
         if args.mode in ("both", "dram"):
@@ -218,19 +248,21 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
             if rc != 0:
                 host.close()
                 raise PerfError(f"register destination buffer failed rc={rc}")
-            for _ in range(args.warmup):
-                got = int(store.get_into(args.key, host_ptr, args.block_bytes))
-                if got != args.block_bytes:
-                    raise PerfError(f"DRAM warmup returned {got}")
             try:
+                for key in keys:
+                    got = int(store.get_into(key, host_ptr, args.block_bytes))
+                    if got != args.block_bytes:
+                        raise PerfError(f"DRAM warmup returned {got} for {key}")
                 t = time.monotonic()
                 for _ in range(args.iterations):
-                    got = int(store.get_into(args.key, host_ptr, args.block_bytes))
-                    if got != args.block_bytes:
-                        raise PerfError(f"DRAM get_into returned {got}")
+                    for key in keys:
+                        got = int(store.get_into(key, host_ptr, args.block_bytes))
+                        if got != args.block_bytes:
+                            raise PerfError(f"DRAM get_into returned {got} for {key}")
                 dt = time.monotonic() - t
-                out["to_local_dram"] = _rate(
-                    args.block_bytes * args.iterations, dt, args.iterations)
+                operations = args.iterations * len(keys)
+                out["to_local_dram_sequential_single"] = _rate(
+                    args.block_bytes * operations, dt, operations)
             finally:
                 store.unregister_buffer(host_ptr)
                 host.close()
@@ -242,41 +274,66 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
         if not torch.cuda.is_available():
             raise PerfError("torch.cuda.is_available() is false")
         torch.cuda.set_device(args.gpu_id)
-        dst = torch.empty(args.block_bytes, dtype=torch.uint8, device="cuda")
-        ptr, size = int(dst.data_ptr()), args.block_bytes
+        destinations = [torch.empty(args.block_bytes, dtype=torch.uint8,
+                                    device="cuda") for _ in keys]
+        ptrs = [int(dst.data_ptr()) for dst in destinations]
+        sizes = [args.block_bytes] * len(keys)
         for _ in range(args.warmup):
-            store.batch_get_into([args.key], [ptr], [size])
+            if args.gpu_pattern == "single":
+                for key, ptr, size in zip(keys, ptrs, sizes):
+                    got = int(store.get_into(key, ptr, size))
+                    if got != size:
+                        raise PerfError(f"GPU warmup returned {got} for {key}")
+            else:
+                results = list(store.batch_get_into(keys, ptrs, sizes))
+                if any(int(got) != size for got, size in zip(results, sizes)):
+                    raise PerfError(f"GPU batch warmup returned {results}")
             torch.cuda.synchronize()
         t = time.monotonic()
         transfer_to_staging_ns = 0
         staging_to_gpu_ns = 0
         for _ in range(args.iterations):
-            if not hasattr(store, "batch_get_into_profiled"):
-                raise PerfError(
-                    "mooncake.store is missing batch_get_into_profiled; "
-                    "rebuild and restage the CUDA store.so")
-            profile = store.batch_get_into_profiled(
-                [args.key], [ptr], [size])
-            res = list(profile["results"])
-            transfer_to_staging_ns += int(profile["transfer_to_staging_ns"])
-            staging_to_gpu_ns += int(profile["staging_to_gpu_ns"])
+            if args.gpu_pattern == "single":
+                if not hasattr(store, "get_into_profiled"):
+                    raise PerfError("store.so is missing get_into_profiled; rebuild")
+                for key, ptr, size in zip(keys, ptrs, sizes):
+                    profile = store.get_into_profiled(key, ptr, size)
+                    if int(profile["result"]) != size:
+                        raise PerfError(f"GPU get_into failed for {key}: {profile}")
+                    transfer_to_staging_ns += int(profile["transfer_to_staging_ns"])
+                    staging_to_gpu_ns += int(profile["staging_to_gpu_ns"])
+            else:
+                if not hasattr(store, "batch_get_into_profiled"):
+                    raise PerfError("store.so is missing batch_get_into_profiled; rebuild")
+                profile = store.batch_get_into_profiled(keys, ptrs, sizes)
+                results = list(profile["results"])
+                if any(int(got) != size for got, size in zip(results, sizes)):
+                    raise PerfError(f"GPU batch_get_into failed: {results}")
+                transfer_to_staging_ns += int(profile["transfer_to_staging_ns"])
+                staging_to_gpu_ns += int(profile["staging_to_gpu_ns"])
             torch.cuda.synchronize()
-            if int(res[0]) != size:
-                raise PerfError(f"GPU get_into returned {res[0]}, expected {size}")
         dt = time.monotonic() - t
         path = "rdma_gpu_direct" if gdr else "rdma_host_staged"
         out["gpu_path_selected"] = path
-        out["to_gpu" + ("_gpudirect" if gdr else "_staged")] = _rate(
-            size * args.iterations, dt, args.iterations)
+        total_operations = args.iterations * len(keys)
+        result_name = f"to_gpu_{args.gpu_pattern}" + (
+            "_gpudirect" if gdr else "_staged")
+        out[result_name] = _rate(
+            args.block_bytes * total_operations, dt, args.iterations)
+        out[result_name]["api_calls"] = (
+            total_operations if args.gpu_pattern == "single" else args.iterations)
+        out[result_name]["objects_per_call"] = (
+            1 if args.gpu_pattern == "single" else len(keys))
         if not gdr:
             transfer_sec = transfer_to_staging_ns / 1e9
             scatter_sec = staging_to_gpu_ns / 1e9
             measured_sec = transfer_sec + scatter_sec
+            measured_bytes = args.block_bytes * total_operations
             out["staged_breakdown"] = {
                 "rdma_to_host": _rate(
-                    size * args.iterations, transfer_sec, args.iterations),
+                    measured_bytes, transfer_sec, args.iterations),
                 "host_to_gpu": _rate(
-                    size * args.iterations, scatter_sec, args.iterations),
+                    measured_bytes, scatter_sec, args.iterations),
                 "measured_phases_sec": round(measured_sec, 6),
                 "unattributed_sec": round(max(0.0, dt - measured_sec), 6),
                 "unattributed_note":
@@ -298,6 +355,8 @@ def main(argv: list[str]) -> int:
     p.add_argument("--device-name", default="", help="RDMA device (blank = auto)")
     p.add_argument("--key", default="dram-rdma-blk")
     p.add_argument("--block-bytes", type=int, default=GiB, help="1..16 GiB KV block")
+    p.add_argument("--object-count", type=int, default=1,
+                   help="number of distinct keys/objects")
     # server / prep sizing
     p.add_argument("--segment-bytes", type=int, default=8 * GiB,
                    help="per-server DRAM contributed to the pool")
@@ -313,6 +372,7 @@ def main(argv: list[str]) -> int:
     p.add_argument("--gpu-id", type=int, default=0)
     p.add_argument("--skip-dram", action="store_true")
     p.add_argument("--mode", choices=["both", "dram", "gpu"], default="both")
+    p.add_argument("--gpu-pattern", choices=["single", "batch"], default="batch")
     p.add_argument("--iterations", type=int, default=1)
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--summary-json", default="")
@@ -321,6 +381,8 @@ def main(argv: list[str]) -> int:
         args.mode = "gpu"
     if args.iterations <= 0:
         p.error("--iterations must be positive")
+    if args.object_count <= 0:
+        p.error("--object-count must be positive")
 
     try:
         if args.role == "server":

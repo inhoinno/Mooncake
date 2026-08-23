@@ -171,6 +171,14 @@ class RealClient : public PyClient {
         };
     }
 
+    [[nodiscard]] BatchGetIntoTiming get_last_get_into_timing() const {
+        return {
+            last_get_into_transfer_to_staging_ns_.load(
+                std::memory_order_relaxed),
+            last_get_into_staging_to_gpu_ns_.load(std::memory_order_relaxed),
+        };
+    }
+
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys
@@ -996,6 +1004,8 @@ class RealClient : public PyClient {
     // without putting locks on the transfer path.
     std::atomic<uint64_t> last_batch_get_into_transfer_to_staging_ns_{0};
     std::atomic<uint64_t> last_batch_get_into_staging_to_gpu_ns_{0};
+    std::atomic<uint64_t> last_get_into_transfer_to_staging_ns_{0};
+    std::atomic<uint64_t> last_get_into_staging_to_gpu_ns_{0};
 
     // Dummy Client manage related members
     void dummy_client_monitor_func();

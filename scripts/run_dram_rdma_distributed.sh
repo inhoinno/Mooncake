@@ -14,7 +14,7 @@ Usage: bash scripts/run_dram_rdma_distributed.sh <master|source|prep|consumer>
 Shared:
   TODOEXTRA_MASTER_ADDRESS=192.168.3.43:50051
   TODOEXTRA_METADATA_URL=http://192.168.3.43:8080/metadata
-  TODOEXTRA_KEY=todoextra-8g TODOEXTRA_BLOCK_GIB=8
+  TODOEXTRA_KEY=todoextra-8g TODOEXTRA_BLOCK_GIB=8 TODOEXTRA_OBJECT_COUNT=4
   RDMA_DEVICE_NAME=<Mooncake RDMA device; blank enables auto discovery>
 
 source (run on every DRAM source node):
@@ -49,6 +49,8 @@ device_name="${RDMA_DEVICE_NAME:-}"
 key="${TODOEXTRA_KEY:-todoextra-8g}"
 block_gib="${TODOEXTRA_BLOCK_GIB:-8}"
 block_bytes=$((block_gib * 1024 * 1024 * 1024))
+object_count="${TODOEXTRA_OBJECT_COUNT:-1}"
+case "$object_count" in ""|*[!0-9]*|0) fatal "TODOEXTRA_OBJECT_COUNT must be positive" ;; esac
 segment_gib="${TODOEXTRA_SEGMENT_GIB:-8}"
 segment_bytes=$((segment_gib * 1024 * 1024 * 1024))
 out_dir="${TODOEXTRA_OUT_DIR:-/tmp/todoextra-rdma}"
@@ -67,7 +69,7 @@ echo "[preflight] rdma_device=${device_name:-auto} MC_MTU=$MC_MTU"
 
 common=(--store-module mooncake.store --master-server "$master_address"
         --metadata-server "$metadata_url" --device-name "$device_name"
-        --key "$key" --block-bytes "$block_bytes")
+        --key "$key" --block-bytes "$block_bytes" --object-count "$object_count")
 
 if [ "$role" = master ]; then
   [ -x "$master_bin" ] && [ -f "$meta_py" ] || fatal "missing master/metadata artifacts"
@@ -115,7 +117,7 @@ if [ "$role" = prep ]; then
 fi
 
 iterations="${TODOEXTRA_ITERATIONS:-1}"
-consumer_buf="${TODOEXTRA_CONSUMER_BUFFER_BYTES:-$((block_bytes + 1024*1024*1024))}"
+consumer_buf="${TODOEXTRA_CONSUMER_BUFFER_BYTES:-$((block_bytes * object_count + 1024*1024*1024))}"
 gpu_id="${TODOEXTRA_GPU_ID:-0}"
 echo "[todoextra] fetch key=$key size=${block_gib}GiB from >=$expect_sources RDMA sources"
 
@@ -126,14 +128,23 @@ echo "[todoextra] fetch key=$key size=${block_gib}GiB from >=$expect_sources RDM
 
 MC_STORE_RDMA_GPU_DIRECT=0 MC_STORE_TRACE_GPU_TRANSFERS=1 \
 "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role consumer --mode gpu \
+  --gpu-pattern single \
   --local-hostname "$local_ip:${TODOEXTRA_GPU_PORT:-50181}" --iterations "$iterations" \
   --consumer-buffer-bytes "$consumer_buf" --gpu-id "$gpu_id" \
-  --summary-json "$out_dir/gpu-staged.json" "${common[@]}" 2>&1 | tee "$out_dir/gpu-staged.log"
+  --summary-json "$out_dir/gpu-single-staged.json" "${common[@]}" 2>&1 | tee "$out_dir/gpu-single-staged.log"
+
+MC_STORE_RDMA_GPU_DIRECT=0 MC_STORE_TRACE_GPU_TRANSFERS=1 \
+"$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role consumer --mode gpu \
+  --gpu-pattern batch \
+  --local-hostname "$local_ip:${TODOEXTRA_BATCH_PORT:-50182}" --iterations "$iterations" \
+  --consumer-buffer-bytes "$consumer_buf" --gpu-id "$gpu_id" \
+  --summary-json "$out_dir/gpu-batch-staged.json" "${common[@]}" 2>&1 | tee "$out_dir/gpu-batch-staged.log"
 
 if [ "${TODOEXTRA_WITH_GDR:-0}" = 1 ]; then
   if ! env MC_STORE_RDMA_GPU_DIRECT=1 MC_STORE_TRACE_GPU_TRANSFERS=1 \
     "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role consumer --mode gpu \
-      --local-hostname "$local_ip:${TODOEXTRA_GDR_PORT:-50182}" --iterations "$iterations" \
+      --gpu-pattern batch \
+      --local-hostname "$local_ip:${TODOEXTRA_GDR_PORT:-50183}" --iterations "$iterations" \
       --consumer-buffer-bytes "$consumer_buf" --gpu-id "$gpu_id" \
       --summary-json "$out_dir/gpu-gdr.json" "${common[@]}" 2>&1 | tee "$out_dir/gpu-gdr.log"; then
     echo "[todoextra] GDR candidate failed (no fallback); see $out_dir/gpu-gdr.log" >&2
