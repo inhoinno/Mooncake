@@ -166,26 +166,25 @@ TEST_F(AllocationStrategyTest, RemovingLastAllocatorClearsMountedEndpoint) {
 TEST_F(AllocationStrategyTest, MountedRdmaProtocolOverridesTcpDefault) {
     AllocatorManager manager;
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "rdma-segment", 0x100000000ULL, 64 * 1024 * 1024,
-        "192.168.5.44:50200");
-    manager.addAllocator("rdma-segment", allocator,
-                         "192.168.5.44:50200", "rdma");
+        "rdma-segment", 0x100000000ULL, 64 * 1024 * 1024, "192.168.5.44:50200");
+    manager.addAllocator("rdma-segment", allocator, "192.168.5.44:50200",
+                         "rdma");
 
     RandomAllocationStrategy strategy;
-    auto result = strategy.Allocate(manager, 16 * 1024 * 1024, 1,
-                                    {"rdma-segment"});
+    auto result =
+        strategy.Allocate(manager, 16 * 1024 * 1024, 1, {"rdma-segment"});
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1);
-    EXPECT_EQ(result->front()
-                  .get_memory_descriptor()
-                  .buffer_descriptor.protocol_,
-              "tcp");
+    const auto before_descriptor = result->front().get_descriptor();
+    EXPECT_EQ(
+        before_descriptor.get_memory_descriptor().buffer_descriptor.protocol_,
+        "tcp");
 
     ApplyMountedSegmentProtocols(manager, result.value());
-    EXPECT_EQ(result->front()
-                  .get_memory_descriptor()
-                  .buffer_descriptor.protocol_,
-              "rdma");
+    const auto after_descriptor = result->front().get_descriptor();
+    EXPECT_EQ(
+        after_descriptor.get_memory_descriptor().buffer_descriptor.protocol_,
+        "rdma");
 }
 
 TEST_F(AllocationStrategyTest, CxlAwareRoutesCxlAndRdmaSegments) {

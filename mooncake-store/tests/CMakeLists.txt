@@ -228,6 +228,29 @@ foreach(todo15_case IN LISTS TODO15_SHARED_CXL_TEST_CASES)
       WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/scripts")
 endforeach()
 
+# The one-node native-CXL launcher has its own dependency-light protocol
+# tests. These validate the full-pool ownership contract and harness behavior;
+# only scripts/run_todo15_one_node_cxl.sh on /dev/dax closes the T2 gate.
+set(TODO15_ONE_NODE_CXL_TEST_CASES
+    preflight_native_environment_and_full_pool_ownership
+    functional_single_batch_put_get_remove
+    failure_checksum_mismatch_fails_and_cleans_up
+    status_summary_is_atomic_bounded_and_payload_free)
+foreach(todo15_one_case IN LISTS TODO15_ONE_NODE_CXL_TEST_CASES)
+  set(todo15_one_test_name "todo15_one_node_cxl_${todo15_one_case}_test")
+  add_test(
+    NAME ${todo15_one_test_name}
+    COMMAND
+      ${PYTHON_EXECUTABLE} -m unittest -v
+      test_todo15_one_node_cxl.Todo15OneNodeCxlTest.test_${todo15_one_case})
+  set_tests_properties(
+    ${todo15_one_test_name}
+    PROPERTIES
+      LABELS "cxl;todo15;one-node;t0;unit"
+      TIMEOUT 30
+      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/scripts")
+endforeach()
+
 # The WSS protocol tests remain dependency-light and use a bounded in-memory
 # Store model. The 500 GiB plan test verifies exact accounting without
 # allocating the payload; only the two-node launcher can close the T2 gate.
