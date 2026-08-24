@@ -296,6 +296,16 @@ MasterMetricManager::MasterMetricManager()
                       "at least one completed replica"),
       total_get_nums_("total_get_nums_",
                       "Total number of GetReplicaList operations"),
+      get_advertised_objects_per_segment_(
+          "master_get_advertised_replicas_total",
+          "Total readable replicas advertised by GetReplicaList, grouped by "
+          "registered endpoint and protocol",
+          {"segment", "protocol"}),
+      get_advertised_bytes_per_segment_(
+          "master_get_advertised_bytes_total",
+          "Total object bytes represented by readable replicas advertised "
+          "by GetReplicaList, grouped by registered endpoint and protocol",
+          {"segment", "protocol"}),
 
       // Initialize Eviction Counters
       // total eviction
@@ -922,6 +932,19 @@ void MasterMetricManager::inc_valid_get_nums(int64_t val) {
 }
 void MasterMetricManager::inc_total_get_nums(int64_t val) {
     total_get_nums_.inc(val);
+}
+void MasterMetricManager::inc_get_advertised_objects(
+    const std::string& endpoint, const std::string& protocol, int64_t val) {
+    if (!endpoint.empty()) {
+        get_advertised_objects_per_segment_.inc({endpoint, protocol}, val);
+    }
+}
+void MasterMetricManager::inc_get_advertised_bytes(const std::string& endpoint,
+                                                   const std::string& protocol,
+                                                   int64_t val) {
+    if (!endpoint.empty()) {
+        get_advertised_bytes_per_segment_.inc({endpoint, protocol}, val);
+    }
 }
 
 // Operation Statistics (Counters)
@@ -1933,6 +1956,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(file_cache_nums_);
     serialize_metric(valid_get_nums_);
     serialize_metric(total_get_nums_);
+    serialize_metric(get_advertised_objects_per_segment_);
+    serialize_metric(get_advertised_bytes_per_segment_);
 
     // Serialize Eviction Counters
     serialize_metric(eviction_success_);

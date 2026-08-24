@@ -1021,6 +1021,22 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     service_.Remove(ssd_only_key, "default");
 }
 
+TEST_F(MasterMetricsTest, GetAdvertisementMetricsExposeEndpointAndProtocol) {
+    auto& metrics = MasterMetricManager::instance();
+    const std::string endpoint = "distribution-test:50200";
+    metrics.inc_get_advertised_objects(endpoint, "rdma", 2);
+    metrics.inc_get_advertised_bytes(endpoint, "rdma", 4096);
+
+    const std::string serialized = metrics.serialize_metrics();
+    EXPECT_NE(serialized.find("master_get_advertised_replicas_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_get_advertised_bytes_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("segment=\"" + endpoint + "\""),
+              std::string::npos);
+    EXPECT_NE(serialized.find("protocol=\"rdma\""), std::string::npos);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

@@ -36,7 +36,7 @@ build_dir_name="${MOONCAKE_BUILD_DIR:-build-gpu-multipath}"
 if [ -n "${PYTHON_BIN:-}" ]; then python_bin="$PYTHON_BIN"
 elif [ -x "$repo_dir/$build_dir_name/.venv/bin/python" ]; then python_bin="$repo_dir/$build_dir_name/.venv/bin/python"
 else python_bin="$(command -v python3)"; fi
-pkg_root="$repo_dir/mooncake-wheel"
+pkg_root="${MOONCAKE_PACKAGE_ROOT:-$repo_dir/mooncake-wheel}"
 export PYTHONPATH="$pkg_root${PYTHONPATH:+:$PYTHONPATH}"
 master_bin="$pkg_root/mooncake/mooncake_master"
 meta_py="$pkg_root/mooncake/http_metadata_server.py"
@@ -105,15 +105,29 @@ fi
 
 if [ "$role" = master ]; then
   [ -x "$master_bin" ] && [ -f "$meta_py" ] || fatal "missing master/metadata artifacts"
-  meta_pid=""
-  cleanup() { [ -n "$meta_pid" ] && kill "$meta_pid" 2>/dev/null || true; }
+  meta_pid=""; monitor_pid=""
+  cleanup() {
+    [ -n "$monitor_pid" ] && kill "$monitor_pid" 2>/dev/null || true
+    [ -n "$meta_pid" ] && kill "$meta_pid" 2>/dev/null || true
+  }
   trap cleanup EXIT
   "$python_bin" "$meta_py" --host 0.0.0.0 --port "$metadata_port" \
     >"$out_dir/metadata.log" 2>&1 & meta_pid=$!
   sleep 1
   echo "[todoextra] Master=$master_address metadata=$metadata_url"
+  metrics_port="${TODOEXTRA_METRICS_PORT:-19004}"
+  if [ "${TODOEXTRA_MONITOR_DISTRIBUTION:-1}" = 1 ]; then
+    "$python_bin" "$repo_dir/scripts/monitor_master_distribution.py" \
+      --metrics-url "http://127.0.0.1:$metrics_port/metrics" \
+      --jsonl "$out_dir/master-distribution.jsonl" \
+      --summary-json "$out_dir/master-distribution-summary.json" \
+      --interval "${TODOEXTRA_MONITOR_INTERVAL:-2}" \
+      --expected-segments "${TODOEXTRA_EXPECT_SOURCES:-0}" &
+    monitor_pid=$!
+    echo "[todoextra] distribution monitor=$out_dir/master-distribution-summary.json"
+  fi
   "$master_bin" --rpc_address=0.0.0.0 --rpc_port="$master_port" \
-    --metrics_port="${TODOEXTRA_METRICS_PORT:-19004}" \
+    --metrics_port="$metrics_port" \
     --enable_metric_reporting=false --default_kv_lease_ttl="${TODOEXTRA_LEASE_TTL:-24h}"
   exit $?
 fi
@@ -159,6 +173,13 @@ fi
 iterations="${TODOEXTRA_ITERATIONS:-1}"
 warmup="${TODOEXTRA_WARMUP:-1}"
 batch_group_size="${TODOEXTRA_BATCH_GROUP_SIZE:-0}"
+if [ -z "${TODOEXTRA_DATA_PATH:-}" ] && [ "${TODOEXTRA_WITH_GDR:-0}" = 1 ]; then
+  data_path=both
+else
+  data_path="${TODOEXTRA_DATA_PATH:-staged}"
+fi
+case "$data_path" in staged|gdr|both) ;; *)
+  fatal "TODOEXTRA_DATA_PATH must be staged, gdr, or both" ;; esac
 consumer_buf="${TODOEXTRA_CONSUMER_BUFFER_BYTES:-$((block_bytes * object_count + 1024*1024*1024))}"
 gpu_id="${TODOEXTRA_GPU_ID:-0}"
 echo "[todoextra] fetch key=$key block_bytes=$block_bytes from >=$expect_sources RDMA sources"
@@ -169,6 +190,7 @@ echo "[todoextra] fetch key=$key block_bytes=$block_bytes from >=$expect_sources
   --consumer-buffer-bytes "$consumer_buf" --summary-json "$out_dir/dram.json" \
   "${common[@]}"
 
+if [ "$data_path" = staged ] || [ "$data_path" = both ]; then
 MC_STORE_RDMA_GPU_DIRECT=0 MC_STORE_TRACE_GPU_TRANSFERS=1 \
 "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role consumer --mode gpu \
   --gpu-pattern single \
@@ -185,20 +207,52 @@ MC_STORE_RDMA_GPU_DIRECT=0 MC_STORE_TRACE_GPU_TRANSFERS=1 \
   --consumer-buffer-bytes "$consumer_buf" --gpu-id "$gpu_id" \
   --summary-json "$out_dir/gpu-batch-staged.json" "${common[@]}" 2>&1 | tee "$out_dir/gpu-batch-staged.log"
 
-if [ "${TODOEXTRA_WITH_GDR:-0}" = 1 ]; then
-  if ! env MC_STORE_RDMA_GPU_DIRECT=1 MC_STORE_TRACE_GPU_TRANSFERS=1 \
-    "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role consumer --mode gpu \
-      --gpu-pattern batch \
-      --local-hostname "$local_ip:${TODOEXTRA_GDR_PORT:-50183}" --iterations "$iterations" \
-      --warmup "$warmup" --batch-group-size "$batch_group_size" \
-      --consumer-buffer-bytes "$consumer_buf" --gpu-id "$gpu_id" \
-      --summary-json "$out_dir/gpu-gdr.json" "${common[@]}" 2>&1 | tee "$out_dir/gpu-gdr.log"; then
-    echo "[todoextra] GDR candidate failed (no fallback); see $out_dir/gpu-gdr.log" >&2
-  fi
+"$python_bin" "$repo_dir/scripts/summarize_dram_rdma_results.py" \
+  --path staged --out-dir "$out_dir"
 fi
 
-"$python_bin" "$repo_dir/scripts/summarize_dram_rdma_results.py" \
-  --out-dir "$out_dir"
+if [ "$data_path" = gdr ] || [ "$data_path" = both ]; then
+  gdr_registration="${TODOEXTRA_GDR_REGISTRATION:-peermem}"
+  case "$gdr_registration" in
+    peermem) with_nvidia_peermem=1 ;;
+    dmabuf) with_nvidia_peermem=0 ;;
+    *) fatal "TODOEXTRA_GDR_REGISTRATION must be peermem or dmabuf" ;;
+  esac
+  echo "[todoextra] GDR registration=$gdr_registration WITH_NVIDIA_PEERMEM=$with_nvidia_peermem"
+
+  env MC_STORE_RDMA_GPU_DIRECT=1 MC_STORE_TRACE_GPU_TRANSFERS=1 \
+    WITH_NVIDIA_PEERMEM="$with_nvidia_peermem" \
+    "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role consumer --mode gpu \
+      --gpu-pattern single \
+      --local-hostname "$local_ip:${TODOEXTRA_GDR_SINGLE_PORT:-50183}" \
+      --iterations "$iterations" --warmup "$warmup" \
+      --consumer-buffer-bytes "$consumer_buf" --gpu-id "$gpu_id" \
+      --summary-json "$out_dir/gpu-single-gdr.json" "${common[@]}" \
+      >"$out_dir/gpu-single-gdr.log" 2>&1
+
+  env MC_STORE_RDMA_GPU_DIRECT=1 MC_STORE_TRACE_GPU_TRANSFERS=1 \
+    WITH_NVIDIA_PEERMEM="$with_nvidia_peermem" \
+    "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role consumer --mode gpu \
+      --gpu-pattern batch \
+      --local-hostname "$local_ip:${TODOEXTRA_GDR_BATCH_PORT:-50184}" \
+      --iterations "$iterations" --warmup "$warmup" \
+      --batch-group-size "$batch_group_size" \
+      --consumer-buffer-bytes "$consumer_buf" --gpu-id "$gpu_id" \
+      --summary-json "$out_dir/gpu-batch-gdr.json" "${common[@]}" \
+      >"$out_dir/gpu-batch-gdr.log" 2>&1
+
+  grep -q 'path=rdma_gpu_direct' "$out_dir/gpu-single-gdr.log" ||
+    fatal "single GDR trace proof missing: $out_dir/gpu-single-gdr.log"
+  grep -q 'path=rdma_gpu_direct' "$out_dir/gpu-batch-gdr.log" ||
+    fatal "batch GDR trace proof missing: $out_dir/gpu-batch-gdr.log"
+  if grep -q 'path=rdma_host_staged' "$out_dir/gpu-single-gdr.log" \
+     "$out_dir/gpu-batch-gdr.log"; then
+    fatal "staged fallback appeared in a GDR-only run"
+  fi
+
+  "$python_bin" "$repo_dir/scripts/summarize_dram_rdma_results.py" \
+    --path gdr --out-dir "$out_dir"
+fi
 
 if [ "${TODOEXTRA_CLEANUP_AFTER:-0}" = 1 ]; then
   "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role cleanup \

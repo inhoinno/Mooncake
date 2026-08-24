@@ -5,6 +5,7 @@ import unittest
 
 import cxl_gpu_perf as cxl
 import dram_rdma_perf as rdma
+import monitor_master_distribution as master_distribution
 import summarize_dram_rdma_results as rdma_summary
 
 
@@ -173,6 +174,54 @@ class PerfHarnessTest(unittest.TestCase):
         self.assertNotIn("per_key_placement", summary)
         self.assertEqual(2.0, summary["batch_throughput_speedup"])
         self.assertEqual(4, summary["single"]["api_calls_per_iteration"])
+
+    def test_gdr_summary_requires_and_reports_direct_path(self):
+        base = {
+            "status": "PASS", "object_count": 2, "block_bytes": 16,
+            "source_segment_count": 2,
+            "source_endpoints": ["m1:1", "m2:1"],
+            "source_protocols": ["rdma"],
+            "gpu_path_selected": "rdma_gpu_direct",
+        }
+        single = dict(base, to_gpu_single_gpudirect={
+            "iterations": 1, "api_calls": 2, "objects_per_call": 1,
+            "sec": 2.0, "GBps": 4.0})
+        batch = dict(base, to_gpu_batch_gpudirect={
+            "iterations": 1, "api_calls": 1, "objects_per_call": 2,
+            "sec": 1.0, "GBps": 8.0})
+        original = rdma_summary._load
+        rdma_summary._load = lambda path: (
+            single if "single" in path.name else batch)
+        try:
+            summary = rdma_summary.build_summary(
+                __import__("pathlib").Path("unused"), "gdr")
+        finally:
+            rdma_summary._load = original
+        self.assertEqual("rdma_gpu_direct", summary["gpu_path"])
+        self.assertNotIn("rdma_to_host_GBps", summary["single"])
+        self.assertIn("GPU-direct", rdma_summary.render(summary))
+
+    def test_master_distribution_separates_population_and_get_evidence(self):
+        metrics = '''
+segment_allocated_bytes{segment="m1:50200"} 1073741824
+segment_allocated_bytes{segment="m2:50200"} 1073741824
+segment_total_capacity_bytes{segment="m1:50200"} 8589934592
+segment_total_capacity_bytes{segment="m2:50200"} 8589934592
+master_get_advertised_replicas_total{segment="m1:50200",protocol="rdma"} 5
+master_get_advertised_replicas_total{segment="m2:50200",protocol="rdma"} 7
+master_get_advertised_bytes_total{segment="m1:50200",protocol="rdma"} 80
+master_get_advertised_bytes_total{segment="m2:50200",protocol="rdma"} 112
+'''
+        samples = master_distribution.parse_prometheus(metrics)
+        baseline = {
+            "objects": {"m1:50200": 1, "m2:50200": 1},
+            "bytes": {"m1:50200": 16, "m2:50200": 16},
+        }
+        result = master_distribution.build_snapshot(samples, baseline, 2)
+        self.assertTrue(result["expected_segments_ready"])
+        self.assertEqual(2, result["population_bytes"]["active_segments"])
+        self.assertEqual(10, result["get_advertised_objects_delta"]["total"])
+        self.assertFalse(result["evidence_scope"]["data_plane_bytes_observed"])
 
 
 if __name__ == "__main__":

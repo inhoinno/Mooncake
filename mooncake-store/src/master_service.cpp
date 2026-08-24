@@ -3270,6 +3270,17 @@ auto MasterService::GetReplicaList(const std::string& key,
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
         }
 
+        for (const auto& descriptor : replica_list) {
+            if (!descriptor.is_memory_replica()) continue;
+            const auto& buffer =
+                descriptor.get_memory_descriptor().buffer_descriptor;
+            MasterMetricManager::instance().inc_get_advertised_objects(
+                buffer.transport_endpoint_, buffer.protocol_);
+            MasterMetricManager::instance().inc_get_advertised_bytes(
+                buffer.transport_endpoint_, buffer.protocol_,
+                static_cast<int64_t>(metadata.size));
+        }
+
         // TODO: NoF SSD support (ranhaojia)
         if (replica_list[0].is_memory_replica()) {
             MasterMetricManager::instance().inc_mem_cache_hit_nums();
@@ -3438,6 +3449,17 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     results[original_idx] =
                         tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
                     continue;
+                }
+
+                for (const auto& descriptor : replica_list) {
+                    if (!descriptor.is_memory_replica()) continue;
+                    const auto& buffer =
+                        descriptor.get_memory_descriptor().buffer_descriptor;
+                    MasterMetricManager::instance().inc_get_advertised_objects(
+                        buffer.transport_endpoint_, buffer.protocol_);
+                    MasterMetricManager::instance().inc_get_advertised_bytes(
+                        buffer.transport_endpoint_, buffer.protocol_,
+                        static_cast<int64_t>(metadata.size));
                 }
 
                 if (replica_list[0].is_memory_replica()) {
@@ -3695,12 +3717,11 @@ auto MasterService::AllocateAndInsertMetadata(
                         !segment_names.front().has_value()) {
                         continue;
                     }
-                    LOG(INFO)
-                        << "component=mooncake_master "
-                           "event=replica_protocol_selected segment_name="
-                        << *segment_names.front() << " protocol="
-                        << allocator_manager.getProtocol(
-                               *segment_names.front());
+                    LOG(INFO) << "component=mooncake_master "
+                                 "event=replica_protocol_selected segment_name="
+                              << *segment_names.front() << " protocol="
+                              << allocator_manager.getProtocol(
+                                     *segment_names.front());
                 }
             }
             allocated_memory_replicas = allocation_result->size();

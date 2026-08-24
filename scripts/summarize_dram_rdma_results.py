@@ -23,47 +23,56 @@ def _metric(data: dict[str, Any], name: str) -> dict[str, Any]:
     return value
 
 
-def build_summary(out_dir: Path) -> dict[str, Any]:
-    single = _load(out_dir / "gpu-single-staged.json")
-    batch = _load(out_dir / "gpu-batch-staged.json")
+def build_summary(out_dir: Path, data_path: str = "staged") -> dict[str, Any]:
+    suffix = "staged" if data_path == "staged" else "gdr"
+    metric_suffix = "staged" if data_path == "staged" else "gpudirect"
+    expected_gpu_path = (
+        "rdma_host_staged" if data_path == "staged" else "rdma_gpu_direct")
+    single = _load(out_dir / f"gpu-single-{suffix}.json")
+    batch = _load(out_dir / f"gpu-batch-{suffix}.json")
     dram_path = out_dir / "dram.json"
     dram = _load(dram_path) if dram_path.exists() else None
 
-    single_e2e = _metric(single, "to_gpu_single_staged")
-    batch_e2e = _metric(batch, "to_gpu_batch_staged")
-    single_split = _metric(single, "staged_breakdown")
-    batch_split = _metric(batch, "staged_breakdown")
+    single_e2e = _metric(single, f"to_gpu_single_{metric_suffix}")
+    batch_e2e = _metric(batch, f"to_gpu_batch_{metric_suffix}")
+    single_split = single.get("staged_breakdown")
+    batch_split = batch.get("staged_breakdown")
 
     if single.get("source_endpoints") != batch.get("source_endpoints"):
         raise ValueError("single and batch source endpoints differ")
     if single.get("source_protocols") != ["rdma"] or \
        batch.get("source_protocols") != ["rdma"]:
         raise ValueError("result is not an RDMA-only comparison")
-    if single.get("gpu_path_selected") != "rdma_host_staged" or \
-       batch.get("gpu_path_selected") != "rdma_host_staged":
-        raise ValueError("result is not the staged RDMA-to-GPU path")
+    if single.get("gpu_path_selected") != expected_gpu_path or \
+       batch.get("gpu_path_selected") != expected_gpu_path:
+        raise ValueError(
+            f"result does not prove requested GPU path {expected_gpu_path}")
 
-    def compact(e2e: dict[str, Any], split: dict[str, Any]) -> dict[str, Any]:
+    def compact(e2e: dict[str, Any], split: Any) -> dict[str, Any]:
         calls_per_iteration = e2e.get("api_calls_per_iteration")
         if calls_per_iteration is None:
             calls_per_iteration = e2e["api_calls"] // e2e["iterations"]
-        return {
+        result = {
             "api_calls": e2e["api_calls"],
             "api_calls_per_iteration": calls_per_iteration,
             "objects_per_call": e2e["objects_per_call"],
             "elapsed_sec": e2e["sec"],
             "end_to_end_GBps": e2e["GBps"],
-            "rdma_to_host_sec": split["rdma_to_host"]["sec"],
-            "rdma_to_host_GBps": split["rdma_to_host"]["GBps"],
-            "host_to_gpu_sec": split["host_to_gpu"]["sec"],
-            "host_to_gpu_GBps": split["host_to_gpu"]["GBps"],
-            "unattributed_sec": split["unattributed_sec"],
         }
+        if isinstance(split, dict):
+            result.update({
+                "rdma_to_host_sec": split["rdma_to_host"]["sec"],
+                "rdma_to_host_GBps": split["rdma_to_host"]["GBps"],
+                "host_to_gpu_sec": split["host_to_gpu"]["sec"],
+                "host_to_gpu_GBps": split["host_to_gpu"]["GBps"],
+                "unattributed_sec": split["unattributed_sec"],
+            })
+        return result
 
     summary = {
         "status": "PASS",
         "transport": "rdma",
-        "gpu_path": "rdma_host_staged",
+        "gpu_path": expected_gpu_path,
         "object_count": single["object_count"],
         "block_bytes": single["block_bytes"],
         "bytes_per_iteration": single["object_count"] * single["block_bytes"],
@@ -86,8 +95,12 @@ def build_summary(out_dir: Path) -> dict[str, Any]:
 
 def render(summary: dict[str, Any]) -> str:
     single, batch = summary["single"], summary["batch"]
+    title = (
+        "TODO Extra RDMA -> GPU-direct comparison"
+        if summary["gpu_path"] == "rdma_gpu_direct"
+        else "TODO Extra RDMA -> host -> GPU comparison")
     lines = [
-        "TODO Extra RDMA -> host -> GPU comparison",
+        title,
         f"status=PASS transport={summary['transport']} "
         f"gpu_path={summary['gpu_path']}",
         f"objects={summary['object_count']} block_bytes={summary['block_bytes']} "
@@ -105,17 +118,24 @@ def render(summary: dict[str, Any]) -> str:
         f"{batch['elapsed_sec']:>10.6f}",
         f"end-to-end GB/s               {single['end_to_end_GBps']:>10.3f}     "
         f"{batch['end_to_end_GBps']:>10.3f}",
-        f"RDMA -> host GB/s             {single['rdma_to_host_GBps']:>10.3f}     "
-        f"{batch['rdma_to_host_GBps']:>10.3f}",
-        f"host -> GPU GB/s              {single['host_to_gpu_GBps']:>10.3f}     "
-        f"{batch['host_to_gpu_GBps']:>10.3f}",
-        f"unattributed seconds          {single['unattributed_sec']:>10.6f}     "
-        f"{batch['unattributed_sec']:>10.6f}",
+    ]
+    if summary["gpu_path"] == "rdma_host_staged":
+        lines.extend([
+            f"RDMA -> host GB/s             {single['rdma_to_host_GBps']:>10.3f}     "
+            f"{batch['rdma_to_host_GBps']:>10.3f}",
+            f"host -> GPU GB/s              {single['host_to_gpu_GBps']:>10.3f}     "
+            f"{batch['host_to_gpu_GBps']:>10.3f}",
+            f"unattributed seconds          {single['unattributed_sec']:>10.6f}     "
+            f"{batch['unattributed_sec']:>10.6f}",
+        ])
+    else:
+        lines.append("phase breakdown                 direct GDR: not applicable")
+    lines.extend([
         "",
         f"batch throughput speedup={summary['batch_throughput_speedup']:.4f}x",
         f"batch elapsed reduction={summary['batch_elapsed_reduction_pct']:.3f}%",
         "endpoints=" + ",".join(summary["source_endpoints"]),
-    ]
+    ])
     if "host_dram_reference" in summary:
         ref = summary["host_dram_reference"]
         lines.append(f"host DRAM reference={ref['GBps']:.3f} GB/s")
@@ -125,12 +145,14 @@ def render(summary: dict[str, Any]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--path", choices=["staged", "gdr"], default="staged")
     args = parser.parse_args()
-    summary = build_summary(args.out_dir)
+    summary = build_summary(args.out_dir, args.path)
     text = render(summary)
-    (args.out_dir / "comparison-summary.json").write_text(
+    prefix = "comparison-summary" if args.path == "staged" else "gdr-comparison-summary"
+    (args.out_dir / f"{prefix}.json").write_text(
         json.dumps(summary, indent=2) + "\n")
-    (args.out_dir / "comparison-summary.txt").write_text(text)
+    (args.out_dir / f"{prefix}.txt").write_text(text)
     print(text, end="")
     return 0
 

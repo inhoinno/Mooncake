@@ -1,5 +1,10 @@
 # TODO Extra: four-source RDMA scaling baseline
 
+Master-side population and GET-distribution monitoring is enabled by default
+for this harness. See `docs/MASTER_REQUEST_DISTRIBUTION_MONITOR.md` for metric
+semantics, artifacts, and paper-safe interpretation. Add
+`TODOEXTRA_EXPECT_SOURCES=4` to the Master command so readiness is explicit.
+
 ## Paper question
 
 Measure whether grouping the same objects by source into Mooncake batch GET
@@ -439,3 +444,10 @@ Do not call this GPUDirect RDMA. This gate intentionally measures:
 ```text
 remote/source DRAM -> RDMA -> registered m3 host staging -> CUDA copy -> GPU
 ```
+
+## Separate GPUDirect RDMA experiment
+
+Do not enable GDR inside this staged baseline. The isolated installation,
+hardware qualification, registration choice, commands, 18-point matrix,
+fail-closed acceptance checks, and GDR result format are documented in
+[`TODOEXTRA_GDR_SCALING_PAPER_BASELINE.md`](TODOEXTRA_GDR_SCALING_PAPER_BASELINE.md).

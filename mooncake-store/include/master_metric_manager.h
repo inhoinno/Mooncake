@@ -47,6 +47,14 @@ class MasterMetricManager {
 
     void inc_valid_get_nums(int64_t val = 1);
     void inc_total_get_nums(int64_t val = 1);
+    // Replicas returned to readers, grouped by the registered transport
+    // endpoint and protocol. These counters describe Master metadata
+    // decisions; payload movement remains on the client data plane.
+    void inc_get_advertised_objects(const std::string& endpoint,
+                                    const std::string& protocol,
+                                    int64_t val = 1);
+    void inc_get_advertised_bytes(const std::string& endpoint,
+                                  const std::string& protocol, int64_t val);
 
     // NoF segment Metrics
     void inc_allocated_nof_size(const std::string& segment, int64_t val = 1);
@@ -655,6 +663,8 @@ class MasterMetricManager {
 
     ylt::metric::counter_t valid_get_nums_;
     ylt::metric::counter_t total_get_nums_;
+    ylt::metric::dynamic_counter_2t get_advertised_objects_per_segment_;
+    ylt::metric::dynamic_counter_2t get_advertised_bytes_per_segment_;
 
     static const inline std::unordered_map<CacheHitStat, std::string>
         stat_names_ = {{CacheHitStat::MEMORY_HITS, "memory_hits"},
