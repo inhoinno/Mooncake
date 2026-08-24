@@ -39,6 +39,22 @@ class _Store:
         ]
 
 
+class _CleanupStore:
+    def __init__(self):
+        self.keys = {"object-0000", "object-0001"}
+        self.closed = False
+
+    def is_exist(self, key):
+        return int(key in self.keys)
+
+    def remove(self, key, _hard):
+        self.keys.remove(key)
+        return 0
+
+    def close(self):
+        self.closed = True
+
+
 class PerfHarnessTest(unittest.TestCase):
     def test_cxl_client_working_sets_are_disjoint_and_deterministic(self):
         a = cxl._client_object_order(0, 64, 7)
@@ -93,6 +109,32 @@ class PerfHarnessTest(unittest.TestCase):
     def test_rdma_target_is_optional_for_legacy_single_key(self):
         args = type("Args", (), {"source_endpoints": []})()
         self.assertIsNone(rdma._target_endpoint(args, 0))
+
+    def test_rdma_batch_groups_preserve_per_source_key_groups(self):
+        keys = [f"key-{i}" for i in range(8)]
+        groups = rdma._batch_groups(keys, list(range(8)), [1] * 8, 4)
+        self.assertEqual(2, len(groups))
+        self.assertEqual(keys[:4], groups[0][0])
+        self.assertEqual(keys[4:], groups[1][0])
+
+    def test_rdma_zero_batch_group_means_one_global_batch(self):
+        keys = ["a", "b", "c"]
+        groups = rdma._batch_groups(keys, [1, 2, 3], [4, 4, 4], 0)
+        self.assertEqual(1, len(groups))
+        self.assertEqual(keys, groups[0][0])
+
+    def test_rdma_cleanup_removes_the_complete_dataset(self):
+        store = _CleanupStore()
+        args = type("Args", (), {"key": "object", "object_count": 2})()
+        original = rdma._open_store
+        rdma._open_store = lambda *_: (None, store)
+        try:
+            result = rdma.run_cleanup(args)
+        finally:
+            rdma._open_store = original
+        self.assertEqual(2, result["removed"])
+        self.assertFalse(store.keys)
+        self.assertTrue(store.closed)
 
     def test_rate_is_total_bytes_over_elapsed_time(self):
         rate = rdma._rate(4_000_000_000, 2.0, 4)

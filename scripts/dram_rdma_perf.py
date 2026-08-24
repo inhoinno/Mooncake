@@ -16,6 +16,7 @@ Roles:
   prep      -- issue one put_from() per key and verify COMPLETE publication on
                the requested source endpoint.
   consumer  -- run the three measurements above and emit a JSON summary.
+  cleanup   -- remove all keys in the current dataset after results are saved.
 
 Topology matches the diagram: N Mooncake clients (legacy) over one RDMA fabric,
 one Mooncake master. Single-node (loopback RDMA, N processes) by default; the
@@ -201,6 +202,22 @@ def run_prep(args: argparse.Namespace) -> dict[str, Any]:
         store.close()
 
 
+def run_cleanup(args: argparse.Namespace) -> dict[str, Any]:
+    _module, store = _open_store(args, 0, 64 * MiB)
+    removed = 0
+    try:
+        for key in _object_keys(args):
+            if int(store.is_exist(key)) != 1:
+                continue
+            rc = int(store.remove(key, True))
+            if rc != 0:
+                raise PerfError(f"failed to remove {key} rc={rc}")
+            removed += 1
+        return {"role": "cleanup", "status": "PASS", "removed": removed}
+    finally:
+        store.close()
+
+
 def _placement_for_key(store: Any, key: str) -> dict[str, Any]:
     endpoints: set[str] = set()
     protocols: set[str] = set()
@@ -250,6 +267,18 @@ def _rate(bytes_n: int, dt: float, iterations: int) -> dict[str, Any]:
     }
 
 
+def _batch_groups(
+    keys: list[str], ptrs: list[int], sizes: list[int], group_size: int
+) -> list[tuple[list[str], list[int], list[int]]]:
+    """Return stable per-source batches; zero means one global batch."""
+    width = group_size or len(keys)
+    return [
+        (keys[start:start + width], ptrs[start:start + width],
+         sizes[start:start + width])
+        for start in range(0, len(keys), width)
+    ]
+
+
 def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
     gdr = os.environ.get("MC_STORE_RDMA_GPU_DIRECT") == "1"
     # Registered get_into needs no internal staging pool. Staged GPU reads do;
@@ -269,7 +298,7 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
         aggregate_placement = _placement_for_keys(placements)
         _assert_placement(aggregate_placement, args)
         if args.source_endpoints:
-            expected = sorted(args.source_endpoints[:len(keys)])
+            expected = sorted(set(args.source_endpoints[:len(keys)]))
             if aggregate_placement["source_endpoints"] != expected:
                 raise PerfError(
                     "consumer placement differs from deterministic prep: "
@@ -322,6 +351,7 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
                                     device="cuda") for _ in keys]
         ptrs = [int(dst.data_ptr()) for dst in destinations]
         sizes = [args.block_bytes] * len(keys)
+        batch_groups = _batch_groups(keys, ptrs, sizes, args.batch_group_size)
         for _ in range(args.warmup):
             if args.gpu_pattern == "single":
                 for key, ptr, size in zip(keys, ptrs, sizes):
@@ -329,9 +359,14 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
                     if got != size:
                         raise PerfError(f"GPU warmup returned {got} for {key}")
             else:
-                results = list(store.batch_get_into(keys, ptrs, sizes))
-                if any(int(got) != size for got, size in zip(results, sizes)):
-                    raise PerfError(f"GPU batch warmup returned {results}")
+                for group_keys, group_ptrs, group_sizes in batch_groups:
+                    results = list(store.batch_get_into(
+                        group_keys, group_ptrs, group_sizes))
+                    if any(int(got) != size for got, size
+                           in zip(results, group_sizes)):
+                        raise PerfError(
+                            f"GPU batch warmup returned {results} for "
+                            f"keys={group_keys}")
             torch.cuda.synchronize()
         t = time.monotonic()
         transfer_to_staging_ns = 0
@@ -349,12 +384,18 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
             else:
                 if not hasattr(store, "batch_get_into_profiled"):
                     raise PerfError("store.so is missing batch_get_into_profiled; rebuild")
-                profile = store.batch_get_into_profiled(keys, ptrs, sizes)
-                results = list(profile["results"])
-                if any(int(got) != size for got, size in zip(results, sizes)):
-                    raise PerfError(f"GPU batch_get_into failed: {results}")
-                transfer_to_staging_ns += int(profile["transfer_to_staging_ns"])
-                staging_to_gpu_ns += int(profile["staging_to_gpu_ns"])
+                for group_keys, group_ptrs, group_sizes in batch_groups:
+                    profile = store.batch_get_into_profiled(
+                        group_keys, group_ptrs, group_sizes)
+                    results = list(profile["results"])
+                    if any(int(got) != size for got, size
+                           in zip(results, group_sizes)):
+                        raise PerfError(
+                            f"GPU batch_get_into failed for keys={group_keys}: "
+                            f"{results}")
+                    transfer_to_staging_ns += int(
+                        profile["transfer_to_staging_ns"])
+                    staging_to_gpu_ns += int(profile["staging_to_gpu_ns"])
             torch.cuda.synchronize()
         dt = time.monotonic() - t
         path = "rdma_gpu_direct" if gdr else "rdma_host_staged"
@@ -364,10 +405,15 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
             "_gpudirect" if gdr else "_staged")
         out[result_name] = _rate(
             args.block_bytes * total_operations, dt, args.iterations)
-        out[result_name]["api_calls"] = (
-            total_operations if args.gpu_pattern == "single" else args.iterations)
+        calls_per_iteration = (
+            len(keys) if args.gpu_pattern == "single" else len(batch_groups))
+        out[result_name]["api_calls"] = args.iterations * calls_per_iteration
+        out[result_name]["api_calls_per_iteration"] = calls_per_iteration
         out[result_name]["objects_per_call"] = (
-            1 if args.gpu_pattern == "single" else len(keys))
+            1 if args.gpu_pattern == "single" else
+            max(len(group[0]) for group in batch_groups))
+        out[result_name]["batch_group_count"] = (
+            0 if args.gpu_pattern == "single" else len(batch_groups))
         if not gdr:
             transfer_sec = transfer_to_staging_ns / 1e9
             scatter_sec = staging_to_gpu_ns / 1e9
@@ -391,7 +437,8 @@ def run_consumer(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--role", choices=["server", "prep", "consumer"], required=True)
+    p.add_argument("--role", choices=["server", "prep", "consumer", "cleanup"],
+                   required=True)
     p.add_argument("--store-module", default="mooncake.store")
     p.add_argument("--local-hostname", required=True)
     p.add_argument("--master-server", required=True)
@@ -420,6 +467,8 @@ def main(argv: list[str]) -> int:
     p.add_argument("--skip-dram", action="store_true")
     p.add_argument("--mode", choices=["both", "dram", "gpu"], default="both")
     p.add_argument("--gpu-pattern", choices=["single", "batch"], default="batch")
+    p.add_argument("--batch-group-size", type=int, default=0,
+                   help="objects per batch call; zero batches all keys together")
     p.add_argument("--iterations", type=int, default=1)
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--summary-json", default="")
@@ -432,6 +481,8 @@ def main(argv: list[str]) -> int:
         p.error("--object-count must be positive")
     if args.publish_timeout_sec <= 0:
         p.error("--publish-timeout-sec must be positive")
+    if args.batch_group_size < 0:
+        p.error("--batch-group-size cannot be negative")
     if args.source_endpoints and len(args.source_endpoints) < args.object_count:
         p.error("provide at least one --source-endpoint per object")
 
@@ -440,6 +491,8 @@ def main(argv: list[str]) -> int:
             summary = run_server(args)
         elif args.role == "prep":
             summary = run_prep(args)
+        elif args.role == "cleanup":
+            summary = run_cleanup(args)
         else:
             summary = run_consumer(args)
     except Exception as err:

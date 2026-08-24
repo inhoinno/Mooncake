@@ -9,7 +9,7 @@ role="${1:-}"
 fatal() { echo "[FATAL] $*" >&2; exit 2; }
 usage() {
   cat <<'EOF'
-Usage: bash scripts/run_dram_rdma_distributed.sh <master|source|prep|consumer>
+Usage: bash scripts/run_dram_rdma_distributed.sh <master|source|prep|consumer|cleanup>
 
 Shared:
   TODOEXTRA_MASTER_ADDRESS=192.168.3.43:50051
@@ -24,11 +24,12 @@ source (run on every DRAM source node):
 prep/consumer (run on the GPU consumer node):
   TODOEXTRA_LOCAL_IP=192.168.3.43 TODOEXTRA_EXPECT_SOURCES=4
   TODOEXTRA_SOURCE_ENDPOINTS=192.168.5.44:50200,192.168.5.44:50201,...
-  TODOEXTRA_ITERATIONS=3 TODOEXTRA_GPU_ID=0 TODOEXTRA_WITH_GDR=1
+  TODOEXTRA_OBJECTS_PER_SOURCE=8 TODOEXTRA_BATCH_GROUP_SIZE=8
+  TODOEXTRA_ITERATIONS=3 TODOEXTRA_WARMUP=1 TODOEXTRA_GPU_ID=0
 EOF
 }
 
-case "$role" in master|source|prep|consumer) ;; *) usage; exit 2 ;; esac
+case "$role" in master|source|prep|consumer|cleanup) ;; *) usage; exit 2 ;; esac
 [ "$(uname -s)" = Linux ] || fatal "requires Linux"
 
 build_dir_name="${MOONCAKE_BUILD_DIR:-build-gpu-multipath}"
@@ -48,8 +49,14 @@ metadata_port="${TODOEXTRA_METADATA_PORT:-8080}"
 local_ip="${TODOEXTRA_LOCAL_IP:-}"
 device_name="${RDMA_DEVICE_NAME:-}"
 key="${TODOEXTRA_KEY:-todoextra-8g}"
-block_gib="${TODOEXTRA_BLOCK_GIB:-8}"
-block_bytes=$((block_gib * 1024 * 1024 * 1024))
+if [ -n "${TODOEXTRA_BLOCK_BYTES:-}" ]; then
+  block_bytes="$TODOEXTRA_BLOCK_BYTES"
+elif [ -n "${TODOEXTRA_BLOCK_MIB:-}" ]; then
+  block_bytes=$((TODOEXTRA_BLOCK_MIB * 1024 * 1024))
+else
+  block_bytes=$((${TODOEXTRA_BLOCK_GIB:-8} * 1024 * 1024 * 1024))
+fi
+case "$block_bytes" in ""|*[!0-9]*|0) fatal "block size must be positive" ;; esac
 object_count="${TODOEXTRA_OBJECT_COUNT:-1}"
 case "$object_count" in ""|*[!0-9]*|0) fatal "TODOEXTRA_OBJECT_COUNT must be positive" ;; esac
 segment_gib="${TODOEXTRA_SEGMENT_GIB:-8}"
@@ -75,8 +82,21 @@ common=(--store-module mooncake.store --master-server "$master_address"
 source_endpoints_csv="${TODOEXTRA_SOURCE_ENDPOINTS:-}"
 if [ -n "$source_endpoints_csv" ]; then
   IFS=',' read -r -a source_endpoints <<<"$source_endpoints_csv"
-  [ "${#source_endpoints[@]}" -ge "$object_count" ] ||
-    fatal "TODOEXTRA_SOURCE_ENDPOINTS needs at least $object_count comma-separated endpoints"
+  objects_per_source="${TODOEXTRA_OBJECTS_PER_SOURCE:-0}"
+  case "$objects_per_source" in ""|*[!0-9]*)
+    fatal "TODOEXTRA_OBJECTS_PER_SOURCE must be zero or positive" ;; esac
+  if [ "$objects_per_source" -gt 0 ]; then
+    [ "$(( ${#source_endpoints[@]} * objects_per_source ))" -eq "$object_count" ] ||
+      fatal "source endpoint count * TODOEXTRA_OBJECTS_PER_SOURCE must equal TODOEXTRA_OBJECT_COUNT"
+    expanded_endpoints=()
+    for endpoint in "${source_endpoints[@]}"; do
+      for _ in $(seq 1 "$objects_per_source"); do expanded_endpoints+=("$endpoint"); done
+    done
+    source_endpoints=("${expanded_endpoints[@]}")
+  else
+    [ "${#source_endpoints[@]}" -ge "$object_count" ] ||
+      fatal "provide one endpoint per object, or set TODOEXTRA_OBJECTS_PER_SOURCE"
+  fi
   for endpoint in "${source_endpoints[@]}"; do
     [[ "$endpoint" == *:* ]] || fatal "invalid source endpoint: $endpoint"
     common+=(--source-endpoint "$endpoint")
@@ -131,13 +151,21 @@ if [ "$role" = prep ]; then
     --min-source-segments "$expect_sources" "${common[@]}"
 fi
 
+if [ "$role" = cleanup ]; then
+  exec "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role cleanup \
+    --local-hostname "$local_ip:${TODOEXTRA_CLEANUP_PORT:-50194}" "${common[@]}"
+fi
+
 iterations="${TODOEXTRA_ITERATIONS:-1}"
+warmup="${TODOEXTRA_WARMUP:-1}"
+batch_group_size="${TODOEXTRA_BATCH_GROUP_SIZE:-0}"
 consumer_buf="${TODOEXTRA_CONSUMER_BUFFER_BYTES:-$((block_bytes * object_count + 1024*1024*1024))}"
 gpu_id="${TODOEXTRA_GPU_ID:-0}"
-echo "[todoextra] fetch key=$key size=${block_gib}GiB from >=$expect_sources RDMA sources"
+echo "[todoextra] fetch key=$key block_bytes=$block_bytes from >=$expect_sources RDMA sources"
 
 "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role consumer --mode dram \
   --local-hostname "$local_ip:${TODOEXTRA_DRAM_PORT:-50180}" --iterations "$iterations" \
+  --warmup "$warmup" \
   --consumer-buffer-bytes "$consumer_buf" --summary-json "$out_dir/dram.json" \
   "${common[@]}"
 
@@ -145,6 +173,7 @@ MC_STORE_RDMA_GPU_DIRECT=0 MC_STORE_TRACE_GPU_TRANSFERS=1 \
 "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role consumer --mode gpu \
   --gpu-pattern single \
   --local-hostname "$local_ip:${TODOEXTRA_GPU_PORT:-50181}" --iterations "$iterations" \
+  --warmup "$warmup" \
   --consumer-buffer-bytes "$consumer_buf" --gpu-id "$gpu_id" \
   --summary-json "$out_dir/gpu-single-staged.json" "${common[@]}" 2>&1 | tee "$out_dir/gpu-single-staged.log"
 
@@ -152,6 +181,7 @@ MC_STORE_RDMA_GPU_DIRECT=0 MC_STORE_TRACE_GPU_TRANSFERS=1 \
 "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role consumer --mode gpu \
   --gpu-pattern batch \
   --local-hostname "$local_ip:${TODOEXTRA_BATCH_PORT:-50182}" --iterations "$iterations" \
+  --warmup "$warmup" --batch-group-size "$batch_group_size" \
   --consumer-buffer-bytes "$consumer_buf" --gpu-id "$gpu_id" \
   --summary-json "$out_dir/gpu-batch-staged.json" "${common[@]}" 2>&1 | tee "$out_dir/gpu-batch-staged.log"
 
@@ -160,10 +190,16 @@ if [ "${TODOEXTRA_WITH_GDR:-0}" = 1 ]; then
     "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role consumer --mode gpu \
       --gpu-pattern batch \
       --local-hostname "$local_ip:${TODOEXTRA_GDR_PORT:-50183}" --iterations "$iterations" \
+      --warmup "$warmup" --batch-group-size "$batch_group_size" \
       --consumer-buffer-bytes "$consumer_buf" --gpu-id "$gpu_id" \
       --summary-json "$out_dir/gpu-gdr.json" "${common[@]}" 2>&1 | tee "$out_dir/gpu-gdr.log"; then
     echo "[todoextra] GDR candidate failed (no fallback); see $out_dir/gpu-gdr.log" >&2
   fi
+fi
+
+if [ "${TODOEXTRA_CLEANUP_AFTER:-0}" = 1 ]; then
+  "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role cleanup \
+    --local-hostname "$local_ip:${TODOEXTRA_CLEANUP_PORT:-50194}" "${common[@]}"
 fi
 
 echo "[todoextra] summaries/logs: $out_dir"
