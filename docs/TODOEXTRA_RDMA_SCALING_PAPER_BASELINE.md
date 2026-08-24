@@ -74,12 +74,168 @@ gpu_path_selected     = "rdma_host_staged"
 The Master's `rpc protocol=tcp` log is control-plane RPC and does not invalidate
 the data-path result.
 
-## Step 0 — build and network checks on all four hosts
+## Installation on a fresh host
+
+Run this on m1, m2, m3, and m4. A command such as
+`cmake --build build-gpu-multipath` is only a rebuild command: it requires an
+existing `build-gpu-multipath/CMakeCache.txt`. The error
+
+```text
+Error: not a CMake build directory (missing CMakeCache.txt)
+```
+
+means the configure/install step below has not been run on that host.
+
+### 1. System dependencies
+
+Ubuntu/Debian:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  build-essential ca-certificates cmake curl git ninja-build patchelf \
+  pkg-config python3 python3-dev python3-pip python3-venv unzip wget \
+  libasio-dev libboost-all-dev libcurl4-openssl-dev libgflags-dev \
+  libgoogle-glog-dev libgrpc++-dev libgrpc-dev libhiredis-dev \
+  libibverbs-dev libjemalloc-dev libjsoncpp-dev libmsgpack-dev \
+  libnuma-dev libprotobuf-dev libssl-dev libunwind-dev liburing-dev \
+  libxxhash-dev libyaml-cpp-dev libzmq3-dev libzstd-dev \
+  protobuf-compiler-grpc
+```
+
+Verify the CUDA compiler and driver on the GPU consumer m3. The CUDA toolkit
+used by CMake must be installed separately from the NVIDIA driver:
+
+```bash
+nvidia-smi
+nvcc --version
+```
+
+The source hosts need the same CUDA-enabled package for reproducibility. If
+they are ABI-identical and do not have a CUDA toolkit, build once on m3 and
+copy the staged `mooncake-wheel` directory plus matching runtime libraries;
+building locally on every host is safer.
+
+### 2. Initialize pinned source dependencies
+
+```bash
+cd /home/labuser/inho/Multipath/Mooncake-dev
+git submodule sync --recursive
+git submodule update --init --recursive extern/pybind11 extern/yalantinglibs
+test -f extern/pybind11/CMakeLists.txt
+test -f extern/yalantinglibs/cmake/build.cmake
+```
+
+Do not install `yalantinglibs` with pip. It is a C++ CMake dependency. The
+overlay builds the pinned submodule into
+`build-gpu-multipath/_deps/yalantinglibs-install` automatically.
+
+### 3. Select the Python environment
+
+The build interpreter and runtime interpreter must be the same Python minor
+version. The lab commands use `/home/labuser/venv/bin/python3`:
+
+```bash
+cd /home/labuser/inho/Multipath/Mooncake-dev
+test -x /home/labuser/venv/bin/python3 || python3 -m venv /home/labuser/venv
+/home/labuser/venv/bin/python3 -m pip install --upgrade \
+  pip build setuptools wheel auditwheel 'patchelf>=0.17' numpy aiohttp
+```
+
+On m3, install a PyTorch wheel compatible with its CUDA driver/toolkit using
+the PyTorch CUDA package index appropriate to the machine, then require CUDA
+visibility:
+
+```bash
+/home/labuser/venv/bin/python3 - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("torch CUDA:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+assert torch.cuda.is_available()
+PY
+```
+
+Do not proceed with the GPU benchmark if this assertion fails.
+
+### 4. Configure, build, test, and stage TODO Extra
+
+This is the canonical first build on every host:
+
+```bash
+cd /home/labuser/inho/Multipath/Mooncake-dev
+PY=/home/labuser/venv/bin/python3
+PYVER="$($PY -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+
+MOONCAKE_USE_CUDA=ON \
+MOONCAKE_BUILD_DIR=build-gpu-multipath \
+MOONCAKE_BUILD_JOBS=8 \
+MOONCAKE_CMAKE_ARGS="-DPython3_EXECUTABLE=$PY" \
+PYTHON_BIN="$PY" \
+PYTHON_VERSION="$PYVER" \
+PATH="$(dirname "$PY"):$PATH" \
+  bash scripts/build_todo1_overlay.sh
+```
+
+The overlay performs all required stages:
+
+1. installs pinned yalantinglibs under the build tree;
+2. configures `USE_CXL=ON`, `USE_HTTP=ON`, `USE_CUDA=ON`, and `WITH_STORE=ON`;
+3. builds Mooncake Store, Transfer Engine, Python bindings, Master, and client;
+4. runs portable TODO1 tests;
+5. builds/stages `mooncake-wheel/mooncake/store.so`, `engine.so`,
+   `mooncake_master`, and `mooncake_client`.
+
+### 5. Installation verification
+
+```bash
+cd /home/labuser/inho/Multipath/Mooncake-dev
+test -f build-gpu-multipath/CMakeCache.txt
+test -x mooncake-wheel/mooncake/mooncake_master
+test -f mooncake-wheel/mooncake/store.so
+
+grep -E '^(USE_CUDA|WITH_STORE|USE_CXL):BOOL=' \
+  build-gpu-multipath/CMakeCache.txt
+
+PYTHONPATH="$PWD/mooncake-wheel" /home/labuser/venv/bin/python3 - <<'PY'
+from mooncake import store
+s = store.MooncakeDistributedStore()
+print("module:", store.__file__)
+print("get_into_profiled:", hasattr(s, "get_into_profiled"))
+print("batch_get_into_profiled:", hasattr(s, "batch_get_into_profiled"))
+assert hasattr(s, "get_into_profiled")
+assert hasattr(s, "batch_get_into_profiled")
+PY
+```
+
+Expected cache values:
+
+```text
+USE_CUDA:BOOL=ON
+WITH_STORE:BOOL=ON
+USE_CXL:BOOL=ON
+```
+
+`USE_CXL=ON` is expected because this shared overlay also carries the CXL
+transport; this TODO Extra data path is still forced and validated as RDMA.
+
+## Incremental rebuild after source changes
+
+Only after `CMakeCache.txt` exists may you use:
 
 ```bash
 cd /home/labuser/inho/Multipath/Mooncake-dev
 cmake --build build-gpu-multipath -j8 --target store
 cp build-gpu-multipath/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+```
+
+If Master or Transfer Engine code changed, run the full overlay again instead
+of copying only `store.so`.
+
+## Step 0 — network checks on all four hosts
+
+```bash
+cd /home/labuser/inho/Multipath/Mooncake-dev
 ibdev2netdev
 ip -br addr
 ```
