@@ -40,6 +40,8 @@ add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_store_test(gpu_transfer_policy_test gpu_transfer_policy_test.cpp)
 add_store_test(multipath_placement_test multipath_placement_test.cpp)
+set_tests_properties(multipath_placement_test
+                     PROPERTIES LABELS "gpu;multisource;t0;unit")
 foreach(
   gpu_path_case
   CpuDestinationUsesHostAddressablePath

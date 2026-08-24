@@ -5,6 +5,7 @@ import unittest
 
 import cxl_gpu_perf as cxl
 import dram_rdma_perf as rdma
+import summarize_dram_rdma_results as rdma_summary
 
 
 class _Buffer:
@@ -140,6 +141,38 @@ class PerfHarnessTest(unittest.TestCase):
         rate = rdma._rate(4_000_000_000, 2.0, 4)
         self.assertEqual(2.0, rate["GBps"])
         self.assertEqual(0.5, rate["latency_sec_avg"])
+
+    def test_rdma_compact_summary_omits_per_key_dump(self):
+        base = {
+            "status": "PASS", "object_count": 4, "block_bytes": 16,
+            "source_segment_count": 2,
+            "source_endpoints": ["m1:1", "m2:1"],
+            "source_protocols": ["rdma"],
+            "gpu_path_selected": "rdma_host_staged",
+            "per_key_placement": {"large": "must not leak"},
+        }
+        split = {
+            "rdma_to_host": {"sec": 1.0, "GBps": 8.0},
+            "host_to_gpu": {"sec": 1.0, "GBps": 8.0},
+            "unattributed_sec": 0.1,
+        }
+        single = dict(base, to_gpu_single_staged={
+            "iterations": 2, "api_calls": 8, "objects_per_call": 1,
+            "sec": 4.0, "GBps": 4.0}, staged_breakdown=split)
+        batch = dict(base, to_gpu_batch_staged={
+            "iterations": 2, "api_calls": 4, "objects_per_call": 2,
+            "sec": 2.0, "GBps": 8.0}, staged_breakdown=split)
+        original = rdma_summary._load
+        rdma_summary._load = lambda path: (
+            single if "single" in path.name else batch)
+        try:
+            summary = rdma_summary.build_summary(
+                __import__("pathlib").Path("unused"))
+        finally:
+            rdma_summary._load = original
+        self.assertNotIn("per_key_placement", summary)
+        self.assertEqual(2.0, summary["batch_throughput_speedup"])
+        self.assertEqual(4, summary["single"]["api_calls_per_iteration"])
 
 
 if __name__ == "__main__":

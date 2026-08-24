@@ -12,6 +12,9 @@ next lab milestone — **two-node shared-CXL, single-Master validation**.
 - **Backend rule:** CXL is a memory-device/allocator/transport boundary, **not** a
   `StorageBackendType::kCxl`. The transport is `CxlTransport`; the allocator path is
   `CxlAllocationStrategy` over a `CxlPoolBackend`. See `DESIGN.md` §3, §18.
+- **Performance/research ladder:** after correctness, use
+  `docs/CXL_RDMA_GPU_RESEARCH_BASELINE.md` to separate DRAM→GPU, CXL→GPU,
+  RDMA→host→GPU, mixed-path, and LLM-serving claims.
 
 ---
 

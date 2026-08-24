@@ -197,6 +197,9 @@ if [ "${TODOEXTRA_WITH_GDR:-0}" = 1 ]; then
   fi
 fi
 
+"$python_bin" "$repo_dir/scripts/summarize_dram_rdma_results.py" \
+  --out-dir "$out_dir"
+
 if [ "${TODOEXTRA_CLEANUP_AFTER:-0}" = 1 ]; then
   "$python_bin" "$repo_dir/scripts/dram_rdma_perf.py" --role cleanup \
     --local-hostname "$local_ip:${TODOEXTRA_CLEANUP_PORT:-50194}" "${common[@]}"

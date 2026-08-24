@@ -407,6 +407,20 @@ Each scale writes:
 ```text
 /tmp/rdma-4src-8gib/gpu-single-staged.json
 /tmp/rdma-4src-8gib/gpu-batch-staged.json
+/tmp/rdma-4src-8gib/comparison-summary.txt
+/tmp/rdma-4src-8gib/comparison-summary.json
+```
+
+The consumer automatically prints the compact text report at the end. The two
+comparison files contain no per-key placement dump. Detailed JSON and trace
+logs remain available for diagnosis. For an already completed directory such
+as `/tmp/rdma-4src-8gib-16mib`, regenerate the summary without rerunning data:
+
+```bash
+cd /home/labuser/inho/Multipath/Mooncake-dev
+/home/labuser/venv/bin/python3 scripts/summarize_dram_rdma_results.py \
+  --out-dir /tmp/rdma-4src-8gib-16mib
+cat /tmp/rdma-4src-8gib-16mib/comparison-summary.txt
 ```
 
 Compare:
