@@ -11,6 +11,8 @@ mode="all"
 build_dir_name="${MOONCAKE_BUILD_DIR:-build-todo1-cpu}"
 skip_apt="${MOONCAKE_SETUP_SKIP_APT:-0}"
 skip_submodules="${MOONCAKE_SETUP_SKIP_SUBMODULES:-0}"
+apt_source_override_dir=""
+apt_source_args=()
 
 cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 if [ "$cpu_count" -gt 16 ]; then
@@ -124,6 +126,9 @@ cleanup_logging() {
   exec 1>&3 2>&4
   wait "$tee_pid" 2>/dev/null || true
   rm -f "$log_pipe"
+  if [[ "$apt_source_override_dir" == /tmp/mooncake-apt-sources.* ]]; then
+    rm -rf -- "$apt_source_override_dir"
+  fi
   exec 3>&- 4>&-
   exit "$status"
 }
@@ -140,7 +145,7 @@ print_diagnostics() {
   echo "[FAIL] stage=$stage exit=$status line=$line"
   echo "[FAIL] complete_log=$log_file"
   echo "[diagnose] matching failure lines (last 80):"
-  grep -nE 'FAILED:|fatal error:|CMake Error|error:|undefined reference|Killed signal|externally-managed-environment|command not found' \
+  grep -nE 'FAILED:|fatal error:|CMake Error|error:|undefined reference|Killed signal|externally-managed-environment|command not found|Failed to fetch|403 +Forbidden|repository .* no longer signed' \
     "$log_file" | tail -80
   cat <<'EOF'
 [diagnose] known installation signatures handled by this bootstrap:
@@ -175,6 +180,9 @@ print_diagnostics() {
   "MOONCAKE_USE_CUDA=OFF: command not found"
     -> hidden Unicode preceded a pasted environment assignment. Invoke this
        script directly; no prefixed assignment is needed.
+  security.ubuntu.com InRelease returns HTTP 403
+    -> official Ubuntu HTTP sources are copied to a temporary HTTPS-only apt
+       configuration; /etc/apt is not modified.
   warnings from yalantinglibs
     -> warnings are not the build failure; inspect the first FAILED/error line.
 EOF
@@ -267,6 +275,66 @@ find_missing_packages() {
   done
 }
 
+is_official_ubuntu_http_source() {
+  grep -Eq \
+    'http://(security\.ubuntu\.com/ubuntu|([[:alnum:]-]+\.)?archive\.ubuntu\.com/ubuntu|ports\.ubuntu\.com/ubuntu-ports)([ /]|$)' \
+    "$1"
+}
+
+rewrite_official_ubuntu_sources_to_https() {
+  sed -E -i \
+    -e 's#http://security\.ubuntu\.com/ubuntu#https://security.ubuntu.com/ubuntu#g' \
+    -e 's#http://(([[:alnum:]-]+\.)?archive\.ubuntu\.com/ubuntu)#https://\1#g' \
+    -e 's#http://ports\.ubuntu\.com/ubuntu-ports#https://ports.ubuntu.com/ubuntu-ports#g' \
+    "$1"
+}
+
+prepare_apt_sources() {
+  local source_files=( /etc/apt/sources.list )
+  local source_file
+  local needs_https_override=0
+
+  for source_file in /etc/apt/sources.list.d/*.list \
+                     /etc/apt/sources.list.d/*.sources; do
+    [ -f "$source_file" ] && source_files+=( "$source_file" )
+  done
+
+  for source_file in "${source_files[@]}"; do
+    if [ -f "$source_file" ] && is_official_ubuntu_http_source "$source_file"; then
+      needs_https_override=1
+      break
+    fi
+  done
+  [ "$needs_https_override" -eq 1 ] || return
+
+  apt_source_override_dir="$(mktemp -d /tmp/mooncake-apt-sources.XXXXXX)"
+  mkdir -p "$apt_source_override_dir/sources.list.d"
+  chmod 0755 "$apt_source_override_dir" "$apt_source_override_dir/sources.list.d"
+
+  if [ -f /etc/apt/sources.list ]; then
+    cp -p /etc/apt/sources.list "$apt_source_override_dir/sources.list"
+  else
+    : > "$apt_source_override_dir/sources.list"
+  fi
+  rewrite_official_ubuntu_sources_to_https \
+    "$apt_source_override_dir/sources.list"
+
+  for source_file in /etc/apt/sources.list.d/*.list \
+                     /etc/apt/sources.list.d/*.sources; do
+    [ -f "$source_file" ] || continue
+    cp -p "$source_file" \
+      "$apt_source_override_dir/sources.list.d/$(basename "$source_file")"
+    rewrite_official_ubuntu_sources_to_https \
+      "$apt_source_override_dir/sources.list.d/$(basename "$source_file")"
+  done
+
+  apt_source_args=(
+    -o "Dir::Etc::sourcelist=$apt_source_override_dir/sources.list"
+    -o "Dir::Etc::sourceparts=$apt_source_override_dir/sources.list.d"
+  )
+  echo "[setup] official Ubuntu HTTP apt sources redirected to HTTPS for this run"
+}
+
 install_packages() {
   stage="system package installation"
   find_missing_packages
@@ -287,8 +355,10 @@ install_packages() {
     apt_prefix=( sudo )
   fi
 
-  "${apt_prefix[@]}" apt-get update
-  "${apt_prefix[@]}" apt-get install -y --no-install-recommends \
+  prepare_apt_sources
+  "${apt_prefix[@]}" apt-get "${apt_source_args[@]}" update
+  "${apt_prefix[@]}" apt-get "${apt_source_args[@]}" \
+    install -y --no-install-recommends \
     "${missing_apt_packages[@]}"
 
   find_missing_packages
