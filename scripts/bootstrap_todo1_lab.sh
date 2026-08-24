@@ -305,7 +305,12 @@ prepare_apt_sources() {
       break
     fi
   done
-  [ "$needs_https_override" -eq 1 ] || return
+  # Returning the status of a failed test here aborts the entire bootstrap
+  # under `set -e`. No override is a successful/common path: it means the host
+  # already uses HTTPS, a non-Ubuntu mirror, or no matching Ubuntu source.
+  if [ "$needs_https_override" -ne 1 ]; then
+    return 0
+  fi
 
   apt_source_override_dir="$(mktemp -d /tmp/mooncake-apt-sources.XXXXXX)"
   mkdir -p "$apt_source_override_dir/sources.list.d"
