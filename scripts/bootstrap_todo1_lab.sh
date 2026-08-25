@@ -163,6 +163,10 @@ print_diagnostics() {
   "ninja: error: loading build.ninja"
     -> Ninja was run after a failed CMake configure. This script stops at the
        configuration error and never launches a nonexistent build graph.
+  "manifest 'build.ninja' still dirty after 100 tries"
+    -> a reused or future-dated yalantinglibs manifest kept regenerating.
+       TODO#0 now builds a normalized snapshot in a fresh Makefiles tree and
+       publishes a revision-keyed install for TODO#1.
   CUmemFabricHandle / CU_MEM_HANDLE_TYPE_FABRIC compile errors
     -> a CUDA feature contaminated a CPU cache; this script uses a separate
        build-todo1-cpu cache and forces every known GPU trigger OFF.

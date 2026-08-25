@@ -47,44 +47,17 @@ if ! printf '#include <xxhash.h>\n' |
 fi
 
 build_dir="$repo_dir/$build_dir_name"
-ylt_source_dir="$repo_dir/extern/yalantinglibs"
-ylt_build_dir="$build_dir/_deps/yalantinglibs-build"
-ylt_prefix="$build_dir/_deps/yalantinglibs-install"
-ylt_config_dir="${MOONCAKE_YALANTINGLIBS_DIR:-$ylt_prefix/lib/cmake/yalantinglibs}"
+ylt_prefix_root="$build_dir/_deps/yalantinglibs-install"
+ylt_config_dir="${MOONCAKE_YALANTINGLIBS_DIR:-$ylt_prefix_root/current/lib/cmake/yalantinglibs}"
 
 # Mooncake consumes yalantinglibs as an installed CMake CONFIG package. Merely
-# initializing the git submodule is insufficient. Keep the pinned dependency
-# inside this build tree so the lab build is reproducible and needs no sudo.
-if [ -z "${MOONCAKE_YALANTINGLIBS_DIR:-}" ] &&
-   [ ! -f "$ylt_config_dir/yalantinglibsConfig.cmake" ]; then
-  ylt_required_files=( CMakeLists.txt cmake/build.cmake cmake/install.cmake )
-  for ylt_required_file in "${ylt_required_files[@]}"; do
-    if [ ! -f "$ylt_source_dir/$ylt_required_file" ]; then
-      echo "[FATAL] incomplete yalantinglibs checkout: missing $ylt_source_dir/$ylt_required_file" >&2
-      echo "        Initialize the submodule, then restore that tracked file:" >&2
-      echo "        git submodule update --init --recursive extern/yalantinglibs" >&2
-      echo "        git -C extern/yalantinglibs restore --source=HEAD --worktree -- $ylt_required_file" >&2
-      exit 2
-    fi
-  done
-
-  echo "[build] bootstrapping yalantinglibs into $ylt_prefix"
-  ylt_cmake_args=(
-    -S "$ylt_source_dir"
-    -B "$ylt_build_dir"
-    -DCMAKE_BUILD_TYPE=Release
-    -DCMAKE_INSTALL_PREFIX="$ylt_prefix"
-    -DYLT_ENABLE_CUDA=OFF
-    -DBUILD_EXAMPLES=OFF
-    -DBUILD_BENCHMARK=OFF
-    -DBUILD_UNIT_TESTS=OFF
-  )
-  if [ ! -f "$ylt_build_dir/CMakeCache.txt" ] && command -v ninja >/dev/null 2>&1; then
-    ylt_cmake_args+=( -G Ninja )
-  fi
-  cmake "${ylt_cmake_args[@]}"
-  cmake --build "$ylt_build_dir" --parallel "$build_jobs"
-  cmake --install "$ylt_build_dir"
+# initializing the git submodule is insufficient. TODO#0 builds a normalized
+# source snapshot in a fresh Makefiles tree, then publishes a revision-keyed
+# install. This prevents copied/future-dated Ninja manifests from looping.
+if [ -z "${MOONCAKE_YALANTINGLIBS_DIR:-}" ]; then
+  bash "$repo_dir/scripts/bootstrap_todo0_lab.sh" \
+    --prefix-root "$ylt_prefix_root" \
+    --jobs "$build_jobs"
 fi
 
 if [ ! -f "$ylt_config_dir/yalantinglibsConfig.cmake" ]; then
