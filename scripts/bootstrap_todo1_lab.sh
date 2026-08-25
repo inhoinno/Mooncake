@@ -145,7 +145,7 @@ print_diagnostics() {
   echo "[FAIL] stage=$stage exit=$status line=$line"
   echo "[FAIL] complete_log=$log_file"
   echo "[diagnose] matching failure lines (last 80):"
-  grep -nE 'FAILED:|fatal error:|CMake Error|error:|undefined reference|Killed signal|externally-managed-environment|command not found|Failed to fetch|403 +Forbidden|repository .* no longer signed' \
+  grep -nE 'FAILED:|fatal error:|CMake Error|error:|undefined reference|Killed signal|externally-managed-environment|command not found|Failed to fetch|403 +Forbidden|repository .* no longer signed|Re-running CMake|still dirty after' \
     "$log_file" | tail -80
   cat <<'EOF'
 [diagnose] known installation signatures handled by this bootstrap:
@@ -164,9 +164,13 @@ print_diagnostics() {
     -> Ninja was run after a failed CMake configure. This script stops at the
        configuration error and never launches a nonexistent build graph.
   "manifest 'build.ninja' still dirty after 100 tries"
-    -> a reused or future-dated yalantinglibs manifest kept regenerating.
-       TODO#0 now builds a normalized snapshot in a fresh Makefiles tree and
-       publishes a revision-keyed install for TODO#1.
+    -> CMake inputs are newer than the manifest it just generated, commonly
+       because a checkout was copied between lab nodes with clock skew. TODO#1
+       normalizes future-dated tracked source mtimes; TODO#0 separately avoids
+       reusing yalantinglibs build manifests.
+  repeated "Re-running CMake" on an unchanged TODO#1 build
+    -> explicit configuration is guarded by a stable argument signature and
+       compatible-cache check; unchanged reruns proceed directly to the build.
   CUmemFabricHandle / CU_MEM_HANDLE_TYPE_FABRIC compile errors
     -> a CUDA feature contaminated a CPU cache; this script uses a separate
        build-todo1-cpu cache and forces every known GPU trigger OFF.

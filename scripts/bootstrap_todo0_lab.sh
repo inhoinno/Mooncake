@@ -122,16 +122,39 @@ version_prefix="$prefix_root/$source_key"
 config_dir="$version_prefix/lib/cmake/yalantinglibs"
 current_link="$prefix_root/current"
 
+normalize_future_install_mtimes() {
+  local install_root="$1"
+  local now future_reference future_count
+
+  [ -d "$install_root" ] || return 0
+  now="$(date +%s)"
+  future_reference="$(mktemp /tmp/mooncake-ylt-future-mtime.XXXXXX)"
+  touch -d "@$((now + 5))" "$future_reference"
+  future_count="$(find "$install_root" -type f -newer "$future_reference" |
+    wc -l)"
+  if [ "$future_count" -gt 0 ]; then
+    find "$install_root" -type f -newer "$future_reference" \
+      -exec touch -m -- {} +
+    echo "[setup] normalized future yalantinglibs install mtimes: files=$future_count"
+  fi
+  rm -f "$future_reference"
+}
+
 publish_current_link() {
   if [ -e "$current_link" ] && [ ! -L "$current_link" ]; then
     echo "[FATAL] refusing to replace non-symlink path: $current_link" >&2
     return 1
+  fi
+  if [ -L "$current_link" ] &&
+     [ "$(readlink "$current_link")" = "$source_key" ]; then
+    return 0
   fi
   ln -sfn "$source_key" "$current_link"
 }
 
 mkdir -p "$prefix_root"
 if [ -f "$config_dir/yalantinglibsConfig.cmake" ]; then
+  normalize_future_install_mtimes "$version_prefix"
   publish_current_link
   echo "[PASS] gate=yalantinglibs detail=reused=$config_dir revision=$source_revision"
   exit 0
