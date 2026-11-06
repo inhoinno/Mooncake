@@ -156,6 +156,34 @@ class CXLTransportTest : public ::testing::Test {
     }
 };
 
+TEST_F(CXLTransportTest, RejectsDifferentPoolBeforeCopy) {
+    // Both dispatch APIs must reject a remote pool offset instead of treating
+    // it as an address in this process's unrelated local CXL mapping.
+    const auto original_pool = segment_desc->cxl_pool_id;
+    segment_desc->cxl_pool_id = "independent-remote-pool";
+    for (bool through_engine : {false, true}) {
+        std::memset(addr, 0xa5, kDataLength);
+        std::memset(base_addr + offset_1, 0x5a, kDataLength);
+        auto batch_id = xport->allocateBatchID(1);
+        TransferRequest entry{.opcode = TransferRequest::WRITE,
+                              .source = addr,
+                              .target_id = segment_id,
+                              .target_offset = offset_1,
+                              .length = kDataLength};
+        const auto submitted = through_engine
+                                   ? engine->submitTransfer(batch_id, {entry})
+                                   : xport->submitTransfer(batch_id, {entry});
+        EXPECT_TRUE(submitted.ok());
+        TransferStatus status;
+        EXPECT_TRUE(xport->getTransferStatus(batch_id, 0, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+        for (size_t i = 0; i < kDataLength; ++i)
+            EXPECT_EQ(base_addr[offset_1 + i], 0x5a);
+        EXPECT_TRUE(xport->freeBatchID(batch_id).ok());
+    }
+    segment_desc->cxl_pool_id = original_pool;
+}
+
 TEST_F(CXLTransportTest, MultiWrite) {
     int times = 10;
     while (times--) {

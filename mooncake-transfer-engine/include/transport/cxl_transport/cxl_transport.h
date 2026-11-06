@@ -106,6 +106,8 @@ class CxlTransport : public Transport {
 
     int cxlDevInit();
 
+    bool validateTargetPool(SegmentHandle target_id) const;
+
     // Returns 0 when the copy completed synchronously, 1 when a CUDA event
     // will complete it asynchronously, and -1 on failure.
     int cxlMemcpy(Transport::Slice *slice, void *dest_addr,

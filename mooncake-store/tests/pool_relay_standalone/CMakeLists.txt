@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.16)
+project(mooncake_pool_relay_tests LANGUAGES CXX)
+enable_testing()
+find_package(Threads REQUIRED)
+add_executable(pool_relay_test ../pool_relay_test.cpp ../../src/pool_relay.cpp)
+target_include_directories(pool_relay_test PRIVATE ../../include)
+target_compile_features(pool_relay_test PRIVATE cxx_std_17)
+target_link_libraries(pool_relay_test PRIVATE Threads::Threads)
+foreach(relay_case preflight functional failure status)
+  add_test(NAME pool_relay_${relay_case} COMMAND pool_relay_test ${relay_case})
+  set_tests_properties(pool_relay_${relay_case}
+    PROPERTIES LABELS "relay;multisource;t0;unit;${relay_case}")
+endforeach()

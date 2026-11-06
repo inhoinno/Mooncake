@@ -1,0 +1,41 @@
+cmake_minimum_required(VERSION 3.16)
+project(callosum_relay_native LANGUAGES CXX)
+find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
+set(PYBIND11_FINDPYTHON ON)
+add_subdirectory(../../extern/pybind11 pybind11-build)
+find_package(Threads REQUIRED)
+pybind11_add_module(callosum_relay_native bindings.cpp ../../mooncake-store/src/pool_relay.cpp)
+target_include_directories(callosum_relay_native PRIVATE ../../mooncake-store/include ../../mooncake-common/include)
+target_compile_features(callosum_relay_native PRIVATE cxx_std_17)
+target_link_libraries(callosum_relay_native PRIVATE Threads::Threads)
+enable_testing()
+set(relay_test_script "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_runtime.py")
+foreach(test_method
+    delivery_policy_fixtures
+    policy_rejection_before_reservation
+    native_batch_projection
+    cxl_mapping_identity
+    sender_batch_cardinality_and_stale_target
+    two_workers_forward_reverse_batch_and_reuse
+    preflight_rejects_duplicate_members
+    preflight_geometry_and_modes
+    four_workers_transfer_reuse_and_journal
+    failure_restart_quarantines_uncertain_operations
+    timeout_late_writer_quarantine
+    status_preserves_coordinator_and_sink_clocks)
+  add_test(NAME callosum_runtime_${test_method}
+    COMMAND "${CMAKE_COMMAND}" -E env
+      "PYTHONPATH=$<TARGET_FILE_DIR:callosum_relay_native>"
+      "${Python3_EXECUTABLE}" "${relay_test_script}" "RuntimeTest.test_${test_method}")
+  set_tests_properties(callosum_runtime_${test_method}
+    PROPERTIES LABELS "relay;multisource;t0" TIMEOUT 60)
+  if(test_method MATCHES "^preflight_")
+    set_property(TEST callosum_runtime_${test_method} APPEND PROPERTY LABELS preflight)
+  elseif(test_method MATCHES "^status_")
+    set_property(TEST callosum_runtime_${test_method} APPEND PROPERTY LABELS status)
+  elseif(test_method MATCHES "^(failure_|timeout_)")
+    set_property(TEST callosum_runtime_${test_method} APPEND PROPERTY LABELS failure)
+  else()
+    set_property(TEST callosum_runtime_${test_method} APPEND PROPERTY LABELS functional)
+  endif()
+endforeach()

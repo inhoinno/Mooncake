@@ -1,0 +1,18 @@
+{
+  "evidence_class": "TRANSFER_ONLY",
+  "abi_version": 2,
+  "mode": "rdma",
+  "path_mode": "direct_dax_write",
+  "master": "http://REPLACE_CONTROL_HOST.invalid:19100",
+  "metadata": "P2PHANDSHAKE",
+  "batch_cap": 32,
+  "max_inflight_bytes": 67108864,
+  "pools": {
+    "A": {"capacity": 0, "map_offset": 0, "mapping_alignment": 0, "owner": "", "physical_pool_id": ""},
+    "B": {"capacity": 0, "map_offset": 0, "mapping_alignment": 0, "owner": "", "physical_pool_id": ""}
+  },
+  "nodes": [
+    {"id": "a1", "pool": "A", "url": "http://REPLACE_A1.invalid:19101", "path": "/REPLACE_WITH_AUTHORIZED_DAX_PATH", "te_endpoint": "REPLACE_A1.invalid:19301", "rdma_device": "REPLACE_HCA", "can_send": true, "can_receive": true},
+    {"id": "b1", "pool": "B", "url": "http://REPLACE_B1.invalid:19101", "path": "/REPLACE_WITH_AUTHORIZED_DAX_PATH", "te_endpoint": "REPLACE_B1.invalid:19301", "rdma_device": "REPLACE_HCA", "can_send": true, "can_receive": true}
+  ]
+}

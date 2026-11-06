@@ -25,6 +25,7 @@
 #include <utility>
 
 #include "common.h"
+#include "cxl_pool_identity.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -449,6 +450,10 @@ Status CxlTransport::submitTransfer(
         slice->cleanup_callback = nullptr;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
+        if (!validateTargetPool(request.target_id)) {
+            slice->markFailed();
+            continue;
+        }
         CxlPoolError resolve_error;
         slice->cxl.dest_addr = cxl_backend_->resolve(
             request.target_offset, request.length, &resolve_error);
@@ -496,6 +501,10 @@ Status CxlTransport::submitTransferTask(
         slice->cleanup_callback = nullptr;
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
+        if (!validateTargetPool(request.target_id)) {
+            slice->markFailed();
+            continue;
+        }
         CxlPoolError resolve_error;
         slice->cxl.dest_addr = cxl_backend_->resolve(
             request.target_offset, request.length, &resolve_error);
@@ -519,6 +528,19 @@ Status CxlTransport::submitTransferTask(
             slice->markSuccess();
     }
     return Status::OK();
+}
+
+bool CxlTransport::validateTargetPool(SegmentHandle target_id) const {
+    const auto descriptor = metadata_->getSegmentDescByID(target_id);
+    if (!descriptor || !cxl_backend_) return false;
+    const auto& local = cxl_backend_->config();
+    if (SameCxlMapping(local.logical_pool_id, local.mapping_offset, local.capacity,
+                       descriptor->cxl_pool_id, descriptor->cxl_map_offset,
+                       descriptor->cxl_capacity))
+        return true;
+    LOG(ERROR) << "component=cxl_transport event=pool_identity_rejected "
+                  "reason=remote_object_requires_materialization";
+    return false;
 }
 
 }  // namespace mooncake

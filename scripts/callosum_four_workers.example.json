@@ -1,0 +1,16 @@
+{
+  "mode": "rdma",
+  "master": "http://192.168.5.43:19100",
+  "metadata": "P2PHANDSHAKE",
+  "max_object_bytes": 268435456,
+  "pools": {
+    "Pool1": {"capacity": 1073741824, "map_offset": 0},
+    "Pool2": {"capacity": 1073741824, "map_offset": 0}
+  },
+  "nodes": [
+    {"id":"n1", "pool":"Pool1", "url":"http://192.168.5.41:19101", "te_endpoint":"192.168.5.41:19201", "rdma_device":"mlx5_0", "path":"/dev/dax24.0", "can_send":true, "can_receive":true},
+    {"id":"n2", "pool":"Pool1", "url":"http://192.168.5.42:19101", "te_endpoint":"192.168.5.42:19201", "rdma_device":"mlx5_0", "path":"/dev/dax24.0", "can_send":true, "can_receive":true},
+    {"id":"n3", "pool":"Pool2", "url":"http://192.168.5.43:19101", "te_endpoint":"192.168.5.43:19201", "rdma_device":"mlx5_0", "path":"/dev/dax24.0", "can_send":true, "can_receive":true},
+    {"id":"n4", "pool":"Pool2", "url":"http://192.168.5.44:19101", "te_endpoint":"192.168.5.44:19201", "rdma_device":"mlx5_0", "path":"/dev/dax24.0", "can_send":true, "can_receive":true}
+  ]
+}

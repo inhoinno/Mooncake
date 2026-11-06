@@ -1,3 +1,15 @@
+# Dependency-light coordinator tests also compile the exact Store core on hosts
+# without verbs/CUDA. No test adapter is linked into mooncake_store.
+add_executable(pool_relay_test pool_relay_test.cpp ../src/pool_relay.cpp)
+target_include_directories(pool_relay_test PRIVATE ../include)
+target_compile_features(pool_relay_test PRIVATE cxx_std_17)
+target_link_libraries(pool_relay_test PRIVATE pthread)
+foreach(relay_case preflight functional failure status)
+  add_test(NAME pool_relay_${relay_case} COMMAND pool_relay_test ${relay_case})
+  set_tests_properties(pool_relay_${relay_case}
+    PROPERTIES LABELS "relay;multisource;t0;unit")
+endforeach()
+
 function(add_store_test name)
   add_executable(${name} ${ARGN})
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -289,6 +301,21 @@ set_tests_properties(
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/scripts")
 
 add_store_test(master_metrics_test master_metrics_test.cpp)
+
+# Functional protocol model only: no real Master/RDMA/DAX/CUDA is exercised.
+foreach(relay_case
+    master_lookup_and_receiver_mr_partition
+    multiple_senders_write_receiver_regions
+    publish_then_worker_local_reuse
+    multi_key_dispatch_and_correlated_completion)
+  add_test(NAME shared_pool_relay_${relay_case}
+    COMMAND ${PYTHON_EXECUTABLE} -m unittest -v
+      test_shared_pool_relay.SharedPoolRelayTest.test_${relay_case})
+  set_tests_properties(shared_pool_relay_${relay_case} PROPERTIES
+    LABELS "relay;multisource;t0;unit;functional"
+    TIMEOUT 30
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/scripts")
+endforeach()
 add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)

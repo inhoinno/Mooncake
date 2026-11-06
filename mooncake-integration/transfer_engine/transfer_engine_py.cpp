@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transfer_engine_py.h"
+#include "../pool_relay/relay_batch.h"
 
 #include <cassert>
 #include <numeric>
@@ -1115,6 +1116,7 @@ void bind_coro_rpc_interface(py::module_& m) {
     m.attr("CoroRPCInterface") = m.attr("RpcInterface");
 }
 
+// The same address/cardinality checks run in portable native relay tests.
 PYBIND11_MODULE(engine, m) {
 #ifdef USE_EFA
     m.attr("SUPPORT_EFA") = true;
@@ -1165,6 +1167,104 @@ PYBIND11_MODULE(engine, m) {
             .def("initialize", &TransferEnginePy::initialize)
             .def("initialize_ext", &TransferEnginePy::initializeExt)
             .def("get_rpc_port", &TransferEnginePy::getRpcPort)
+            .def("relay_abi_version", [](TransferEnginePy&) { return 2; })
+            .def("relay_write_batch_drained",
+                 [](TransferEnginePy& self,
+                    const std::vector<std::string>& segments,
+                    const std::vector<uintptr_t>& sources,
+                    const std::vector<uintptr_t>& destinations,
+                    const std::vector<size_t>& lengths) {
+                     mooncake::pool_relay::ValidateWriteBatch(
+                         segments, sources, destinations, lengths);
+                     py::gil_scoped_release release;
+                     auto engine = self.getEngine();
+                     if (!engine || engine->isUsingTent() ||
+                         !engine->getTransport("rdma"))
+                         throw std::runtime_error("relay requires legacy RDMA");
+                     // Validate every target before submitting any payload.
+                     for (const auto& segment : segments) {
+                         auto handle = engine->openSegment(segment);
+                         if (handle == static_cast<Transport::SegmentHandle>(-1))
+                             throw std::runtime_error("cannot open relay segment");
+                         auto desc = engine->getMetadata()->getSegmentDescByID(handle);
+                         engine->closeSegment(handle);
+                         if (!desc || desc->protocol != "rdma")
+                             throw std::runtime_error("relay refuses non-RDMA target");
+                     }
+                     const size_t zero = 0;
+                     std::vector<TransferEngine::ScatterTransferRange> ranges;
+                     ranges.reserve(segments.size());
+                     for (size_t i = 0; i < segments.size(); ++i) {
+                         ranges.push_back({
+                             .opcode = TransferRequest::WRITE,
+                             .remote_segment = segments[i],
+                             .remote_base_offset = destinations[i],
+                             .remote_size = lengths[i],
+                             .local_buffer = reinterpret_cast<void*>(sources[i]),
+                             .local_capacity = lengths[i],
+                             .local_offsets = std::span<const size_t>(&zero, 1),
+                             .remote_offsets = std::span<const size_t>(&zero, 1),
+                             .lengths = std::span<const size_t>(&lengths[i], 1),
+                             .on_fragment_complete = {}});
+                     }
+                     // One scatter submission contains the entire bounded batch.
+                     // Its operation destructor also waits: no deadline frees MRs.
+                     auto operation = engine->submitScatter(ranges);
+                     auto status = operation.wait();
+                     if (!status.ok()) throw std::runtime_error(status.ToString());
+                     return lengths;
+                 }, py::arg("segments"), py::arg("sources"),
+                 py::arg("destinations"), py::arg("lengths"))
+            .def("relay_rdma_available",
+                 [](TransferEnginePy& self) {
+                     auto engine = self.getEngine();
+                     return engine && !engine->isUsingTent() &&
+                            engine->getTransport("rdma") != nullptr;
+                 })
+            .def(
+                "relay_write_drained",
+                [](TransferEnginePy& self, const std::string& segment,
+                   uintptr_t source, uintptr_t destination, size_t length) {
+                    // Dedicated relay gate: no deadline return while DMA is
+                    // live. Do not use transferSync's timeout semantics for
+                    // leased MRs.
+                    py::gil_scoped_release release;
+                    auto engine = self.getEngine();
+                    if (!engine || engine->isUsingTent() ||
+                        !engine->getTransport("rdma") || length == 0)
+                        throw std::runtime_error(
+                            "relay requires legacy RDMA engine and nonzero "
+                            "length");
+                    auto handle = engine->openSegment(segment);
+                    if (handle == static_cast<Transport::SegmentHandle>(-1))
+                        throw std::runtime_error(
+                            "cannot open relay receiver segment");
+                    auto desc =
+                        engine->getMetadata()->getSegmentDescByID(handle);
+                    engine->closeSegment(handle);
+                    if (!desc || desc->protocol != "rdma")
+                        throw std::runtime_error(
+                            "relay refuses non-RDMA target");
+                    const size_t zero = 0;
+                    TransferEngine::ScatterTransferRange range{
+                        .opcode = TransferRequest::WRITE,
+                        .remote_segment = segment,
+                        .remote_base_offset = destination,
+                        .remote_size = length,
+                        .local_buffer = reinterpret_cast<void*>(source),
+                        .local_capacity = length,
+                        .local_offsets = std::span<const size_t>(&zero, 1),
+                        .remote_offsets = std::span<const size_t>(&zero, 1),
+                        .lengths = std::span<const size_t>(&length, 1),
+                        .on_fragment_complete = {}};
+                    auto operation = engine->submitScatter({range});
+                    auto status = operation.wait();
+                    if (!status.ok())
+                        throw std::runtime_error(status.ToString());
+                    return length;
+                },
+                py::arg("segment"), py::arg("source"), py::arg("destination"),
+                py::arg("length"))
             .def("allocate_managed_buffer",
                  &TransferEnginePy::allocateManagedBuffer)
             .def("free_managed_buffer", &TransferEnginePy::freeManagedBuffer)
