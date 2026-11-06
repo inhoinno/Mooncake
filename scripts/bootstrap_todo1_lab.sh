@@ -43,6 +43,12 @@ Environment equivalents:
   MOONCAKE_BUILD_DIR, MOONCAKE_BUILD_JOBS, MOONCAKE_SETUP_SKIP_APT=1,
   MOONCAKE_SETUP_SKIP_SUBMODULES=1, and MOONCAKE_CMAKE_ARGS.
 
+Temporary lab workaround:
+  MOONCAKE_SETUP_INSECURE_APT_TLS=1 disables HTTPS certificate and hostname
+  verification for this run's apt commands only. Package-signature verification
+  remains enabled. Default: verification enabled. Fix CA trust and omit this
+  option afterward. This does not affect git, pip, or CMake downloads.
+
 Safe recovery choices built into this script:
   * uses a dedicated CPU cache and forces CUDA-triggering features OFF;
   * installs yalantinglibs under the build tree, not system-wide;
@@ -348,6 +354,21 @@ prepare_apt_sources() {
   echo "[setup] official Ubuntu HTTP apt sources redirected to HTTPS for this run"
 }
 
+configure_apt_tls() {
+  case "${MOONCAKE_SETUP_INSECURE_APT_TLS:-0}" in
+    0|"") ;;
+    1)
+      echo "[WARN] INSECURE APT TLS: certificate and hostname verification disabled for this run only" >&2
+      echo "[WARN] Repository server identity is not verified; package-signature verification is unchanged. Repair CA trust after this run." >&2
+      apt_source_args+=(
+        -o "Acquire::https::Verify-Peer=false"
+        -o "Acquire::https::Verify-Host=false"
+      )
+      ;;
+    *) fatal "MOONCAKE_SETUP_INSECURE_APT_TLS must be 0 or 1" ;;
+  esac
+}
+
 install_packages() {
   stage="system package installation"
   find_missing_packages
@@ -369,7 +390,8 @@ install_packages() {
   fi
 
   prepare_apt_sources
-  "${apt_prefix[@]}" apt-get "${apt_source_args[@]}" update
+  configure_apt_tls
+  "${apt_prefix[@]}" apt-get "${apt_source_args[@]}" -o APT::Update::Error-Mode=any update
   "${apt_prefix[@]}" apt-get "${apt_source_args[@]}" \
     install -y --no-install-recommends \
     "${missing_apt_packages[@]}"
