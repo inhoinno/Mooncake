@@ -11,6 +11,7 @@ target_link_libraries(callosum_relay_native PRIVATE Threads::Threads)
 enable_testing()
 set(relay_test_script "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_runtime.py")
 foreach(test_method
+    preflight_empty_startup_abort
     initiation_native_file_path
     status_progress_during_fetch
     transport_baseline_exact_bytes_and_units
@@ -46,6 +47,8 @@ foreach(test_method
     set_property(TEST callosum_runtime_${test_method} APPEND PROPERTY LABELS functional)
   endif()
 endforeach()
+set_property(TEST callosum_runtime_initiation_native_file_path APPEND
+  PROPERTY LABELS "adapter;initiation")
 
 # These validate a Callosum-facing contract, not an installed Dynamo integration.
 foreach(category preflight function failure status)
