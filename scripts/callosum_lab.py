@@ -152,6 +152,8 @@ class Runner:
         self.log = (self.run_dir / 'commands.log').open('a', buffering=1)
         self.stage = 'initialization'
         self.services_may_be_live = False
+        self.configuration_effects = []
+        self.commands_started = []
 
     def say(self, text):
         print(text, flush=True)
@@ -160,6 +162,7 @@ class Runner:
     def call(self, stage, command, env=None, capture=False, input_text=None):
         self.stage = stage
         command = [str(v) for v in command]
+        self.commands_started.append(stage)
         self.say('\n[stage] ' + stage + '\n$ ' + shlex.join(command))
         # No shell, errexit, nounset or pipefail. Child failure is explicit.
         if capture:
@@ -222,6 +225,7 @@ def prepare(root, run, args, runner):
             'setup.json already exists; use start/test, or a new preparation campaign')
     runner.call('source-head', ['git', '-C', source, 'log', '-1', '--oneline'])
     runner.call('source-status', ['git', '-C', source, 'status', '--short'])
+    runner.call('launcher-tests', [args.python, source/'scripts/test_callosum_lab.py', '-v'], clean_env())
     apply_remaining_patch(source, run, runner)
     runner.stage = 'native-dependencies'
     missing = []
@@ -486,17 +490,20 @@ def initialize_configuration(root, run, args, runner):
     require(ask('Confirm exclusive test extents, independent devices and authorized config copy. Type INITIALIZE CONFIG')
             =='INITIALIZE CONFIG','Configuration initialization not authorized; no files or devices changed')
     (run/'initialization-inventory.json').write_text(json.dumps(inventories,indent=2))
-    install_configuration(str(config_path),str(token_path),config,secret)
+    runner.configuration_effects.append(dict(location='local',result='INSTALL_ATTEMPTED; existing/partial files must be preserved'))
+    installed=install_configuration(str(config_path),str(token_path),config,secret)
+    runner.configuration_effects[-1]['result']=installed['status']
     # Token goes through stdin, never argv, output or the command log.
     installer=inspect.getsource(install_configuration)+"""
 import json,sys
 bundle=json.load(sys.stdin)
 print(json.dumps(install_configuration(sys.argv[1],sys.argv[2],bundle['config'],bundle['token'])))
 """
+    runner.configuration_effects.append(dict(location='peer',result='INSTALL_ATTEMPTED; inspect peer if SSH fails'))
     runner.call('peer-private-config-install',remote_command(peer,
         ['python3','-c',installer,remote_config,remote_token]),
         env=clean_env(),capture=True,input_text=json.dumps(dict(config=config,token=secret)))
-    runner.say('[CONFIG READY] Shared manifest/token installed on both hosts; peer may now run its normal command. No DAX mapped yet.')
+    runner.say('[CONFIG READY] Shared manifest/token installed on both hosts. Initialization stops here. No service started; no DAX mapped. Run --check-config on each host before the separate hardware commands.')
 
 
 def load_setup(run):
@@ -762,37 +769,137 @@ def validate_node_traces(root, run, config, runtime):
     return results
 
 
+class ConfigurationError(RuntimeError):
+    def __init__(self, issues):
+        self.issues = issues
+        super().__init__('; '.join(issues))
+
+
+def configuration_inputs(root, args):
+    """Read-only input gate. Collect independent errors without importing native code."""
+    issues, config, secret = [], None, None
+    config_path = Path(args.config).absolute() if args.config else None
+    token_path = Path(args.token_file).absolute() if args.token_file else None
+    if config_path and token_path and config_path.resolve() == token_path.resolve():
+        issues.append('CONFIG and TOKEN_FILE must be distinct files')
+    if not args.node_id:
+        issues.append('NODE_ID is required')
+    if not config_path or not config_path.is_file():
+        issues.append(f'Missing CONFIG: {config_path}. Use --initialize on the configured controller')
+    else:
+        try:
+            config = json.loads(config_path.read_text())
+            if not isinstance(config, dict):
+                raise ValueError('CONFIG must contain a JSON object')
+        except (OSError, ValueError) as error:
+            issues.append(f'Invalid CONFIG: {error}')
+            config = None
+    if not token_path or not token_path.is_file():
+        issues.append(f'Missing TOKEN_FILE: {token_path}. Use the same private token on both hosts; --initialize creates/copies the pair')
+    else:
+        try:
+            if token_path.is_symlink() or token_path.stat().st_mode & 0o077:
+                issues.append('TOKEN_FILE must be a private regular file (mode 0600 or stricter), not a symlink')
+            secret = token_path.read_text().strip()
+            if len(secret) < 32:
+                issues.append('TOKEN_FILE requires at least 32 characters; do not generate a different token on each host')
+        except (OSError, UnicodeError):
+            issues.append('TOKEN_FILE cannot be read as text')
+    selected = launch = None
+    if config is not None:
+        # Completeness is independent of semantic validation. Report all unknown
+        # template fields, not just the first null IP or device encountered.
+        required = {'': ('evidence_class','abi_version','mode','path_mode','master','metadata','nodes','pools','lab_run')}
+        def fields(record, prefix, names):
+            for name in names:
+                value = record.get(name)
+                if value is None or value == '':
+                    issues.append(f'CONFIG {prefix}{name} is required')
+        fields(config, '', required[''])
+        nodes = config.get('nodes')
+        if isinstance(nodes, list):
+            for i, node in enumerate(nodes):
+                if isinstance(node, dict):
+                    fields(node, f'nodes[{i}].', ('id','pool','url','path','te_endpoint','rdma_device','can_send','can_receive'))
+            if args.node_id and not any(isinstance(n,dict) and n.get('id') == args.node_id for n in nodes):
+                issues.append('NODE_ID does not select a configured node')
+        pools = config.get('pools')
+        if isinstance(pools, dict):
+            for identity, pool in pools.items():
+                if isinstance(pool, dict):
+                    fields(pool, f'pools.{identity}.', ('capacity','map_offset','mapping_alignment','owner','physical_pool_id'))
+        launch = config.get('lab_run')
+        if isinstance(launch, dict):
+            fields(launch, 'lab_run.', ('controller','profile'))
+            if launch.get('profile') == 'two_worker_smoke':
+                fields(launch, 'lab_run.', ('source','requester'))
+        try:
+            selected, launch = validate_launch_config(config, args.node_id)
+            sys.path.insert(0, str(source_path(root)/'scripts'))
+            importlib.import_module('callosum_runtime').config(config_path)
+        except (RuntimeError, ValueError, TypeError, KeyError, AttributeError) as error:
+            issues.append(f'CONFIG contract: {error}')
+    if issues:
+        raise ConfigurationError(issues)
+    return config, selected, launch, secret
+
+
+def check_delivery(root):
+    """Audit the actual two-repository delivery boundary, without changing Git."""
+    root = Path(root).resolve()
+    source = source_path(root)
+    def git(path, *argv):
+        return subprocess.check_output(['git','-C',str(path),*argv],text=True).strip()
+    top = Path(git(root, 'rev-parse','--show-toplevel'))
+    relative = str(source.relative_to(top))
+    issues = []
+    pinned = git(top, 'ls-tree','HEAD','--',relative).split()
+    head = git(source,'rev-parse','HEAD')
+    if len(pinned) < 3 or pinned[0] != '160000' or pinned[2] != head:
+        issues.append('Parent committed gitlink does not select the active Mooncake commit')
+    modules = subprocess.run(['git','-C',str(top),'show','HEAD:.gitmodules'],text=True,capture_output=True)
+    if modules.returncode:
+        issues.append('Parent HEAD has no committed .gitmodules; fresh submodule initialization cannot reproduce this checkout')
+    else:
+        paths = subprocess.run(['git','config','--file','-','--get-regexp',r'submodule\..*\.path'],
+                               input=modules.stdout,text=True,capture_output=True)
+        if not any(line.split(maxsplit=1)[-1] == relative for line in paths.stdout.splitlines()):
+            issues.append('Committed .gitmodules does not declare the Mooncake path')
+    for repo, files in ((root, ('scripts/callosum_lab.sh','scripts/capture_preflight.sh',
+            'experiments/two_worker_metadata_lookup/lab.example.json')),
+            (source, ('scripts/callosum_lab.py','scripts/run_callosum_relay.sh',
+                      'scripts/callosum_runtime.py','scripts/test_callosum_lab.py'))):
+        for file in files:
+            if subprocess.run(['git','-C',str(repo),'cat-file','-e',f'HEAD:{str((repo/file).relative_to(top)) if repo==root else file}'],
+                              capture_output=True).returncode:
+                issues.append(f'Not committed: {repo.name}/{file}')
+            elif git(repo,'status','--porcelain','--',file):
+                issues.append(f'Local changes not in HEAD: {repo.name}/{file}')
+    return dict(status='FAIL' if issues else 'PASS',scope='SOURCE_DELIVERY_LOCAL_ONLY',
+                parent_head=git(top,'rev-parse','HEAD'),mooncake_head=head,
+                parent_gitlink=pinned[2] if len(pinned)>2 else None,issues=issues,
+                pushed='UNVERIFIED',remote_deployment='UNVERIFIED')
+
+
 def node_run(root, run, args, runner):
     """Independent terminals; configuration selects services and the smoke driver."""
-    require(sys.platform.startswith('linux'), 'Run the node launcher on the Linux lab host')
     runner.stage='configuration-validation'
-    require(args.config and args.token_file, 'Set CONFIG and TOKEN_FILE to the same manifest/token on both hosts')
+    config,selected,launch,secret=configuration_inputs(root,args)
+    require(sys.platform.startswith('linux'), 'Run the node launcher on the Linux lab host')
     require(os.environ.get('CALLOSUM_DESTRUCTIVE_ACK') == '1',
             'Set CALLOSUM_DESTRUCTIVE_ACK=1 only for owned exclusive extents without outstanding DMA')
     require(not (run/'topology.json').exists(), 'Campaign already started; retain journals and do not restart')
-    config_path, token_path = Path(args.config).resolve(), Path(args.token_file).resolve()
-    require(config_path.is_file(),
-            f'Missing shared manifest: {config_path}. First run the configured controller command with --initialize; do not use the null template as a live config.')
-    config = json.loads(config_path.read_text())
-    selected,launch=validate_launch_config(config,args.node_id)
-    require(token_path.is_file(),
-            f'Missing shared token file: {token_path}. Use --initialize on the configured controller to create/copy the shared pair.')
     source = source_path(root)
     sys.path.insert(0,str(source/'scripts'))
     runtime = importlib.import_module('callosum_runtime')
-    runtime.config(config_path)  # Reuse the installed runtime contract before any build.
-    require(token_path.is_file() and token_path.stat().st_mode & 0o077 == 0,
-            'TOKEN_FILE must be private (mode 0600 or stricter)')
-    secret = token_path.read_text().strip()
-    require(len(secret) >= 32, 'TOKEN_FILE must contain a shared random token of at least 32 characters')
-    runner.call('host-preflight',['bash',root/'scripts/capture_preflight.sh','--output',run/'preflight',
-        '--checkout',source,'--python',args.python,'--dax',selected['path']],clean_env())
-    if not (run/'setup.json').exists():
-        prepare(root,run,args,runner)
     inv = inventory()
     (run/'inventory.json').write_text(json.dumps(inv,indent=2))
     runner.stage='local-device-validation'
     node = validate_node_extent(config,args.node_id,inv)
+    runner.call('host-preflight',['bash',root/'scripts/capture_preflight.sh','--output',run/'preflight',
+        '--checkout',source,'--python',args.python,'--dax',selected['path']],clean_env())
+    if not (run/'setup.json').exists():
+        prepare(root,run,args,runner)
     runner.say('[extent] '+json.dumps(dict(node_id=args.node_id,path=node['path'],pool=config['pools'][node['pool']])))
     (run/'topology.json').write_text(json.dumps(config,indent=2))
     (run/'authorization.json').write_text(json.dumps(dict(confirmed=True,
@@ -963,9 +1070,21 @@ def main(argv=None):
     parser.add_argument('--config',help='Approved common manifest for independent-terminal node mode')
     parser.add_argument('--token-file',help='Private shared control token file; never place the token in argv')
     parser.add_argument('--initialize',action='store_true',
-        help='Explicitly collect inventory, initialize/copy shared configuration through authorized SSH, then run this node')
+        help='Prepare/copy shared configuration through authorized SSH, then STOP; no services or DAX mapping')
+    parser.add_argument('--check-config',action='store_true',
+        help='Check manifest/token and node selection only; no build, SSH, service, inventory or device access')
+    parser.add_argument('--check-delivery',action='store_true',
+        help='Audit committed parent/submodule inputs; no network or changes to Git')
     args=parser.parse_args(argv)
     root=Path(args.root).resolve()
+    require(sum((args.initialize,args.check_config,args.check_delivery))<=1,
+            'Use only one of --initialize, --check-config or --check-delivery')
+    require(not (args.initialize or args.check_config) or args.action=='node',
+            '--initialize and --check-config require --action node; do not combine them with build/prepare actions')
+    if args.check_delivery:
+        result=check_delivery(root)
+        print(json.dumps(result,indent=2))
+        return 0 if result['status']=='PASS' else 1
     if args.action=='inventory':
         print(json.dumps(inventory()))
         return 0
@@ -1002,9 +1121,19 @@ def main(argv=None):
             else:
                 prepare(root,run,args,runner)
         elif args.action=='node':
-            if args.initialize:
+            if args.check_config:
+                runner.stage='configuration-validation'
+                config,node,launch,_=configuration_inputs(root,args)
+                result=dict(status='PASS',scope='CONFIG_ONLY',node_id=node['id'],pool=node['pool'],
+                    starts_master=node['id']==launch['controller'],profile=launch['profile'],
+                    config_sha256=digest(args.config),hardware_verified=False,
+                    next_stage='host-preflight',services_started=False,devices_accessed=False)
+                (run/'configuration-check.json').write_text(json.dumps(result,indent=2))
+                runner.say(json.dumps(result,indent=2))
+            elif args.initialize:
                 initialize_configuration(root,run,args,runner)
-            node_run(root,run,args,runner)
+            else:
+                node_run(root,run,args,runner)
         elif args.action=='start-b1':
             start_service(root,run,'agent','b1',runner)
         else:
@@ -1013,9 +1142,14 @@ def main(argv=None):
     except (Exception,KeyboardInterrupt) as error:
         started=runner.services_may_be_live or any(run.glob('*.process.json'))
         failure=dict(status='FAIL',stage=runner.stage,error=str(error),evidence=str(run),
+            issues=getattr(error,'issues',[str(error)]),
             local_services_started_this_run=started,
+            side_effects=dict(evidence_directory_created=True,
+                configuration=runner.configuration_effects,commands_started=runner.commands_started,
+                device_access_possible=started),
+            retry_after_input_correction=not started,
             action=('Retain all services, mappings, logs and journals. No automatic retry/reclaim.' if started
-                    else 'No local service was started by this invocation. Preserve logs and fix the named setup stage; do not reclaim any earlier run.'))
+                    else 'This invocation started no local service and mapped no DAX. Correct all listed inputs and rerun. Preserve any existing configuration; earlier campaigns require a separate lifetime check.'))
         (run/'failure.json').write_text(json.dumps(failure,indent=2))
         runner.say('\n'+json.dumps(failure,indent=2))
         return 1

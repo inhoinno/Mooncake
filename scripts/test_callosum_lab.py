@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -14,6 +15,180 @@ import unittest
 from unittest.mock import Mock, patch
 
 import callosum_lab as lab
+
+
+class CheckoutCommandTest(unittest.TestCase):
+    """Actual shell -> argparse -> file loader in an isolated tracked-file copy.
+
+    No local lab.json, token, venv, build tree or untracked source is copied.
+    These tests intentionally stop at CONFIG_ONLY, not a hardware simulation.
+    """
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.directory.cleanup)
+        cls.root = Path(cls.directory.name)/'callosum'
+        cls.root.mkdir()
+        original = Path(lab.__file__).resolve().parents[2]
+        for repo, destination, selected in ((original,cls.root,
+                ['scripts/callosum_lab.sh','scripts/capture_preflight.sh',
+                 'experiments/two_worker_metadata_lookup/lab.example.json']),
+                (original/'Mooncake-dev',cls.root/'Mooncake-dev',None)):
+            tracked = subprocess.check_output(['git','-C',str(repo),'ls-files','-z'],text=True).split('\0')
+            files = selected if selected is not None else [f for f in tracked if f.startswith('scripts/') and f.endswith(('.py','.sh'))]
+            for name in files:
+                if name not in tracked:
+                    raise AssertionError(f'Entry dependency is not tracked: {name}')
+                target = destination/name
+                target.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copy2(repo/name,target)
+
+    def invoke(self, node='a1', config=None, secret=None, mode=0o600, check=True, root=None):
+        case = Path(tempfile.mkdtemp(dir=self.directory.name))
+        manifest, token = case/'lab.json', case/'control.token'
+        if config is not None:
+            manifest.write_text(json.dumps(config))
+        if secret is not None:
+            token.write_text(secret)
+            token.chmod(mode)
+        env = dict(lab.clean_env(),PYTHON_BIN=sys.executable,NODE_ID=node,
+                   CONFIG=str(manifest),TOKEN_FILE=str(token))
+        env.pop('CALLOSUM_ROOT',None)
+        result = subprocess.run(['bash',str((root or self.root)/'scripts/callosum_lab.sh'),
+            '--run-dir',str(case/'evidence')]+(['--check-config'] if check else []),
+            cwd=case,env=env,text=True,capture_output=True)
+        artifact = 'configuration-check.json' if result.returncode==0 else 'failure.json'
+        report = json.loads((case/'evidence'/artifact).read_text())
+        self.assertNotIn(secret or 'NEVER_PRINT_THIS_SECRET',result.stdout+result.stderr)
+        self.assertFalse((case/'evidence'/'topology.json').exists())
+        self.assertFalse(list((case/'evidence').glob('*.process.json')))
+        self.assertFalse((case/'evidence'/'setup.json').exists())
+        if result.returncode:
+            self.assertEqual(report['side_effects']['commands_started'],[])
+            self.assertFalse(report['side_effects']['device_access_possible'])
+            self.assertTrue(report['retry_after_input_correction'])
+        return result, report
+
+    def test_first_run_reports_both_missing_inputs_through_actual_entry(self):
+        for node in ('a1','b1'):
+            with self.subTest(node=node):
+                result, report = self.invoke(node=node,check=False)
+                self.assertEqual(result.returncode,1)
+                self.assertEqual(report['stage'],'configuration-validation')
+                self.assertTrue(any('CONFIG:' in issue for issue in report['issues']))
+                self.assertTrue(any('TOKEN_FILE:' in issue for issue in report['issues']))
+                self.assertNotIn('No automatic retry',report['action'])
+
+    def test_null_template_reports_all_hardware_unknowns_and_missing_token(self):
+        config=json.loads((self.root/'experiments/two_worker_metadata_lookup/lab.example.json').read_text())
+        _, report=self.invoke(config=config)
+        for field in ('master','nodes[0].path','nodes[1].rdma_device','pools.A.owner','pools.B.capacity','TOKEN_FILE:'):
+            self.assertTrue(any(field in issue for issue in report['issues']),field)
+
+    def test_invalid_config_and_token_are_independent_errors(self):
+        config=LabTest.node_manifest()
+        config['pools']['A']['capacity']=-1
+        _,report=self.invoke(config=config,secret='short',mode=0o644)
+        for field in ('private','32 characters','extent'):
+            self.assertTrue(any(field in issue for issue in report['issues']),field)
+
+    def test_unknown_node_is_rejected(self):
+        result,report=self.invoke(node='not-a-member',config=LabTest.node_manifest(),secret='fixture-private-token-'*3)
+        self.assertEqual(result.returncode,1)
+        self.assertTrue(any('NODE_ID' in issue for issue in report['issues']))
+
+    def test_existing_valid_manifest_with_missing_token_still_cannot_run(self):
+        result,report=self.invoke(config=LabTest.node_manifest(),check=False)
+        self.assertEqual(result.returncode,1)
+        self.assertEqual(len(report['issues']),1)
+        self.assertIn('Missing TOKEN_FILE',report['issues'][0])
+
+    def test_non_object_config_does_not_hide_invalid_token(self):
+        _,report=self.invoke(config=['not-an-object'],secret='short')
+        self.assertTrue(any('JSON object' in issue for issue in report['issues']))
+        self.assertTrue(any('32 characters' in issue for issue in report['issues']))
+
+    def test_valid_files_select_the_correct_stage_and_generic_node(self):
+        config=LabTest.node_manifest()
+        config['nodes'][0]['id']='requester-X'
+        config['nodes'][1]['id']='peer-Y'
+        config['lab_run'].update(controller='requester-X',requester='requester-X',source='peer-Y')
+        for node,controller in (('requester-X',True),('peer-Y',False)):
+            result,report=self.invoke(node=node,config=config,secret='fixture-private-token-'*3)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            self.assertEqual(report['scope'],'CONFIG_ONLY')
+            self.assertEqual(report['starts_master'],controller)
+            self.assertEqual(report['node_id'],node)
+            self.assertEqual(report['next_stage'],'host-preflight')
+            self.assertFalse(report['hardware_verified'])
+
+    def test_missing_submodule_fails_at_delivery_not_runtime(self):
+        case=Path(tempfile.mkdtemp(dir=self.directory.name))
+        (case/'scripts').mkdir()
+        shutil.copy2(self.root/'scripts/callosum_lab.sh',case/'scripts/callosum_lab.sh')
+        result=subprocess.run(['bash',str(case/'scripts/callosum_lab.sh'),'--check-config'],
+                              text=True,capture_output=True)
+        self.assertEqual(result.returncode,1)
+        self.assertIn('stage=source-delivery',result.stderr)
+        self.assertFalse((case/'runs').exists())
+
+    def test_config_check_cannot_accidentally_select_package_preparation(self):
+        case=Path(tempfile.mkdtemp(dir=self.directory.name))
+        result=subprocess.run(['bash',str(self.root/'scripts/callosum_lab.sh'),
+            '--action','prepare','--check-config'],cwd=case,
+            env=dict(lab.clean_env(),PYTHON_BIN=sys.executable),text=True,capture_output=True)
+        self.assertEqual(result.returncode,1)
+        self.assertIn('require --action node',result.stderr)
+        self.assertFalse((self.root/'runs').exists())
+
+    def test_delivery_audit_detects_missing_gitmodules_stale_gitlink_and_local_edits(self):
+        # Real repositories, local commits only in this owned temporary fixture.
+        # No user repository index, branch, config or remote is changed.
+        case=Path(tempfile.mkdtemp(dir=self.directory.name))
+        root=case/'parent'
+        source=root/'Mooncake-dev'
+        source.mkdir(parents=True)
+        for repo,destination,files in ((self.root,root,
+                ['scripts/callosum_lab.sh','scripts/capture_preflight.sh',
+                 'experiments/two_worker_metadata_lookup/lab.example.json']),
+                (self.root/'Mooncake-dev',source,
+                 [str(p.relative_to(self.root/'Mooncake-dev'))
+                  for p in (self.root/'Mooncake-dev/scripts').iterdir() if p.is_file()])):
+            for file in files:
+                (destination/file).parent.mkdir(parents=True,exist_ok=True)
+                shutil.copy2(repo/file,destination/file)
+        def git(repo,*args):
+            return subprocess.check_output(['git','-C',str(repo),'-c','user.name=Fixture',
+                '-c','user.email=fixture@example.invalid','-c','commit.gpgsign=false',*args],
+                text=True,stderr=subprocess.DEVNULL).strip()
+        for repo in (source,root):
+            git(repo,'init')
+            git(repo,'add','.')
+            git(repo,'commit','-m','fixture base')
+        result=lab.check_delivery(root)
+        self.assertTrue(any('.gitmodules' in issue for issue in result['issues']))
+        # A local .gitmodules alone must not satisfy committed delivery.
+        (root/'.gitmodules').write_text(f'[submodule "engine"]\n path = Mooncake-dev\n url = {source}\n')
+        self.assertEqual(lab.check_delivery(root)['status'],'FAIL')
+        git(root,'add','.gitmodules')
+        git(root,'commit','-m','fixture submodule registration')
+        self.assertEqual(lab.check_delivery(root)['status'],'PASS')
+        # Reproduce Git delivery, not only copying a developer's working tree.
+        # The file protocol is enabled only for this owned local fixture command.
+        fresh=case/'fresh-clone'
+        git(case,'-c','protocol.file.allow=always','clone','--recurse-submodules',str(root),str(fresh))
+        self.assertFalse((fresh/'lab.json').exists())
+        self.assertFalse((fresh/'control.token').exists())
+        self.assertEqual(lab.check_delivery(fresh)['status'],'PASS')
+        result,report=self.invoke(root=fresh,config=LabTest.node_manifest(),secret='fixture-private-token-'*3)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(report['scope'],'CONFIG_ONLY')
+        with (source/'scripts/callosum_lab.py').open('a') as stream:
+            stream.write('\n# fixture change\n')
+        self.assertTrue(any('Local changes' in issue for issue in lab.check_delivery(root)['issues']))
+        git(source,'add','scripts/callosum_lab.py')
+        git(source,'commit','-m','fixture new engine revision')
+        self.assertTrue(any('gitlink' in issue for issue in lab.check_delivery(root)['issues']))
 
 
 class LabTest(unittest.TestCase):
@@ -166,7 +341,7 @@ class LabTest(unittest.TestCase):
             self.assertEqual(argv[argv.index('--node-id')+1],'arbitrary-id')
             self.assertIn('--initialize',argv)
 
-    def test_initialize_flag_precedes_normal_node_workflow(self):
+    def test_initialize_stops_before_normal_node_workflow(self):
         with tempfile.TemporaryDirectory() as directory,patch('sys.stdout',new=io.StringIO()):
             root=Path(directory)
             (root/'Mooncake-dev/scripts').mkdir(parents=True)
@@ -176,7 +351,7 @@ class LabTest(unittest.TestCase):
                     patch.object(lab,'node_run',side_effect=lambda *args:order.append('run')):
                 self.assertEqual(lab.main(['--root',str(root),'--run-dir',str(root/'evidence'),
                     '--action','node','--node-id','some-controller','--initialize']),0)
-            self.assertEqual(order,['initialize','run'])
+            self.assertEqual(order,['initialize'])
 
     def test_embedded_patch_is_complete(self):
         payload=base64.b64decode(lab.PATCH_B64)
@@ -317,12 +492,14 @@ class LabTest(unittest.TestCase):
 
     def test_node_without_explicit_write_ack_does_not_prepare_or_start(self):
         with patch.object(lab.sys,'platform','linux'),patch.dict(os.environ,{},clear=True), \
+                patch.object(lab,'configuration_inputs',return_value=({}, {}, {}, 'fixture')) as inputs, \
                 patch.object(lab,'prepare') as prepare,patch.object(lab,'start_service') as start:
             with self.assertRaisesRegex(RuntimeError,'CALLOSUM_DESTRUCTIVE_ACK'):
                 lab.node_run(Path('/fixture'),Path('/fixture'),
                     SimpleNamespace(node_id='a1',config='/fixture.json',token_file='/fixture.token'),Mock())
             prepare.assert_not_called()
             start.assert_not_called()
+            inputs.assert_called_once()
 
     def exercise_node_fixture(self,node_id,configured=None):
         with tempfile.TemporaryDirectory() as directory:
