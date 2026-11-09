@@ -5,6 +5,7 @@
 #include "relay_batch.h"
 #include "delivery_policy.h"
 #include "cxl_pool_identity.h"
+#include "scatter_layout.h"
 
 namespace py = pybind11;
 using namespace mooncake::pool_relay;
@@ -117,6 +118,31 @@ PYBIND11_MODULE(callosum_relay_native, m) {
     m.attr("ABI_VERSION") = 2;
     m.def("same_cxl_mapping", &mooncake::SameCxlMapping);
     m.def("validate_write_batch", &ValidateWriteBatch);
+    py::class_<ReadinessLedger>(m, "ReadinessLedger")
+        .def(py::init<std::string, std::string, uint64_t>())
+        .def("assign", &ReadinessLedger::assign)
+        .def("event", &ReadinessLedger::event)
+        .def("ready", &ReadinessLedger::ready);
+    m.def("project_scatter", [](const std::vector<std::vector<uint64_t>>& src,
+                                const std::vector<std::vector<uint64_t>>& dst,
+                                uint64_t bytes, uint64_t start, uint64_t length,
+                                uint64_t max_fragment) {
+        auto unpack = [](const auto& rows) {
+            std::vector<TensorExtent> result;
+            for (const auto& r : rows) {
+                if (r.size() != 3)
+                    throw std::invalid_argument(
+                        "extent requires logical, VA, length");
+                result.push_back({r[0], r[1], r[2]});
+            }
+            return result;
+        };
+        std::vector<std::vector<uint64_t>> result;
+        for (const auto& f : ProjectScatter(unpack(src), unpack(dst), bytes,
+                                            start, length, max_fragment))
+            result.push_back({f.logical, f.source, f.destination, f.length});
+        return result;
+    });
     m.def("select_delivery", [](bool local, bool source, bool eligible, bool forced,
                                double transfer_us, double recompute_us,
                                double margin_us, double margin_fraction,

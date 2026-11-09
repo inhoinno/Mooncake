@@ -17,6 +17,281 @@ import callosum_runtime as runtime
 
 
 class RuntimeTest(unittest.TestCase):
+    def test_initiation_native_file_path(self):
+        import ctypes
+        import hashlib
+        from callosum_initiation import (
+            CacheMiss, Delivery, Demand, Intent, Target, WorkerInitiator,
+        )
+
+        def exercise(c, root):
+            cfg = runtime.config(root / 'config.json')
+            source = runtime.rpc(c['master'], 'seed', dict(node='n2',
+                key='initiation-object', length=65537))
+            # This test owns both temporary files. Do not relax Mapping's guard.
+            with patch.dict(os.environ, CALLOSUM_DESTRUCTIVE_ACK='1'):
+                mapping = runtime.Mapping(cfg, cfg['nodes'][0])
+            owner = ctypes.create_string_buffer(source['length'])
+            target = Target(ctypes.addressof(owner), source['length'], 'host-allocation-1', owner)
+            calls = []
+
+            def deliver(intent, demand, destination):
+                calls.append(demand.key)
+                fetched = runtime.rpc(c['master'], 'fetch', dict(key=demand.key,
+                    requester='n1', worker='n1', request_id=intent.request_id,
+                    tp_rank=demand.tp_rank, chunk_bytes=4096))
+                self.assertEqual(fetched['length'], demand.length)
+                self.assertEqual(fetched['version'], demand.source_generation)
+                self.assertEqual(mapping.digest(fetched['offset'], demand.length), fetched['checksum'])
+                ctypes.memmove(destination.address, mapping.address+fetched['offset'], demand.length)
+                self.assertEqual(hashlib.sha256(owner.raw).hexdigest(), source['checksum'])
+                return Delivery('host_validated', fetched)
+
+            worker = WorkerInitiator('n1', 'worker-incarnation-1', deliver)
+            intent = Intent('routed-fixture', 'opaque-fixture-compatibility', 'n1', worker.epoch, 1)
+            worker.accept(intent)
+            self.assertEqual(calls, [])  # No allocations/transfer on routing intent.
+            demand = Demand('block0-rank0', 'initiation-object', 'contiguous-host-fixture',
+                            source['length'], source_generation=source['version'])
+            before = len(runtime.rpc(c['master'], 'status')['operations'])
+            first = worker.load(intent, demand, target)
+            duplicate = worker.load(intent, demand, target)
+            self.assertEqual(first, duplicate)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(runtime.rpc(c['master'], 'status')['operations']), before+1)
+            self.assertFalse(first.result['local_hit'])
+            self.assertEqual(first.phase, 'host_validated')  # No fake GPU-ready.
+            self.assertEqual(worker.status()[0]['validation_scope'], 'ADAPTER_ONLY')
+            worker.release(intent, demand.consumer_id)
+            missing = Demand('missing-block', 'not-present', 'host-fixture', source['length'])
+            with self.assertRaises(CacheMiss):
+                worker.load(intent, missing, target)
+            self.assertEqual(worker.status()[1]['state'], 'MISS')
+            worker.release(intent, missing.consumer_id)
+
+        self.run_cluster(2, exercise=exercise)
+
+    def test_status_progress_during_fetch(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            log=runtime.Log(root/'events.jsonl','master')
+            c=dict(fingerprint='status-fixture',mode='local-file-test',pools={'A':dict(capacity=65536)},
+                   nodes=[dict(id='a1',pool='A')])
+            master=runtime.Master(c,root/'state.sqlite',log)
+            master.topology_ok=True
+            entered,release=threading.Event(),threading.Event()
+            def waiting_fetch(data):
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError('test did not release fetch')
+                return dict(local_hit=False)
+            master.fetch=waiting_fetch
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                pending=executor.submit(master.handle,'fetch',dict(key='K',requester='a1'))
+                try:
+                    self.assertTrue(entered.wait(5))
+                    status=executor.submit(master.handle,'status',{}).result(timeout=2)
+                    self.assertTrue(status['topology_verified'])
+                finally:
+                    release.set()
+                    pending.result(timeout=5)
+                    master.db.close()
+                    log.file.close()
+
+    def test_transport_baseline_exact_bytes_and_units(self):
+        from callosum_transport_benchmark import SIZES, TOTAL_BYTES, block_bytes, write_loop
+        for unit in ('MiB','MB'):
+            for size in SIZES:
+                block=block_bytes(size,unit)
+                posted=[]
+                def write(src,dst,n):
+                    self.assertGreaterEqual(src,0x1000)
+                    self.assertLessEqual(src+n,0x1000+block)
+                    self.assertEqual(dst-src,0x100000000)
+                    posted.append(n)
+                    return n
+                result=write_loop(write,0x1000,0x100001000,block,TOTAL_BYTES,64*1024**2)
+                self.assertEqual(result['bytes'],8589934592)
+                self.assertEqual(sum(posted),8589934592)
+                self.assertEqual(result['native_calls'],len(posted))
+                self.assertEqual(result['logical_blocks'],(TOTAL_BYTES+block-1)//block)
+        with self.assertRaisesRegex(RuntimeError,'short'):
+            write_loop(lambda s,d,n:n-1,4096,8192,64,128,32)
+        with self.assertRaises(ValueError):
+            block_bytes(16,'unknown')
+        large=write_loop(lambda s,d,n:n,4096,2**40,512*1024**2,TOTAL_BYTES,512*1024**2)
+        self.assertEqual(large['native_calls'],16)
+
+    def test_transport_baseline_reservation_and_final_validation(self):
+        from callosum_transport_benchmark import TOTAL_BYTES
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            log=runtime.Log(root/'events.jsonl','master')
+            nodes=[dict(id=n,pool=p,url='http://'+n,capacity=2**30,can_send=True,
+                        can_receive=True,configured_qps='16')
+                   for n,p in [('a1','A'),('b1','B')]]
+            c=dict(fingerprint='transport-fixture',mode='rdma',
+                   pools={p:dict(capacity=2**30) for p in ('A','B')},nodes=nodes)
+            master=runtime.Master(c,root/'state.sqlite',log)
+            master.topology_ok=True
+            master.members=lambda:nodes
+            source=dict(key='source',pool='B',offset=4096,length=512*1024**2,
+                        version='v1',checksum='full-source-checksum')
+            master.db.execute('INSERT INTO objects VALUES (?,?,?)',('source','B',json.dumps(source)))
+            master.db.commit()
+            def network(url,method,data,**kwargs):
+                if method=='prepare':
+                    return dict(receiver='a1',extent=data['extent'],plan_id=data['transfer_id'])
+                if method=='transport_write_loop':
+                    return dict(bytes=TOTAL_BYTES,block_bytes=data['block_bytes'],
+                                sender_write_loop_ns=1000)
+                if method=='digest':
+                    self.assertEqual(data['length'],1024**2)
+                    return 'window-checksum'
+                self.fail('unexpected baseline RPC '+method)
+            try:
+                with patch.object(runtime,'rpc',side_effect=network):
+                    result=master.handle('transport_benchmark',dict(node='b1',receiver='a1',
+                        key='source',block_size=1,block_unit='MiB'))
+                self.assertEqual(result['bytes'],TOTAL_BYTES)
+                self.assertFalse(result['active_qps_verified'])
+                self.assertEqual(master.db.execute('SELECT state FROM operations').fetchone()[0],
+                                 'DRAINED_RETAINED')
+                self.assertEqual(master.db.execute("SELECT count(*) FROM objects WHERE pool='A'").fetchone()[0],0)
+            finally:
+                master.db.close()
+                log.file.close()
+
+    def test_scatter_tensor_projection_and_hybrid_readiness(self):
+        import ctypes
+        from callosum_relay_native import project_scatter, ReadinessLedger
+        sources = [ctypes.create_string_buffer(bytes(range(7)),7),
+                   ctypes.create_string_buffer(bytes(range(7,17)),10)]
+        destinations = [ctypes.create_string_buffer(5),ctypes.create_string_buffer(12)]
+        src = [[0, ctypes.addressof(sources[0]), 7], [7, ctypes.addressof(sources[1]), 10]]
+        dst = [[0, ctypes.addressof(destinations[0]), 5], [5, ctypes.addressof(destinations[1]), 12]]
+        rows = project_scatter(src, dst, 17, 0, 17, 4)
+        source = bytearray(range(17))
+        copied = bytearray(17)
+        for logical, s, d, n in rows:
+            se = next(e for e in src if e[1] <= s < e[1]+e[2])
+            de = next(e for e in dst if e[1] <= d < e[1]+e[2])
+            self.assertEqual(se[0]+s-se[1], logical)
+            self.assertEqual(de[0]+d-de[1], logical)
+            copied[logical:logical+n] = source[logical:logical+n]
+            ctypes.memmove(d,s,n)
+        self.assertEqual(copied, source)
+        self.assertEqual(b''.join(d.raw for d in destinations),bytes(source))
+        for bad in ([[0, 0x8000, 5], [6, 0x9000, 11]],
+                    [[0, 0x8000, 5], [5, 0x8001, 12]]):
+            with self.assertRaises(ValueError):
+                project_scatter(src, bad, 17, 0, 17, 4)
+        ledger = ReadinessLedger('attempt-1', 'generation-1', 17)
+        ledger.assign('direct', 0, 7, False)
+        ledger.assign('helper', 7, 10, True)
+        # Helper transport is complete but local GPU copy remains pending.
+        for phase in ('transport', 'validated'):
+            ledger.event('attempt-1', 'generation-1', 'helper', phase)
+        with self.assertRaises(ValueError):
+            ledger.event('attempt-1', 'generation-1', 'helper', 'gpu_ready')
+        self.assertFalse(ledger.ready(17))
+        for phase in ('transport', 'validated', 'gpu_ready'):
+            ledger.event('attempt-1', 'generation-1', 'direct', phase)
+        self.assertTrue(ledger.ready(7))
+        self.assertFalse(ledger.ready(17))
+        with self.assertRaises(ValueError):
+            ledger.event('old-attempt', 'generation-1', 'helper', 'copy_complete')
+        with self.assertRaises(ValueError):
+            ledger.event('attempt-1', 'old-generation', 'helper', 'copy_complete')
+        ledger.event('attempt-1', 'generation-1', 'helper', 'copy_complete')
+        ledger.event('attempt-1', 'generation-1', 'helper', 'gpu_ready')
+        ledger.event('attempt-1', 'generation-1', 'helper', 'gpu_ready')
+        self.assertTrue(ledger.ready(17))
+        with self.assertRaises(ValueError):
+            ledger.assign('conflict', 6, 1, True)
+        prefix = ReadinessLedger('prefix','fixture-generation',4)
+        for i in range(4):
+            prefix.assign(f'K{i+1}',i,1,i>=2)
+        for key in ('K4','K2','K1'):
+            for phase in ('transport','validated'):
+                prefix.event('prefix','fixture-generation',key,phase)
+            if key=='K4':
+                prefix.event('prefix','fixture-generation',key,'copy_complete')
+            prefix.event('prefix','fixture-generation',key,'gpu_ready')
+        self.assertTrue(prefix.ready(2))
+        self.assertFalse(prefix.ready(4))  # K3 hole despite K4 completion.
+
+    def test_receiver_rejects_cross_plan_alias(self):
+        import threading
+        agent=runtime.Agent.__new__(runtime.Agent)
+        agent.node=dict(id='a1',pool='A',can_receive=True)
+        agent.mapping=SimpleNamespace(address=0x100000,bounds=Mock())
+        agent.lock=threading.Lock()
+        agent.targets={}
+        agent.segment,agent.epoch='a1-segment','epoch-a'
+        first=dict(transfer_id='one',extent=dict(pool='A',offset=4096,length=8192))
+        self.assertEqual(agent.handle('prepare',first),agent.handle('prepare',first))
+        with self.assertRaisesRegex(RuntimeError,'aliases'):
+            agent.handle('prepare',dict(transfer_id='two',
+                         extent=dict(pool='A',offset=8192,length=8192)))
+        self.assertNotIn('two',agent.targets)
+        agent.handle('prepare',dict(transfer_id='three',
+                     extent=dict(pool='A',offset=12288,length=4096)))
+
+    def test_source_dispatch_fcfs_and_idempotent_completion(self):
+        import threading
+        from callosum_dispatch import SourceDispatcher
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def send(plan, group):
+            calls.append(plan['transfer_id'])
+            if plan['transfer_id'] == 'first':
+                entered.set()
+                self.assertTrue(release.wait(5))
+            return [dict(chunk=0, bytes=1, success=True)]
+        dispatch = SourceDispatcher(send, capacity=1)
+        def plan(name):
+            return dict(transfer_id=name, senders=[dict(sender='b1')])
+        errors = []
+        def run(name):
+            try:
+                dispatch.execute(plan(name))
+            except Exception as e:
+                errors.append(e)
+        first = threading.Thread(target=run,args=('first',))
+        second = threading.Thread(target=run,args=('second',))
+        third = threading.Thread(target=run,args=('third',))
+        first.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            second.start()
+            deadline=time.monotonic()+5
+            while dispatch.status().get('second') != 'QUEUED' and time.monotonic()<deadline:
+                time.sleep(.001)
+            self.assertEqual(dispatch.status().get('second'), 'QUEUED')
+            third.start()
+        finally:
+            release.set()
+            for thread in (first,second,third):
+                if thread.ident is not None:
+                    thread.join(5)
+        self.assertFalse(errors)
+        self.assertEqual(calls,['first','second','third'])
+        self.assertEqual(dispatch.execute(plan('first'))[0]['bytes'],1)
+        self.assertEqual(len(calls),3)
+        with self.assertRaisesRegex(RuntimeError,'conflicting'):
+            dispatch.execute(dict(plan('first'), changed=True))
+        def fail(plan, group):
+            raise TimeoutError('possible posted writer')
+        uncertain=SourceDispatcher(fail)
+        with self.assertRaises(TimeoutError):
+            uncertain.execute(plan('failed'))
+        self.assertEqual(uncertain.status()['failed'],'QUARANTINED')
+        with self.assertRaisesRegex(RuntimeError,'quarantined'):
+            uncertain.execute(plan('failed'))
+
     def test_cxl_mapping_identity(self):
         from callosum_relay_native import same_cxl_mapping
         self.assertTrue(same_cxl_mapping('A',0,65536,'A',0,65536))
@@ -177,6 +452,9 @@ class RuntimeTest(unittest.TestCase):
             writers=[]
 
             def control(url,method,data,**kwargs):
+                if method=='dispatch':
+                    group=data['senders'][0]
+                    return control(url,'write',dict(group,targets=data['targets']))
                 if method=='prepare':
                     return dict(receiver='a1',extent=data['extent'],segment='a1',remote_base=0x100000,
                                 epoch='a1',address_kind='classic_va',plan_id=data['transfer_id'])
@@ -295,6 +573,8 @@ class RuntimeTest(unittest.TestCase):
                 self.assertEqual(result['checksum'], seed['checksum'])
                 self.assertEqual((result['senders'], result['receivers']), (workers//2,workers//2))
                 self.assertFalse(result['local_hit'])
+                dispatch_status = runtime.rpc(urls[workers//2+1], 'dispatch_status')
+                self.assertEqual(dispatch_status[result['transfer_id']], 'DRAINED')
                 # Non-requesting helper observes the same published object.
                 reuse = runtime.rpc(urls[workers//2], 'consume', dict(key='kv-a'))
                 self.assertTrue(reuse['local_hit'])

@@ -11,6 +11,13 @@ target_link_libraries(callosum_relay_native PRIVATE Threads::Threads)
 enable_testing()
 set(relay_test_script "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_runtime.py")
 foreach(test_method
+    initiation_native_file_path
+    status_progress_during_fetch
+    transport_baseline_exact_bytes_and_units
+    transport_baseline_reservation_and_final_validation
+    receiver_rejects_cross_plan_alias
+    scatter_tensor_projection_and_hybrid_readiness
+    source_dispatch_fcfs_and_idempotent_completion
     delivery_policy_fixtures
     policy_rejection_before_reservation
     native_batch_projection
@@ -38,4 +45,14 @@ foreach(test_method
   else()
     set_property(TEST callosum_runtime_${test_method} APPEND PROPERTY LABELS functional)
   endif()
+endforeach()
+
+# These validate a Callosum-facing contract, not an installed Dynamo integration.
+foreach(category preflight function failure status)
+  add_test(NAME callosum_initiation_${category}
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_initiation.py"
+      -k "test_${category}_")
+  set_tests_properties(callosum_initiation_${category} PROPERTIES
+    LABELS "relay;initiation;adapter;t0;${category}" TIMEOUT 30)
 endforeach()

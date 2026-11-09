@@ -6,7 +6,6 @@ Payload: Mooncake legacy RDMA, or explicitly labelled local-file test DMA.
 No eviction/reuse: uncertain operations permanently quarantine their extents.
 """
 import argparse
-import concurrent.futures
 import ctypes
 import ctypes.util
 import hashlib
@@ -24,8 +23,15 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+from callosum_dispatch import SourceDispatcher, partition_source
+from callosum_initiation import CacheMiss
+from callosum_transport_benchmark import block_bytes, write_loop, TOTAL_BYTES
 
 RUNTIME_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+IMPLEMENTATION_SHA256 = hashlib.sha256(b''.join(
+    (Path(__file__).parent / name).read_bytes() for name in
+    ('callosum_runtime.py', 'callosum_dispatch.py', 'callosum_transport_benchmark.py',
+     'callosum_initiation.py', 'callosum_worker.py'))).hexdigest()
 
 STAGES = ['lookup', 'reserved', 'targets_ready', 'dispatch_begin',
           'writes_complete', 'verified', 'published', 'handles_released', 'failed']
@@ -48,6 +54,8 @@ def rpc(url, method, data=None, timeout=60):
             'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token()})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         result = json.load(response)
+    if not result.get('ok') and result.get('error_kind') == 'cache_miss_before_submit':
+        raise CacheMiss(result['error'])
     require(result.get('ok'), result.get('error', 'control RPC failed'))
     return result['result']
 
@@ -231,6 +239,7 @@ class Agent:
         self.epoch = secrets.token_hex(16)
         self.lock = threading.Lock()
         self.targets, self.jobs = {}, {}
+        self.dispatcher = SourceDispatcher(self.send_group)
         self.engine = None
         if c['mode'] == 'rdma':
             from mooncake.engine import TransferEngine
@@ -255,11 +264,65 @@ class Agent:
                     capacity=self.mapping.capacity, can_send=self.node['can_send'],
                     can_receive=self.node['can_receive'], epoch=self.epoch,
                     segment=self.segment, fingerprint=self.c['fingerprint'], abi_version=2,
-                    runtime_sha256=RUNTIME_SHA256)
+                    runtime_sha256=RUNTIME_SHA256,
+                    implementation_sha256=IMPLEMENTATION_SHA256,
+                    configured_qps=os.environ.get('MC_NUM_QP_PER_EP', 'default'))
 
     def handle(self, method, d):
         if method == 'health':
             return self.descriptor()
+        if method == 'dispatch_status':
+            return self.dispatcher.status()
+        if method == 'dispatch':
+            require(d['source']['pool'] == self.node['pool'] and self.node['can_send'],
+                    'dispatch must execute at an eligible source member')
+            source = d['source']
+            self.mapping.bounds(source['offset'], source['length'])
+            require(len({g['sender'] for g in d['senders']}) == len(d['senders']),
+                    'duplicate source sender group')
+            for group in d['senders']:
+                member = next(n for n in self.c['nodes'] if n['id'] == group['sender'])
+                require(member['pool'] == self.node['pool'] and member['can_send'],
+                        'ineligible source sender')
+                for w in group['writes']:
+                    e = w['source']
+                    require(e['pool'] == source['pool'] and e['offset'] >= source['offset'] and
+                            e['offset'] + e['length'] <= source['offset'] + source['length'],
+                            'dispatch outside source grant')
+            planned = partition_source(d)
+            self.log.emit('source_scatter',transfer_id=d['transfer_id'],
+                          senders=[g['sender'] for g in planned['senders']],
+                          chunks=sum(len(g['writes']) for g in planned['senders']))
+            return self.dispatcher.execute(planned)
+        if method == 'transport_write_loop':
+            require(self.engine is not None and self.node['can_send'],
+                    'transport baseline requires real RDMA engine')
+            require(os.environ.get('MC_NUM_QP_PER_EP') == '16', 'baseline requires 16 configured QPs')
+            extent, target = d['source'], d['target']
+            require(extent['pool'] == self.node['pool'], 'wrong source pool')
+            require(0 < d['block_bytes'] <= min(extent['length'],target['extent']['length']) and
+                    target['plan_id'] == d['transfer_id'], 'baseline exceeds authorized window')
+            self.mapping.bounds(extent['offset'], d['block_bytes'])
+            peer = next(n for n in self.c['nodes'] if n['id'] == target['receiver'])
+            require(peer['pool'] != self.node['pool'] and
+                    target['address_kind'] == 'classic_va' and
+                    rpc(peer['url'], 'target', dict(transfer_id=d['transfer_id'])) == target,
+                    'stale transport target')
+            with self.lock:
+                require(d['transfer_id'] not in self.jobs, 'benchmark replay refused')
+                self.jobs[d['transfer_id']] = 'RUNNING'
+            try:
+                result = write_loop(lambda src,dst,n: self.engine.relay_write_batch_drained(
+                    [target['segment']], [src], [dst], [n])[0],
+                    self.mapping.address + extent['offset'], target['remote_base'],
+                    d['block_bytes'], TOTAL_BYTES, self.c.get('max_inflight_bytes',64*1024**2))
+                self.jobs[d['transfer_id']] = 'DRAINED'
+                self.log.emit('transport_baseline_complete', transfer_id=d['transfer_id'],
+                              opcode='WRITE', actual_transport='rdma', **result)
+                return result
+            except BaseException:
+                self.jobs[d['transfer_id']] = 'QUARANTINED'
+                raise
         if method == 'marker':
             # The first page is reserved for destructive topology challenges.
             if 'value' in d:
@@ -286,8 +349,16 @@ class Agent:
                           remote_base=self.mapping.address + e['offset'], epoch=self.epoch,
                           address_kind='classic_va', plan_id=d['transfer_id'])
             with self.lock:
-                previous = self.targets.setdefault(d['transfer_id'], target)
+                previous = self.targets.get(d['transfer_id'], target)
                 require(previous == target, 'conflicting registration replay')
+                for identity, other in self.targets.items():
+                    if identity == d['transfer_id']:
+                        continue
+                    a, b = e, other['extent']
+                    require(a['offset'] >= b['offset']+b['length'] or
+                            b['offset'] >= a['offset']+a['length'],
+                            'target aliases another retained reservation')
+                self.targets[d['transfer_id']] = target
             return target
         if method == 'target':
             with self.lock:
@@ -311,6 +382,12 @@ class Agent:
                           request_to_ready_ns=result['request_to_ready_ns'])
             return result
         raise RuntimeError('unknown agent operation')
+
+    def send_group(self, plan, group):
+        node = next(n for n in self.c['nodes'] if n['id'] == group['sender'])
+        return rpc(node['url'], 'write', dict(group, transfer_id=plan['transfer_id'],
+            targets=plan['targets'], epoch=plan['sender_epochs'][group['sender']],
+            source_object_offset=plan['source']['offset']), timeout=300)
 
     def write(self, d):
         transfer = d['transfer_id']
@@ -413,6 +490,9 @@ class Master:
     def __init__(self, c, database, log):
         self.c, self.log = c, log
         self.lock = threading.RLock()
+        self.fetch_locks = {}
+        self.seed_locks = {}
+        self.preflight_lock = threading.Lock()
         self.db = sqlite3.connect(database, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=FULL')
@@ -436,7 +516,8 @@ class Master:
         return next(n for n in self.c['nodes'] if n['id'] == identity)
 
     def members(self):
-        records = [json.loads(row[0]) for row in self.db.execute('SELECT descriptor FROM members ORDER BY id')]
+        with self.lock:
+            records = [json.loads(row[0]) for row in self.db.execute('SELECT descriptor FROM members ORDER BY id')]
         require(len(records) == len(self.c['nodes']), 'all configured workers must register')
         for d in records:
             actual = rpc(self.node(d['id'])['url'], 'health')
@@ -446,39 +527,53 @@ class Master:
     def allocate(self, pool, length):
         require(type(length) is int and 0 < length <= self.c.get('max_object_bytes', 1024**3),
                 'invalid object size')
-        start = self.db.execute('SELECT next FROM pools WHERE id=?', (pool,)).fetchone()[0]
-        end = (start + length + 4095) // 4096 * 4096
-        require(end <= self.c['pools'][pool]['capacity'], 'arena full; no unsafe extent reuse')
-        with self.db:
-            self.db.execute('UPDATE pools SET next=? WHERE id=?', (end, pool))
+        with self.lock:
+            start = self.db.execute('SELECT next FROM pools WHERE id=?', (pool,)).fetchone()[0]
+            end = (start + length + 4095) // 4096 * 4096
+            require(end <= self.c['pools'][pool]['capacity'], 'arena full; no unsafe extent reuse')
+            with self.db:
+                self.db.execute('UPDATE pools SET next=? WHERE id=?', (end, pool))
         return dict(pool=pool, offset=start, length=length)
 
     def operation(self, identity, state, record):
-        with self.db:
+        with self.lock, self.db:
             self.db.execute('INSERT OR REPLACE INTO operations VALUES (?,?,?)',
                             (identity, state, json.dumps(record)))
 
     def handle(self, method, d):
-        with self.lock:
-            if method == 'register':
-                n = self.node(d['id'])
-                live = rpc(n['url'], 'health')
-                require(live == d and d['fingerprint'] == self.c['fingerprint'] and
-                        d['pool'] == n['pool'] and d.get('abi_version') == 2 and
-                        d.get('runtime_sha256') == RUNTIME_SHA256,
-                        'registration/code ABI mismatch')
+        if method == 'transport_benchmark':
+            return self.transport_benchmark(d)
+        if method == 'fetch':
+            with self.lock:
+                require(self.topology_ok, 'run destructive topology preflight first')
+                identity = (d['key'], self.node(d['requester'])['pool'])
+                single_flight = self.fetch_locks.setdefault(identity, threading.Lock())
+            with single_flight:
+                return self.fetch(d)
+        if method == 'register':
+            n = self.node(d['id'])
+            live = rpc(n['url'], 'health')
+            require(live == d and d['fingerprint'] == self.c['fingerprint'] and
+                    d['pool'] == n['pool'] and d.get('abi_version') == 2 and
+                    d.get('runtime_sha256') == RUNTIME_SHA256 and
+                    d.get('implementation_sha256') == IMPLEMENTATION_SHA256,
+                    'registration/code ABI mismatch')
+            with self.lock:
                 old = self.db.execute('SELECT descriptor FROM members WHERE id=?', (d['id'],)).fetchone()
                 require(not old or json.loads(old[0]) == d,
                         'worker restart detected; old remote targets may be live; arena remains quarantined')
                 with self.db:
                     self.db.execute('INSERT OR REPLACE INTO members VALUES (?,?)', (d['id'], json.dumps(d)))
                 return dict(registered=d['id'])
-            if method == 'status':
+        if method == 'status':
+            with self.lock:
                 return dict(mode=self.c['mode'], evidence_class='TRANSFER_ONLY',
                     topology_verified=self.topology_ok,
                     operations=[dict(id=i, state=s) for i,s in self.db.execute('SELECT id,state FROM operations')])
-            if method == 'preflight':
-                self.topology_ok = False
+        if method == 'preflight':
+            with self.preflight_lock:
+                with self.lock:
+                    self.topology_ok = False
                 members = self.members()
                 # Distinct tokens at the SAME logical offset expose accidental
                 # pool aliasing as well as members which do not share memory.
@@ -489,41 +584,96 @@ class Master:
                 for member in members:
                     observed = rpc(self.node(member['id'])['url'], 'marker')
                     require(observed == challenges[member['pool']], 'physical pool sharing/isolation check failed')
-                self.topology_ok = True
+                with self.lock:
+                    self.topology_ok = True
                 self.log.emit('topology_verified', mode=self.c['mode'], members=len(members))
                 return dict(shared_pairs_verified=True, separate_pools_verified=True, mode=self.c['mode'])
-            require(self.topology_ok, 'run destructive topology preflight first')
-            if method == 'fetch':
-                return self.fetch(d)
+        if method == 'seed':
+            require(isinstance(d['key'], str) and 0 < len(d['key']) <= 512, 'invalid key')
+            with self.lock:
+                require(self.topology_ok, 'run destructive topology preflight first')
+                single_seed = self.seed_locks.setdefault(d['key'],threading.Lock())
+            with single_seed:
+                return self.seed(d)
+        raise RuntimeError('unknown master operation')
+
+    def seed(self, d):
+        members = self.members()
+        pool = self.node(d['node'])['pool']
+        with self.lock:
+            require(not self.db.execute('SELECT 1 FROM objects WHERE key=?', (d['key'],)).fetchone(),
+                    'immutable key already exists')
+            allocation_start = time.monotonic_ns()
+            extent = self.allocate(pool, d['length'])
+            allocation_ns = time.monotonic_ns() - allocation_start
+        digest = rpc(self.node(d['node'])['url'], 'seed', dict(extent, key=d['key']), timeout=300)
+        for m in members:
+            if m['pool'] == pool:
+                require(rpc(self.node(m['id'])['url'], 'digest', extent, timeout=300) == digest,
+                        'source is not visible to every source member')
+        record = dict(extent, key=d['key'], version=secrets.token_hex(16), checksum=digest)
+        publication_start = time.monotonic_ns()
+        with self.lock, self.db:
+            self.db.execute('INSERT INTO objects VALUES (?,?,?)', (d['key'], pool, json.dumps(record)))
+        return dict(record, initial_allocation_ns=allocation_ns,
+                    initial_publication_ns=time.monotonic_ns()-publication_start)
+
+    def transport_benchmark(self, d):
+        block = block_bytes(d['block_size'], d['block_unit'])
+        require(self.c.get('max_inflight_bytes',64*1024**2) >= block,
+                'baseline block exceeds native request budget; configure max_inflight_bytes before agent startup')
+        # Allocation and journal mutation only: release the authority lock before
+        # posting the long transport loop. This dedicated range is never published.
+        with self.lock:
+            require(self.topology_ok and self.c['mode']=='rdma', 'RDMA preflight required')
+            source_node, receiver = self.node(d['node']), self.node(d['receiver'])
+            require(source_node['pool'] != receiver['pool'], 'independent pools required')
+            row = self.db.execute('SELECT record FROM objects WHERE key=? AND pool=?',
+                                 (d['key'],source_node['pool'])).fetchone()
+            require(row, 'seed source object before baseline')
+            source = json.loads(row[0])
+            require(source['length'] >= block, 'source window smaller than block')
+            identity = secrets.token_hex(16)
+            destination = self.allocate(receiver['pool'], block)
+            self.operation(identity, 'RESERVED', dict(source=source,destination=destination,
+                                                     benchmark=True))
+        try:
             members = self.members()
-            if method == 'seed':
-                require(isinstance(d['key'], str) and 0 < len(d['key']) <= 512, 'invalid key')
-                pool = self.node(d['node'])['pool']
-                require(not self.db.execute('SELECT 1 FROM objects WHERE key=?', (d['key'],)).fetchone(),
-                        'immutable key already exists')
-                allocation_start = time.monotonic_ns()
-                extent = self.allocate(pool, d['length'])
-                allocation_ns = time.monotonic_ns() - allocation_start
-                digest = rpc(self.node(d['node'])['url'], 'seed', dict(extent, key=d['key']), timeout=300)
-                for m in members:
-                    if m['pool'] == pool:
-                        require(rpc(self.node(m['id'])['url'], 'digest', extent, timeout=300) == digest,
-                                'source is not visible to every source member')
-                record = dict(extent, key=d['key'], version=secrets.token_hex(16), checksum=digest)
-                publication_start = time.monotonic_ns()
-                with self.db:
-                    self.db.execute('INSERT INTO objects VALUES (?,?,?)', (d['key'], pool, json.dumps(record)))
-                return dict(record, initial_allocation_ns=allocation_ns,
-                            initial_publication_ns=time.monotonic_ns()-publication_start)
-            raise RuntimeError('unknown master operation')
+            require(all(m.get('configured_qps')=='16' for m in members),
+                    'all endpoints must start with MC_NUM_QP_PER_EP=16')
+            target = rpc(receiver['url'], 'prepare', dict(transfer_id=identity, extent=destination))
+            result = rpc(source_node['url'], 'transport_write_loop', dict(
+                transfer_id=identity,source=source,target=target,block_bytes=block), timeout=900)
+            require(result['bytes'] == TOTAL_BYTES and result['block_bytes'] == block,
+                    'baseline byte accounting mismatch')
+            source_range = dict(source, length=block)
+            expected = rpc(source_node['url'],'digest',source_range,timeout=300)
+            require(rpc(receiver['url'],'digest',destination,timeout=300)==expected,
+                    'baseline destination checksum mismatch')
+            with self.lock:
+                self.operation(identity, 'DRAINED_RETAINED', dict(source=source,
+                    destination=destination,benchmark=True,result=result))
+            return dict(result, status='PASS', transfer_id=identity,
+                        evidence_class='TRANSFER_ONLY', block_unit=d['block_unit'],
+                        configured_qps=16, active_qps_verified=False,
+                        qp_gate='INCOMPLETE_REQUIRES_ENDPOINT_EVIDENCE',
+                        path_mode='direct_dax_write', actual_transport='rdma',
+                        checksum_scope='final block window', store_compatible=False)
+        except BaseException:
+            with self.lock:
+                self.operation(identity,'QUARANTINED',dict(source=source,
+                    destination=destination,benchmark=True))
+            raise
 
     def fetch(self, request):
         import callosum_relay_native
         requester = self.node(request['requester'])
         key = request['key']
-        lookup_start = time.monotonic_ns()
-        records = [json.loads(r[0]) for r in self.db.execute('SELECT record FROM objects WHERE key=?', (key,))]
-        require(records, 'KV not found; requester must recompute')
+        with self.lock:
+            lookup_start = time.monotonic_ns()
+            records = [json.loads(r[0]) for r in self.db.execute('SELECT record FROM objects WHERE key=?', (key,))]
+        if not records:
+            raise CacheMiss('KV not found; requester must recompute')
         local = next((r for r in records if r['pool'] == requester['pool']), None)
         metadata_lookup_ns = time.monotonic_ns() - lookup_start
         validation_start = time.monotonic_ns()
@@ -531,8 +681,9 @@ class Master:
             # A local hit must not depend on a remote source's health. Check
             # only this consumer's current mapping epoch. This is still the
             # experiment's directory, not a production LocalCxlMaster.
-            row = self.db.execute('SELECT descriptor FROM members WHERE id=?',
-                                  (requester['id'],)).fetchone()
+            with self.lock:
+                row = self.db.execute('SELECT descriptor FROM members WHERE id=?',
+                                      (requester['id'],)).fetchone()
             require(row and rpc(requester['url'],'health') == json.loads(row[0]),
                     'local worker epoch changed; preserve arena')
             return dict(local, transfer_id='local-hit', local_hit=True,
@@ -609,24 +760,11 @@ class Session:
     def execute(self, plan):
         self.m.operation(self.id, 'DISPATCHED', dict(plan=plan, source=self.source, destination=self.destination))
         descriptors = {m['id']:m for m in self.m.members()}
-        def send(group):
-            node = self.m.node(group['sender'])
-            return rpc(node['url'], 'write', dict(group, transfer_id=self.id,
-                targets=plan['targets'], epoch=descriptors[node['id']]['epoch'],
-                source_object_offset=self.source['offset']), timeout=300)
-        # HTTP timeout means uncertainty, not drain. Session failure quarantines
-        # all extents; agents retain mappings/MRs for their entire process life.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(plan['senders'])) as executor:
-            pending = [executor.submit(send, group) for group in plan['senders']]
-            results, errors = [], []
-            for future in pending:
-                try:
-                    results.extend(future.result())
-                except Exception as error:
-                    errors.append(error)
-            if errors:
-                raise errors[0]
-            return results
+        dispatcher = self.m.node(plan['senders'][0]['sender'])
+        # Source member performs fan-out. The master handles control records;
+        # neither dispatcher nor master adds a payload copy hop.
+        return rpc(dispatcher['url'], 'dispatch', dict(plan, source=self.source,
+            sender_epochs={identity:d['epoch'] for identity,d in descriptors.items()}), timeout=300)
 
     def verify(self):
         self.m.members()  # Reject changed boot epochs before publication.
@@ -639,7 +777,7 @@ class Session:
     def commit(self):
         record = dict(self.destination, key=self.source['key'], checksum=self.source['checksum'],
                       version=self.source['version'])
-        with self.m.db:
+        with self.m.lock, self.m.db:
             self.m.db.execute('INSERT INTO objects VALUES (?,?,?)',
                              (record['key'], record['pool'], json.dumps(record)))
             self.m.db.execute("UPDATE operations SET state='COMMITTED' WHERE id=?", (self.id,))
@@ -670,6 +808,8 @@ def server(url, service):
                 payload = dict(ok=True, result=result)
             except Exception as error:
                 payload = dict(ok=False, error=str(error))
+                if isinstance(error, CacheMiss):
+                    payload['error_kind'] = 'cache_miss_before_submit'
             raw = json.dumps(payload).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -685,7 +825,7 @@ def server(url, service):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('role', choices=['check','master','agent','preflight','seed','consume','status'])
+    parser.add_argument('role', choices=['check','master','agent','preflight','seed','consume','status','transport-benchmark'])
     parser.add_argument('--config', required=True)
     parser.add_argument('--node')
     parser.add_argument('--state-dir', default='./callosum-state')
@@ -695,6 +835,9 @@ def main():
     parser.add_argument('--gpu', action='store_true')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--request-id', default='manual')
+    parser.add_argument('--receiver')
+    parser.add_argument('--block-size', type=int, choices=[1,2,4,8,16,32,64,128,256,512])
+    parser.add_argument('--block-unit', choices=['MB','MiB'])
     args = parser.parse_args()
     c = config(args.config)
     import callosum_relay_native as native
@@ -740,6 +883,14 @@ def main():
     elif args.role == 'seed':
         print(json.dumps(rpc(c['master'], 'seed', dict(node=args.node, key=args.key, length=args.bytes),
                              timeout=600), indent=2))
+    elif args.role == 'transport-benchmark':
+        require(args.node and args.receiver and args.block_size and args.block_unit,
+                'baseline requires --node source --receiver --block-size --block-unit')
+        start = time.monotonic_ns()
+        result = rpc(c['master'], 'transport_benchmark', dict(node=args.node,receiver=args.receiver,
+            key=args.key,block_size=args.block_size,block_unit=args.block_unit),timeout=1200)
+        result['requester_rpc_ns'] = time.monotonic_ns()-start
+        print(json.dumps(result,indent=2))
     else:
         node = next(n for n in c['nodes'] if n['id'] == args.node)
         print(json.dumps(rpc(node['url'], 'consume', dict(key=args.key, gpu=args.gpu,
