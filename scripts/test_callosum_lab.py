@@ -353,6 +353,17 @@ class LabTest(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('--node-id',result.stdout)
 
+    def test_project_entrypoint_uses_canonical_launcher_outside_cwd(self):
+        root=Path(lab.__file__).resolve().parents[2]
+        entry=root/'scripts/callosum_lab.sh'
+        with tempfile.TemporaryDirectory() as directory:
+            result=subprocess.run(['bash',str(entry),'--help'],cwd=directory,
+                text=True,capture_output=True,
+                env=dict(lab.clean_env(),PYTHON_BIN=sys.executable,NODE_ID='arbitrary-node'))
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('--node-id',result.stdout)
+        self.assertNotIn('--node-role',result.stdout)
+
     def test_missing_authorization_prevents_any_child_launch(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
