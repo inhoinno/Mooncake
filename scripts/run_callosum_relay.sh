@@ -18,6 +18,10 @@ if [[ ${1:-} == build ]]; then
   exit
 fi
 export PYTHONPATH="$native_build:$script_dir:${PYTHONPATH:-}"
+if [[ ${1:-} == dram-benchmark ]]; then
+  shift
+  exec "$python_bin" "$script_dir/callosum_dram_benchmark.py" "$@"
+fi
 if [[ ${1:-} != --help && ${1:-} != -h ]]; then
   "$python_bin" -c 'import callosum_relay_native as n; assert n.ABI_VERSION == 2, "rebuild native relay module"'
 fi

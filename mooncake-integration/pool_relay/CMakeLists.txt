@@ -9,6 +9,10 @@ target_include_directories(callosum_relay_native PRIVATE ../../mooncake-store/in
 target_compile_features(callosum_relay_native PRIVATE cxx_std_17)
 target_link_libraries(callosum_relay_native PRIVATE Threads::Threads)
 enable_testing()
+add_test(NAME callosum_dram_write_baseline_control
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_dram_benchmark.py")
+set_tests_properties(callosum_dram_write_baseline_control PROPERTIES
+  LABELS "relay;benchmark;t0" TIMEOUT 60)
 set(relay_test_script "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_runtime.py")
 foreach(test_method
     preflight_empty_startup_abort
