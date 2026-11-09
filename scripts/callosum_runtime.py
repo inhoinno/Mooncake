@@ -694,6 +694,8 @@ class Master:
                         for i,v in self.db.execute('SELECT id,descriptor FROM members')},
                     mr_pages={i:json.loads(v).get('mr_pages')
                         for i,v in self.db.execute('SELECT id,descriptor FROM members')},
+                    remaining_capacity_bytes={p:self.c['pools'][p]['capacity']-n
+                        for p,n in self.db.execute('SELECT id,next FROM pools')},
                     topology_verified=self.topology_ok,
                     operations=[dict(id=i, state=s) for i,s in self.db.execute('SELECT id,state FROM operations')])
         if method == 'preflight':

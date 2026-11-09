@@ -38,11 +38,21 @@ SOURCE_FILES = (
     'scripts/callosum_benchmark_report.py',
     'scripts/callosum_write_mini.py',
     'scripts/callosum_write_matrix.py', 'scripts/callosum_dram_benchmark.py',
+    'scripts/callosum_benchmark_prepare.py',
     'mooncake-store/src/pool_relay.cpp', 'mooncake-store/include/pool_relay.h',
     'mooncake-integration/pool_relay/bindings.cpp',
     'mooncake-integration/pool_relay/relay_batch.h',
     'mooncake-integration/pool_relay/scatter_layout.h',
     'mooncake-integration/transfer_engine/transfer_engine_py.cpp',
+)
+DELIVERY_ROOT_FILES = (
+    'scripts/callosum_lab.sh', 'scripts/capture_preflight.sh',
+    'scripts/rdma-write-matrix.sh', 'scripts/cxl-write-mini.sh',
+    'experiments/two_worker_metadata_lookup/lab.example.json',
+    'experiments/two_worker_metadata_lookup/run.sh',
+    'experiments/two_worker_metadata_lookup/benchmark.py',
+    'experiments/cxl_write_mini/matrix.example.json',
+    'docs/DRAM_RDMA_BASELINE_RUNBOOK.md',
 )
 PACKAGES = (
     'build-essential', 'cmake', 'git', 'pkg-config', 'python3-dev', 'python3-venv',
@@ -978,10 +988,9 @@ def check_delivery(root):
                                input=modules.stdout,text=True,capture_output=True)
         if not any(line.split(maxsplit=1)[-1] == relative for line in paths.stdout.splitlines()):
             issues.append('Committed .gitmodules does not declare the Mooncake path')
-    for repo, files in ((root, ('scripts/callosum_lab.sh','scripts/capture_preflight.sh',
-            'experiments/two_worker_metadata_lookup/lab.example.json')),
-            (source, ('scripts/callosum_lab.py','scripts/run_callosum_relay.sh',
-                      'scripts/callosum_runtime.py','scripts/test_callosum_lab.py'))):
+    for repo, files in ((root, DELIVERY_ROOT_FILES),
+            (source, SOURCE_FILES+('scripts/callosum_lab.py','scripts/run_callosum_relay.sh',
+                'scripts/test_callosum_lab.py','scripts/test_callosum_benchmark_prepare.py'))):
         for file in files:
             if subprocess.run(['git','-C',str(repo),'cat-file','-e',f'HEAD:{str((repo/file).relative_to(top)) if repo==root else file}'],
                               capture_output=True).returncode:

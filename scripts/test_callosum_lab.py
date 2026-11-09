@@ -147,15 +147,18 @@ class CheckoutCommandTest(unittest.TestCase):
         root=case/'parent'
         source=root/'Mooncake-dev'
         source.mkdir(parents=True)
-        for repo,destination,files in ((self.root,root,
-                ['scripts/callosum_lab.sh','scripts/capture_preflight.sh',
-                 'experiments/two_worker_metadata_lookup/lab.example.json']),
-                (self.root/'Mooncake-dev',source,
-                 [str(p.relative_to(self.root/'Mooncake-dev'))
+        # Construct a candidate delivery in isolated Git repositories. This
+        # does not assert that the developer's current uncommitted tree is delivered.
+        original=Path(lab.__file__).resolve().parents[2]
+        for repo,destination,files in ((original,root,lab.DELIVERY_ROOT_FILES),
+                (original/'Mooncake-dev',source,
+                 list(lab.SOURCE_FILES)+[str(p.relative_to(self.root/'Mooncake-dev'))
                   for p in (self.root/'Mooncake-dev/scripts').iterdir() if p.is_file()])):
             for file in files:
                 (destination/file).parent.mkdir(parents=True,exist_ok=True)
                 shutil.copy2(repo/file,destination/file)
+        shutil.copy2(original/'Mooncake-dev/scripts/test_callosum_benchmark_prepare.py',
+                     source/'scripts/test_callosum_benchmark_prepare.py')
         def git(repo,*args):
             return subprocess.check_output(['git','-C',str(repo),'-c','user.name=Fixture',
                 '-c','user.email=fixture@example.invalid','-c','commit.gpgsign=false',*args],

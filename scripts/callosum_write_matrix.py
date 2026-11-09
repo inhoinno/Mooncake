@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 from callosum_lab import Runner, clean_env
 from callosum_runtime import config, require, rpc
-from callosum_transport_benchmark import block_bytes
+from callosum_transport_benchmark import block_bytes, TOTAL_BYTES
 from callosum_dram_benchmark import allocation_geometry, hugepage_capacity, source_identity
 from callosum_benchmark_report import write_report
 
@@ -40,8 +40,10 @@ def load(path,args):
     require(set(pair)=={'source','receiver'} and all(n in nodes for n in pair.values()),'invalid pair')
     require(nodes[pair['source']]['pool']!=nodes[pair['receiver']]['pool'] and
             nodes[pair['source']]['can_send'] and nodes[pair['receiver']]['can_receive'],'ineligible cross-pool pair')
-    require(args.node==pair['receiver' if args.action=='receive' else 'source'],
-            'node does not match the selected pair action; host names do not select roles')
+    require(args.node in pair.values(),'node not in the configured pair')
+    if args.action in ('receive','run'):
+        require(args.node==pair['receiver' if args.action=='receive' else 'source'],
+                'node does not match the selected pair action; host names do not select roles')
     lengths=[block_bytes(n,args.unit) for n in args.sizes]
     require(args.sizes and len(set(args.sizes))==len(args.sizes) and 0<args.repetitions<=100,
             'invalid sweep/repetitions')
@@ -105,6 +107,7 @@ def receiver_health(spec,c,args,mode):
     health=rpc(url,'health',timeout=5)
     require(health['node_id']==spec['pair']['receiver'] and health['peer_id']==spec['pair']['source'] and
             health['fingerprint']==c['fingerprint'] and health['state']=='IDLE' and
+            not health.get('sealed',False) and
             health['source_identity']==source_identity() and health['mr_pages']['mode']==mode and
             health['capacity']>=max(block_bytes(n,args.unit) for n in args.sizes),
             'receiver mode, size, source, peer or lifetime state differs; no automatic restart')
@@ -119,6 +122,13 @@ def receive(spec,c,args,topology,receipt,private,env,out,runner):
     runner.stage='receiver-local-numa-preflight'
     require('local_numa' in args.backings,'receive action is only needed for local_numa')
     node=next(n for n in c['nodes'] if n['id']==args.node)
+    reused=[]; missing=[]
+    for mode in args.page_modes:
+        try: receiver_health(spec,c,args,mode); reused.append(mode)
+        except Exception: missing.append(mode)
+    if not missing:
+        runner.say(f'[READY REUSED] compatible receivers={reused}; no process or reservation added')
+        return
     numa=spec['numa_nodes'].get(args.node)
     if numa is None: numa=int((Path('/sys/class/infiniband')/node['rdma_device']/'device/numa_node').read_text())
     require(numa>=0,'NIC NUMA is unknown; configure a reviewed numa_nodes override')
@@ -128,13 +138,13 @@ def receive(spec,c,args,topology,receipt,private,env,out,runner):
     soft,_=resource.getrlimit(resource.RLIMIT_MEMLOCK)
     require(soft==resource.RLIM_INFINITY or soft>=required,
             f'each receiver process needs memlock >= {required} bytes')
-    if 'huge2MB' in args.page_modes: hugepage_capacity(numa,size)
-    for mode in args.page_modes:
+    if 'huge2MB' in missing: hugepage_capacity(numa,size)
+    for mode in missing:
         for port in (spec['control_ports'][mode],spec['te_ports'][mode]):
             with socket.socket() as probe: probe.bind((urlparse(node['url']).hostname,port))
     children=[]
     try:
-        for mode in args.page_modes:
+        for mode in missing:
             runner.stage='receiver-start-'+mode
             command=dram_command(spec,args,topology,receipt,private,out/mode,mode,'receiver',env)
             with (out/f'{mode}.log').open('x') as log:
@@ -142,25 +152,29 @@ def receive(spec,c,args,topology,receipt,private,env,out,runner):
             children.append(child)
             runner.children[str(child.pid)]=child
             (out/'owned-pids.json').write_text(json.dumps([p.pid for p in children]))
+            from callosum_lab import process_stamp
+            (out/f'{mode}.process.json').write_text(json.dumps(dict(pid=child.pid,stamp=process_stamp(child.pid),
+                state_dir=str(out/mode),config=str(topology),mode=mode)))
             deadline=time.monotonic()+60
             while True:
                 require(child.poll() is None,f'{mode} receiver exited; inspect {out}/{mode}.log')
                 try:
-                    receiver_health(spec,c,args,mode)
+                    live=receiver_health(spec,c,args,mode)
                     break
                 except (OSError,RuntimeError):
                     require(time.monotonic()<deadline,f'{mode} readiness timed out; retain child and inspect its log')
                     time.sleep(.2)
+            marker=out/f'{mode}.process.json'
+            record=json.loads(marker.read_text()); record['epoch']=live['epoch']
+            marker.write_text(json.dumps(record))
         runner.say(f'[READY] receivers={args.page_modes}; evidence={out}; Ctrl-C requests safe owned shutdown')
         while all(p.poll() is None for p in children): time.sleep(.5)
         raise RuntimeError('a receiver exited; inspect the owned receiver logs')
     except KeyboardInterrupt:
-        for child in children:
-            if child.poll() is None: child.send_signal(signal.SIGTERM)
-        for child in children:
-            try: child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                runner.say(f'[RETAINED] pid={child.pid}; active/quarantined target; no SIGKILL')
+        from callosum_benchmark_prepare import stop_receivers
+        try: runner.say(json.dumps(stop_receivers(out,spec,c,args)))
+        except Exception as error:
+            runner.say(f'[RETAINED] {error}; inspect owned process markers; no SIGKILL or reclaim')
     except BaseException:
         runner.say('[RETAINED] Inspect owned-pids.json. No child was killed or MR reclaimed.')
         raise
@@ -193,8 +207,32 @@ def run(spec,c,args,topology,receipt,private,env,out,runner):
                 require(pages.get('device_alignment_bytes')==2**21 and
                         pages.get('kernel_page_size_bytes')==2**21 and pages.get('virtual_alignment_2MiB'),
                         'CXL-2MiB case needs live DAX page evidence; no page-size fabrication or restart')
+    # Small correctness gate is automatic. The standalone mini is not a prerequisite.
+    smoke=[]
+    if 'local_numa' in args.backings:
+        from types import SimpleNamespace
+        small=SimpleNamespace(**dict(vars(args),sizes=[1],unit='MB',repetitions=1))
+        for mode in args.page_modes:
+            destination=out/('smoke-local_numa-'+mode)
+            command=dram_command(spec,small,topology,receipt,private,destination,mode,'sender',env)
+            command+=['--smoke-bytes','1000000']
+            runner.remote_mutation_possible=True
+            runner.call('smoke-local_numa-'+mode,command,env)
+            proof=json.loads((destination/'summary.json').read_text())
+            require(proof['status']=='PASS','DRAM smoke failed; no performance cases start')
+            smoke.append(dict(case='local_numa-'+mode,status='PASS',evidence=str(destination)))
+    if 'cxl' in args.backings:
+        destination=out/'smoke-cxl'
+        benchmark=Path(__file__).resolve().parents[2]/'experiments/two_worker_metadata_lookup/run.sh'
+        runner.remote_mutation_possible=True
+        runner.call('smoke-cxl',['bash',benchmark,'--config',topology,'--source',spec['pair']['source'],
+            '--requester',spec['pair']['receiver'],'--sizes-bytes','1000000','--iterations','1','--warmup','0',
+            '--chunk-bytes','65536','--output',destination],env)
+        require(json.loads((destination/'summary.json').read_text())['status']=='PASS','CXL smoke failed')
+        smoke.append(dict(case='cxl',status='PASS',evidence=str(destination)))
+    (out/'smoke-results.json').write_text(json.dumps(smoke,indent=2))
     rows=[]
-    for backing in args.backings:
+    for backing in [b for b in ('local_numa','cxl') if b in args.backings]:
         for mode in args.page_modes:
             case=f'{backing}-{mode}'; destination=out/case
             if backing=='cxl':
@@ -211,6 +249,11 @@ def run(spec,c,args,topology,receipt,private,env,out,runner):
             runner.call(case,command,env)
             summary=json.loads((destination/'summary.json').read_text())
             require(summary['status']=='PASS','case did not complete')
+            expected={(block_bytes(n,args.unit),rep) for n in args.sizes for rep in range(args.repetitions)}
+            observed=[(r['block_bytes'],r.get('repetition',0)) for r in summary['results']]
+            require(len(observed)==len(expected) and set(observed)==expected and
+                    all(r['bytes']==TOTAL_BYTES and r.get('measurement_kind','PERFORMANCE')=='PERFORMANCE'
+                        for r in summary['results']),'incomplete or smoke-only case cannot enter performance report')
             for row in summary['results']:
                 row.update(experiment_case=case,requested_page_mode=mode)
                 rows.append(row)
@@ -228,26 +271,120 @@ def run(spec,c,args,topology,receipt,private,env,out,runner):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['receive','run'])
+    parser.add_argument('action',choices=['init','prepare','provision-hugepages','retire','start-cxl','stop-receivers','receive','run'])
     parser.add_argument('--config',required=True)
     parser.add_argument('--node',required=True)
+    parser.add_argument('--work-dir',help='Preparation/evidence directory; defaults to runs/benchmark-prep/<node>')
+    parser.add_argument('--peer-report',help='Signed readiness.json from the other physical host')
+    parser.add_argument('--topology',help='init: existing approved topology, never generated device ownership')
+    parser.add_argument('--setup-run',help='init: existing local successful build receipt')
+    parser.add_argument('--peer-setup-run',help='init: peer build receipt path as used on that host')
+    parser.add_argument('--token-file',help='init: existing shared private token file')
+    parser.add_argument('--source',help='init: explicit source ID if absent from lab_run')
+    parser.add_argument('--receiver',help='init: explicit receiver ID if absent from lab_run')
+    parser.add_argument('--campaign-run',help='retire: old campaign; start-cxl: fresh campaign directory')
+    parser.add_argument('--ack-exclusive-campaign',action='store_true',
+                        help='retire: operator stopped canonical benchmark initiators; no unrelated/direct writers')
     parser.add_argument('--sizes',nargs='+',type=int)
-    parser.add_argument('--unit',choices=['MB','MiB'],default=os.environ.get('IO_UNIT','MiB'))
+    parser.add_argument('--unit',choices=['MB','MiB'],default=os.environ.get('IO_UNIT','MB'))
     parser.add_argument('--repetitions',type=int,default=3)
-    parser.add_argument('--backings',nargs='+',choices=['cxl','local_numa'],default=['cxl','local_numa'])
+    parser.add_argument('--backings',nargs='+',choices=['cxl','local_numa'],default=['local_numa','cxl'])
     parser.add_argument('--page-modes',nargs='+',choices=['native','huge2MB'],default=['native','huge2MB'])
-    args=parser.parse_args(); runner=None
+    args=parser.parse_args(); runner=None; phase='configuration'; work=None
+    transition_possible=False; host_resources_changed=False
     try:
         if args.sizes is None:
             args.sizes=[int(n) for n in os.environ.get('IO_SIZES','1 2 4 8 16 32 64 128').split()]
         require(len(set(args.backings))==len(args.backings) and len(set(args.page_modes))==len(args.page_modes),
                 'duplicate backing or page mode')
+        import callosum_benchmark_prepare as preparation
+        work=Path(args.work_dir or (Path(__file__).resolve().parents[2]/'runs/benchmark-prep'/args.node)).resolve()
+        if args.action=='init':
+            print(json.dumps(preparation.initialize(args.config,args),indent=2)); return 0
+        if args.action in ('prepare','provision-hugepages'):
+            phase=args.action
+            report=preparation.inspect(args.config,args,work,load)
+            if args.action=='provision-hugepages':
+                require(sys.platform=='linux' and os.geteuid()==0,'provision-hugepages needs authorized Linux root')
+                require(report.get('local_addresses') and report.get('numa') and report.get('hugepages') is not None,
+                        'NUMA/hugepage inventory unavailable; no guessed provisioning')
+                needed=0 if report.get('reused_huge_receiver') else report['hugepages_required_for_new_buffer']
+                host_resources_changed=True
+                print(json.dumps(preparation.provision(report['numa']['node'],needed,work),indent=2))
+                print('Provisioning is not benchmark readiness. Repeat prepare on both hosts.')
+                return 0
+            print(json.dumps(report,indent=2))
+            return 0 if report['status']=='PREPARED_NOT_TESTED' else 1
         spec,c,topology,receipt,private,env,root=load(args.config,args)
+        phase=args.action
+        if args.action=='stop-receivers':
+            require(args.campaign_run and args.node==spec['pair']['receiver'],
+                    'stop-receivers requires the owned receiver --campaign-run and receiver node')
+            os.environ['CALLOSUM_CONTROL_TOKEN']=env['CALLOSUM_CONTROL_TOKEN']
+            transition_possible=True
+            print(json.dumps(preparation.stop_receivers(args.campaign_run,spec,c,args),indent=2)); return 0
+        if args.action=='retire':
+            require(args.campaign_run,'retire requires --campaign-run for the owned retained services')
+            transition_possible=True
+            print(json.dumps(preparation.retire(args.campaign_run,args.node,env['CALLOSUM_CONTROL_TOKEN'],
+                  work,args.peer_report,args.ack_exclusive_campaign),indent=2)); return 0
+        if args.action=='start-cxl':
+            require(args.campaign_run and args.peer_report,'start-cxl requires a fresh --campaign-run and peer retired.json')
+            local=preparation.read_proof(work/'retired.json',env['CALLOSUM_CONTROL_TOKEN'])
+            peer=preparation.read_proof(args.peer_report,env['CALLOSUM_CONTROL_TOKEN'])
+            require({local.get('node'),peer.get('node')}==set(spec['pair'].values()) and
+                    all(r.get('status')=='RETIRED_NOT_RECLAIMED' for r in (local,peer)) and
+                    local['fingerprint']==peer['fingerprint'] and local['frozen']==peer['frozen'],
+                    'both old participants must be retired before fresh startup')
+            from callosum_lab import process_stamp
+            require(process_stamp(local['agent_exit']['pid'])!=local['agent_exit']['stamp'],
+                    'old local participant is still running')
+            require(os.environ.get('CALLOSUM_DESTRUCTIVE_ACK')=='1',
+                    'start-cxl needs explicit exclusive-range authorization; prepare/init do not authorize DAX writes')
+            from callosum_lab import main as lab_main
+            source=Path(__file__).resolve().parents[1]; campaign=Path(args.campaign_run).resolve()
+            claim=Path(local['campaign'])/'successor.json'
+            intended=dict(campaign=str(campaign),fingerprint=c['fingerprint'])
+            if claim.exists():
+                require(json.loads(claim.read_text())==intended,
+                        'old retirement proof already assigned to a different successor; do not delete the claim')
+            else:
+                with claim.open('x') as stream: json.dump(intended,stream)
+            if not (campaign/'setup.json').exists():
+                preparation.adopt_build(source,receipt,campaign,env)
+            input_hash=hashlib.sha256(Path(args.config).read_bytes()).hexdigest()
+            # Canonical launcher constructs child environments from this process.
+            # Apply the same reviewed transport knobs used by the DRAM cases.
+            for key in tuple(os.environ):
+                if key.startswith('MC_'): os.environ.pop(key)
+            os.environ.update({k:v for k,v in env.items() if k.startswith('MC_')})
+            transition_possible=True
+            code=lab_main(['--action','node','--root',str(source.parent),'--run-dir',str(campaign),
+                '--node-id',args.node,'--config',str(topology),'--token-file',str(private),
+                '--python',env['PYTHON_BIN'],'--skip-apt'])
+            if code==0:
+                require(hashlib.sha256(Path(args.config).read_bytes()).hexdigest()==input_hash,
+                        'matrix config changed during startup; services retained; no configuration overwritten')
+                spec['runtimes'][args.node]={'setup_run':str(campaign)}
+                preparation.archive(Path(args.config).resolve().parent,Path(args.config).name,spec)
+            return code
+        require(args.peer_report,'run prepare on both hosts, exchange readiness.json, then supply --peer-report; no service started')
+        peer=preparation.verify_peer(args.peer_report,env['CALLOSUM_CONTROL_TOKEN'],c,spec,args)
+        local=preparation.inspect(args.config,args,work,load)
+        require(local['status']=='PREPARED_NOT_TESTED',f'local preparation BLOCKED; inspect {work}/readiness.json')
         require(sys.platform=='linux','matrix execution requires the Linux lab; portable tests are separate')
+        # Raise only this process's soft limit within the existing hard limit.
+        # Children inherit it. Preparation already checked the hard limit.
+        soft,hard=resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        needed=local['memlock']['required']
+        if soft!=resource.RLIM_INFINITY and soft<needed:
+            resource.setrlimit(resource.RLIMIT_MEMLOCK,(needed,hard))
         os.environ['CALLOSUM_CONTROL_TOKEN']=env['CALLOSUM_CONTROL_TOKEN']
         root.mkdir(parents=True,exist_ok=True)
         out=Path(tempfile.mkdtemp(prefix=f'matrix-{args.node}-',dir=root))
         runner=Runner(out); runner.remote_mutation_possible=False
+        (out/'local-readiness.json').write_text(json.dumps(local,indent=2))
+        (out/'peer-readiness.json').write_text(json.dumps(peer,indent=2))
         public=dict(spec); public['token_file']='[private file path omitted]'
         (out/'experiment.json').write_text(json.dumps(dict(action=args.action,node=args.node,
             sizes=args.sizes,unit=args.unit,repetitions=args.repetitions,backings=args.backings,
@@ -258,12 +395,16 @@ def main():
         (receive if args.action=='receive' else run)(spec,c,args,topology,receipt,private,env,out,runner)
         return 0
     except Exception as error:
-        failure=dict(status='FAIL',stage=runner.stage if runner else 'configuration',error=str(error),
-                     evidence=str(runner.run_dir) if runner else None,
+        failure=dict(status='FAIL',stage=runner.stage if runner else phase,error=str(error),
+                     evidence=str(runner.run_dir) if runner else (str(work) if work and phase!='configuration' else None),
                      owned_children_started=list(runner.children) if runner else [],
                      rdma_work_possible=bool(runner and runner.remote_mutation_possible),
-                     action=('Retain owned processes and existing mappings/journals. No automatic reclaim.'
-                             if runner and (runner.children or runner.remote_mutation_possible) else
+                     owned_service_transition_possible=transition_possible,
+                     hugepage_pool_change_possible=host_resources_changed,
+                     action=('Retain owned processes, mappings and journals; inspect transition evidence. No automatic reclaim.'
+                             if transition_possible or runner and (runner.children or runner.remote_mutation_possible) else
+                             'No service or WRITE started. A partial NUMA HugeTLB change may remain; inspect hugepage-provision.json. No rollback/shrink.'
+                             if host_resources_changed else
                              'No new service or WRITE started. Correct configuration/resources and rerun.'))
         if runner: (runner.run_dir/'failure.json').write_text(json.dumps(failure,indent=2))
         print(json.dumps(failure,indent=2),file=sys.stderr)

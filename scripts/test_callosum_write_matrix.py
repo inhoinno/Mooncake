@@ -97,12 +97,17 @@ class MatrixTest(unittest.TestCase):
             spec,c,topology,receipt,private,env,_=matrix.load(path,args)
             args.sizes=[1]; args.repetitions=1
             out=root/'output'; out.mkdir(); runner=Runner(out)
-            commands=[]
+            commands=[]; stages=[]
             def call(stage,command,*a,**kw):
+                stages.append(stage)
                 if stage=='cxl-status-preflight':
                     return json.dumps(dict(fingerprint=c['fingerprint'],topology_verified=True,
                         mr_pages={n:dict(device_alignment_bytes=2**21,kernel_page_size_bytes=2**21,
                                          virtual_alignment_2MiB=True) for n in ('a1','b1')}))
+                if stage.startswith('smoke-'):
+                    destination=Path(command[command.index('--output')+1]); destination.mkdir()
+                    (destination/'summary.json').write_text(json.dumps(dict(status='PASS')))
+                    return
                 commands.append(command)
                 if stage.startswith('cxl'):
                     mini=json.loads(Path(command[-1]).read_text()); destination=Path(mini['output'])
@@ -121,15 +126,91 @@ class MatrixTest(unittest.TestCase):
                      patch.object(matrix,'receiver_health',return_value={}), \
                      patch.object(matrix,'hugepage_capacity',return_value={}), \
                      patch.object(matrix.resource,'getrlimit',return_value=(matrix.resource.RLIM_INFINITY,)*2), \
+                     patch.object(matrix,'TOTAL_BYTES',2*1024**2), \
                      contextlib.redirect_stdout(io.StringIO()):
                     matrix.run(spec,c,args,topology,receipt,private,env,out,runner)
                 result=json.loads((out/'summary.json').read_text())
                 self.assertEqual(len(commands),4)
+                self.assertEqual(stages,['cxl-status-preflight','smoke-local_numa-native',
+                    'smoke-local_numa-huge2MB','smoke-cxl','local_numa-native',
+                    'local_numa-huge2MB','cxl-native','cxl-huge2MB'])
                 self.assertEqual(len(result['report']['aggregates']),4)
-                self.assertEqual(result['results'][1]['mr_page_mode'],'native')
-                self.assertEqual(result['results'][1]['requested_page_mode'],'huge2MB')
+                checked=next(r for r in result['results'] if r['experiment_case']=='cxl-huge2MB')
+                self.assertEqual(checked['mr_page_mode'],'native')
+                self.assertEqual(checked['requested_page_mode'],'huge2MB')
+                self.assertTrue((out/'smoke-results.json').exists())
                 self.assertTrue((out/'requests.csv').exists())
                 self.assertIn('not a forced 4 KiB/2 MiB A/B',(out/'report.md').read_text())
+            finally: runner.log.close()
+
+    def test_repeat_receive_reuses_compatible_owners_without_second_allocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); path,args=self.fixture(root); args.action='receive'; args.node='a1'
+            spec,c,topology,receipt,private,env,_=matrix.load(path,args)
+            out=root/'receive'; out.mkdir(); runner=Runner(out)
+            try:
+                with patch.object(matrix,'receiver_health',return_value={}), \
+                     patch.object(matrix.subprocess,'Popen') as start, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    matrix.receive(spec,c,args,topology,receipt,private,env,out,runner)
+                start.assert_not_called(); self.assertFalse((out/'owned-pids.json').exists())
+            finally: runner.log.close()
+
+    def test_receiver_seal_refuses_active_or_unknown_then_blocks_new_target(self):
+        receiver=dram.Receiver(SimpleNamespace(capacity=4096),'model-segment','a1','b1','fp',{},Path('/unused'))
+        for state in ('ACTIVE','QUARANTINED'):
+            receiver.state=state
+            with self.assertRaisesRegex(RuntimeError,'active/quarantined'):
+                receiver.handle('seal',{})
+            self.assertFalse(receiver.sealed)
+        receiver.state='IDLE'
+        sealed=receiver.handle('seal',{})
+        self.assertTrue(receiver.handle('health',{})['sealed'])
+        self.assertEqual(sealed['epoch'],receiver.description['epoch'])
+        with self.assertRaisesRegex(RuntimeError,'busy or quarantined'):
+            receiver.handle('prepare',{})
+
+    def test_not_ready_receiver_or_failed_smoke_starts_no_performance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); path,args=self.fixture(root)
+            spec,c,topology,receipt,private,env,_=matrix.load(path,args)
+            args.backings=['local_numa']; args.page_modes=['native']; args.sizes=[1]
+            out=root/'test'; out.mkdir(); runner=Runner(out)
+            try:
+                with patch.object(matrix,'receiver_health',side_effect=RuntimeError('receiver not ready')), \
+                     patch.object(Runner,'call') as invoke:
+                    with self.assertRaisesRegex(RuntimeError,'receiver not ready'):
+                        matrix.run(spec,c,args,topology,receipt,private,env,out,runner)
+                    invoke.assert_not_called()
+                with patch.object(matrix,'receiver_health',return_value={}), \
+                     patch.object(matrix.resource,'getrlimit',return_value=(matrix.resource.RLIM_INFINITY,)*2), \
+                     patch.object(Runner,'call',side_effect=RuntimeError('smoke failed')) as invoke:
+                    with self.assertRaisesRegex(RuntimeError,'smoke failed'):
+                        matrix.run(spec,c,args,topology,receipt,private,env,out,runner)
+                    self.assertEqual(invoke.call_count,1)
+                    self.assertEqual(invoke.call_args.args[0],'smoke-local_numa-native')
+                self.assertFalse((out/'summary.json').exists())
+            finally: runner.log.close()
+
+    def test_incomplete_trial_never_produces_matrix_performance_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); path,args=self.fixture(root)
+            spec,c,topology,receipt,private,env,_=matrix.load(path,args)
+            args.backings=['local_numa']; args.page_modes=['native']; args.sizes=[1]; args.repetitions=1
+            out=root/'test'; out.mkdir(); runner=Runner(out)
+            def call(stage,command,*a,**kw):
+                destination=Path(command[command.index('--output')+1]); destination.mkdir()
+                result=dict(status='PASS')
+                if not stage.startswith('smoke-'):
+                    result['results']=[dict(block_bytes=1024**2,repetition=0,bytes=1)]
+                (destination/'summary.json').write_text(json.dumps(result))
+            try:
+                with patch.object(matrix,'receiver_health',return_value={}), \
+                     patch.object(matrix.resource,'getrlimit',return_value=(matrix.resource.RLIM_INFINITY,)*2), \
+                     patch.object(Runner,'call',side_effect=call):
+                    with self.assertRaisesRegex(RuntimeError,'incomplete or smoke-only'):
+                        matrix.run(spec,c,args,topology,receipt,private,env,out,runner)
+                self.assertFalse((out/'summary.json').exists()); self.assertFalse((out/'report.md').exists())
             finally: runner.log.close()
 
     def test_status_shell_help_and_missing_config_need_no_native(self):

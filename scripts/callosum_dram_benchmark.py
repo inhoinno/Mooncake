@@ -193,7 +193,11 @@ class Receiver:
     def handle(self, method, d):
         with self.lock:
             if method == 'health':
-                return dict(self.description, state=self.state)
+                return dict(self.description, state=self.state,sealed=self.sealed)
+            if method == 'seal':
+                require(self.state=='IDLE','active/quarantined receiver cannot be sealed or stopped')
+                self.sealed=True
+                return dict(sealed=True,state='IDLE',epoch=self.description['epoch'])
             if method == 'prepare':
                 require(not self.sealed and self.state == 'IDLE', 'receiver is busy or quarantined')
                 require(d['fingerprint'] == self.description['fingerprint'] and
@@ -285,7 +289,7 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
             samples = []
             try:
                 result = write_loop(write, memory.address, target['remote_base'], length,
-                                    TOTAL_BYTES, length,samples)
+                                    getattr(args,'smoke_bytes',0) or TOTAL_BYTES, length,samples)
                 observed=dict(result,status='PENDING_VALIDATION',attempt=identity,path_mode='dram_rdma_write')
                 save(output/f'observed-{identity}.json',observed)
                 write_request_csv(output/f'observed-{identity}.csv',observed)
@@ -317,6 +321,7 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                 sender_before=before, sender_after=after, sender_placement=local_placement,
                 store_compatible=False, gpu_delivery_proven=False, serving_proven=False)
             result.update(source=node['id'],receiver_node=peer['id'],mr_page_mode=page_mode,
+                          measurement_kind='CORRECTNESS_SMOKE' if getattr(args,'smoke_bytes',0) else 'PERFORMANCE',
                           mr_pages={node['id']:getattr(memory,'page_evidence',None),
                                     peer['id']:health.get('mr_pages')})
             result = enrich_trial(result)
@@ -360,6 +365,8 @@ def main():
     parser.add_argument('--unit', choices=['MB', 'MiB'], default='MiB')
     parser.add_argument('--repetitions', type=int, default=3)
     parser.add_argument('--warmup-blocks', type=int, default=0)
+    parser.add_argument('--smoke-bytes',type=int,default=0,
+                        help='Explicit correctness-only byte count; not a performance trial')
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     output = Path(args.output)
@@ -370,6 +377,9 @@ def main():
         require(sys.platform == 'linux', 'real DRAM RDMA benchmark requires Linux')
         require(0 < args.repetitions <= 100 and args.warmup_blocks >= 0 and
                 len(set(args.sizes)) == len(args.sizes), 'invalid sweep settings')
+        require(args.smoke_bytes>=0 and (not args.smoke_bytes or
+                (len(args.sizes)==1 and args.repetitions==1 and args.warmup_blocks==0
+                 and args.smoke_bytes<=block_bytes(args.sizes[0],args.unit))), 'invalid correctness-only volume')
         require(1 <= args.control_port <= 65535 and 1 <= args.te_port <= 65535,
                 'invalid benchmark port')
         receipt = setup_environment(args.setup_run)
@@ -392,6 +402,9 @@ def main():
         require(os.environ['MC_NUM_QP_PER_EP'] == '16', 'benchmark requires 16 configured QPs')
         capacity = allocation_geometry(max(block_bytes(n, args.unit) for n in args.sizes),args.page_mode)
         soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        if soft!=resource.RLIM_INFINITY and soft<capacity and (hard==resource.RLIM_INFINITY or hard>=capacity):
+            resource.setrlimit(resource.RLIMIT_MEMLOCK,(capacity,hard))
+            soft,hard=resource.getrlimit(resource.RLIMIT_MEMLOCK)
         require(soft == resource.RLIM_INFINITY or soft >= capacity, 'raise memlock before registration')
         output.mkdir(parents=True, exist_ok=False)
         output_created = True
