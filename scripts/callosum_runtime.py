@@ -533,6 +533,8 @@ class Master:
                 self.db.execute('INSERT OR IGNORE INTO pools VALUES (?,4096)', (pool,))
             self.db.execute("UPDATE operations SET state='QUARANTINED' WHERE state NOT IN ('COMMITTED','QUARANTINED')")
         self.topology_ok = False
+        self.startup_aborted = bool(self.db.execute(
+            "SELECT 1 FROM settings WHERE key='startup_aborted'").fetchone())
 
     def node(self, identity):
         return next(n for n in self.c['nodes'] if n['id'] == identity)
@@ -563,6 +565,23 @@ class Master:
                             (identity, state, json.dumps(record)))
 
     def handle(self, method, d):
+        if method == 'abort_empty_startup':
+            # This is not DMA drain or campaign cleanup. Close admission before
+            # stopping only a coordinator that never admitted a participant.
+            with self.lock:
+                require(d.get('fingerprint') == self.c['fingerprint'], 'startup abort configuration mismatch')
+                counts = {table:self.db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+                          for table in ('members','objects','operations')}
+                allocated = self.db.execute('SELECT 1 FROM pools WHERE next != 4096').fetchone()
+                require(not any(counts.values()) and not allocated and not self.topology_ok,
+                        'startup is not empty; retain coordinator, participants and arenas')
+                with self.db:
+                    self.db.execute("INSERT OR REPLACE INTO settings VALUES ('startup_aborted','1')")
+                self.startup_aborted = True
+                return dict(startup_aborted=True, no_participants_admitted=True, reclaimed=False)
+        if method != 'status':
+            with self.lock:
+                require(not self.startup_aborted, 'startup admission is closed; retain this journal')
         if method == 'transport_benchmark':
             return self.transport_benchmark(d)
         if method == 'fetch':
@@ -581,6 +600,8 @@ class Master:
                     d.get('implementation_sha256') == IMPLEMENTATION_SHA256,
                     'registration/code ABI mismatch')
             with self.lock:
+                # A registration health RPC can race the empty-startup abort.
+                require(not self.startup_aborted, 'startup admission is closed; registration refused')
                 old = self.db.execute('SELECT descriptor FROM members WHERE id=?', (d['id'],)).fetchone()
                 require(not old or json.loads(old[0]) == d,
                         'worker restart detected; old remote targets may be live; arena remains quarantined')
@@ -590,6 +611,8 @@ class Master:
         if method == 'status':
             with self.lock:
                 return dict(mode=self.c['mode'], evidence_class='TRANSFER_ONLY',
+                    fingerprint=self.c['fingerprint'], startup_aborted=self.startup_aborted,
+                    registered_nodes=[row[0] for row in self.db.execute('SELECT id FROM members ORDER BY id')],
                     topology_verified=self.topology_ok,
                     operations=[dict(id=i, state=s) for i,s in self.db.execute('SELECT id,state FROM operations')])
         if method == 'preflight':

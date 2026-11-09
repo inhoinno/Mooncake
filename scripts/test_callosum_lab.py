@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -187,6 +188,207 @@ class CheckoutCommandTest(unittest.TestCase):
         git(source,'add','scripts/callosum_lab.py')
         git(source,'commit','-m','fixture new engine revision')
         self.assertTrue(any('gitlink' in issue for issue in lab.check_delivery(root)['issues']))
+
+
+class StartupSafetyTest(unittest.TestCase):
+    def master_fixture(self):
+        import callosum_runtime as runtime
+        directory=tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root=Path(directory.name)
+        config_path=root/'config.json'
+        config_path.write_text(json.dumps(LabTest.node_manifest()))
+        config=runtime.config(config_path)
+        log=runtime.Log(root/'master.jsonl','master')
+        self.addCleanup(log.file.close)
+        master=runtime.Master(config,root/'master.sqlite',log)
+        self.addCleanup(master.db.close)
+        return runtime,config,master,root,log
+
+    def test_empty_startup_abort_is_persistent_and_idempotent(self):
+        runtime,config,master,root,log=self.master_fixture()
+        data=dict(fingerprint=config['fingerprint'])
+        first=master.handle('abort_empty_startup',data)
+        self.assertEqual(master.handle('abort_empty_startup',data),first)
+        self.assertTrue(first['no_participants_admitted'])
+        self.assertFalse(first['reclaimed'])
+        for method in ('register','seed','fetch','preflight','transport_benchmark'):
+            with self.assertRaisesRegex(RuntimeError,'admission is closed'):
+                master.handle(method,{})
+        restarted=runtime.Master(config,root/'master.sqlite',log)
+        self.addCleanup(restarted.db.close)
+        self.assertTrue(restarted.handle('status',{})['startup_aborted'])
+        with self.assertRaisesRegex(RuntimeError,'admission is closed'):
+            restarted.handle('preflight',{})
+
+    def test_startup_abort_refuses_registered_used_and_quarantined_campaigns(self):
+        for kind in ('member','allocation','object','committed','quarantined','topology'):
+            with self.subTest(kind=kind):
+                runtime,config,master,_,_=self.master_fixture()
+                with master.db:
+                    if kind=='member':
+                        master.db.execute("INSERT INTO members VALUES ('b1','{}')")
+                    elif kind=='allocation':
+                        master.allocate('A',4096)
+                    elif kind=='object':
+                        master.db.execute("INSERT INTO objects VALUES ('key','A','{}')")
+                    elif kind in ('committed','quarantined'):
+                        master.operation('old',kind.upper(),{})
+                    else:
+                        master.topology_ok=True
+                with self.assertRaisesRegex(RuntimeError,'startup is not empty'):
+                    master.handle('abort_empty_startup',dict(fingerprint=config['fingerprint']))
+                self.assertFalse(master.startup_aborted)
+
+    def test_registration_racing_abort_cannot_commit_a_late_member(self):
+        runtime,config,master,_,_=self.master_fixture()
+        descriptor=dict(id='b1',pool='B',fingerprint=config['fingerprint'],abi_version=2,
+                        runtime_sha256=runtime.RUNTIME_SHA256,implementation_sha256=runtime.IMPLEMENTATION_SHA256)
+        entered,release=threading.Event(),threading.Event()
+        errors=[]
+        def health(*args,**kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('fixture release timeout')
+            return descriptor
+        def register():
+            try:
+                master.handle('register',descriptor)
+            except Exception as error:
+                errors.append(str(error))
+        with patch.object(runtime,'rpc',side_effect=health):
+            worker=threading.Thread(target=register)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                master.handle('abort_empty_startup',dict(fingerprint=config['fingerprint']))
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(any('registration refused' in error for error in errors))
+        self.assertEqual(master.handle('status',{})['registered_nodes'],[])
+
+    def test_worker_restart_does_not_clear_old_epoch_or_allow_empty_cleanup(self):
+        runtime,config,master,_,_=self.master_fixture()
+        old=dict(id='b1',pool='B',fingerprint=config['fingerprint'],abi_version=2,epoch='old',
+                 runtime_sha256=runtime.RUNTIME_SHA256,implementation_sha256=runtime.IMPLEMENTATION_SHA256)
+        with master.db:
+            master.db.execute('INSERT INTO members VALUES (?,?)',('b1',json.dumps(old)))
+        replacement=dict(old,epoch='new')
+        with patch.object(runtime,'rpc',return_value=replacement):
+            with self.assertRaisesRegex(RuntimeError,'worker restart detected'):
+                master.handle('register',replacement)
+        self.assertEqual(json.loads(master.db.execute('SELECT descriptor FROM members').fetchone()[0]),old)
+        with self.assertRaisesRegex(RuntimeError,'startup is not empty'):
+            master.handle('abort_empty_startup',dict(fingerprint=config['fingerprint']))
+
+    def test_startup_gate_aggregates_permissions_memlock_and_ports(self):
+        config=LabTest.node_manifest()
+        runner=Mock()
+        with patch.object(lab.os,'open',side_effect=PermissionError(13,'Permission denied')), \
+                patch.object(lab.os,'geteuid',return_value=1000), \
+                patch.object(lab.resource,'getrlimit',return_value=(8388608,8388608)), \
+                patch.object(lab,'port_in_use',return_value=True), \
+                patch.object(lab,'prepare') as prepare,patch.object(lab,'start_service') as start:
+            config['pools']['A']['capacity']=1073741824
+            with self.assertRaises(lab.ConfigurationError) as caught:
+                lab.startup_checks(config,'a1',runner)
+        self.assertEqual(len(caught.exception.issues),4)
+        self.assertEqual(runner.stage,'local-startup-validation')
+        prepare.assert_not_called()
+        start.assert_not_called()
+
+    def test_startup_gate_only_opens_and_closes_authorized_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'owned-fixture'
+            path.write_bytes(b'unchanged')
+            config=LabTest.node_manifest()
+            config['nodes'][0]['path']=str(path)
+            with patch.object(lab.resource,'getrlimit',return_value=(lab.resource.RLIM_INFINITY,)*2), \
+                    patch.object(lab,'port_in_use',return_value=False):
+                lab.startup_checks(config,'a1',Mock())
+            self.assertEqual(path.read_bytes(),b'unchanged')
+
+    def test_existing_participant_and_old_coordinator_are_not_restarted(self):
+        valid=dict(fingerprint='same',startup_aborted=False,registered_nodes=[])
+        lab.check_peer_campaign(valid,'same','b1')
+        for status in ({},dict(valid,fingerprint='other'),dict(valid,startup_aborted=True),
+                       dict(valid,registered_nodes=['b1'])):
+            with self.assertRaises(RuntimeError):
+                lab.check_peer_campaign(status,'same','b1')
+
+    def test_startup_failure_precedes_build_and_service_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/'Mooncake-dev/scripts').mkdir(parents=True)
+            (root/'Mooncake-dev/scripts/callosum_runtime.py').write_text('# source fixture')
+            config=root/'config.json'
+            config.write_text(json.dumps(LabTest.node_manifest()))
+            token=root/'control.token'
+            token.write_text('private-fixture-control-token-'*2)
+            token.chmod(0o600)
+            args=SimpleNamespace(config=str(config),token_file=str(token),node_id='a1')
+            runner=lab.Runner(root/'evidence')
+            try:
+                with patch.object(lab.sys,'platform','linux'), \
+                        patch.dict(os.environ,CALLOSUM_DESTRUCTIVE_ACK='1'), \
+                        patch.object(lab,'inventory',return_value=LabTest.inventoried_host()), \
+                        patch.object(lab,'startup_checks',side_effect=lab.ConfigurationError(['DAX permission denied'])), \
+                        patch.object(lab,'prepare') as prepare,patch.object(lab,'start_service') as start:
+                    with self.assertRaisesRegex(RuntimeError,'DAX permission denied'):
+                        lab.node_run(root,root/'evidence',args,runner)
+                self.assertEqual(runner.commands_started,[])
+                prepare.assert_not_called()
+                start.assert_not_called()
+            finally:
+                runner.log.close()
+
+    def test_rollback_only_stops_empty_owned_coordinator(self):
+        for kind in ('empty','registered','live-agent','wrong-pid','wrong-command','unsealed'):
+            with self.subTest(kind=kind),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                (root/'Mooncake-dev/scripts').mkdir(parents=True)
+                (root/'Mooncake-dev/scripts/callosum_runtime.py').write_text('# source fixture')
+                run=root/'evidence'
+                runner=lab.Runner(run)
+                master=Mock(pid=123)
+                master.poll.return_value=None
+                runner.children['master']=master
+                if kind=='live-agent':
+                    agent=Mock()
+                    agent.poll.return_value=None
+                    runner.children['a1']=agent
+                (run/'master.process.json').write_text(json.dumps(dict(pid=321 if kind=='wrong-pid' else 123,
+                    stamp='same',config='/owned/config',state_dir='/owned/state')))
+                (run/'control.token').write_text('fixture-shared-token-'*3)
+                runtime=Mock()
+                runtime.config.return_value=dict(master='http://127.0.0.1:19100',fingerprint='same')
+                runtime.rpc.return_value=dict(startup_aborted=kind!='unsealed',no_participants_admitted=True)
+                if kind=='registered':
+                    runtime.rpc.side_effect=RuntimeError('startup is not empty')
+                try:
+                    with patch.object(lab,'process_stamp',return_value='same'), \
+                            patch.object(lab.importlib,'import_module',return_value=runtime), \
+                            patch.object(lab.os,'pidfd_open',return_value=99,create=True), \
+                            patch.object(lab.signal,'pidfd_send_signal',create=True) as stop, \
+                            patch.object(lab.os,'close'), \
+                            patch.object(Path,'read_bytes',return_value=(b'unrelated' if kind=='wrong-command' else
+                                b'python\0/owned/config\0/owned/state\0')), \
+                            patch.dict(os.environ,CALLOSUM_CONTROL_TOKEN='preserve-existing-env'):
+                        result=lab.rollback_empty_startup(root,run,runner)
+                        self.assertEqual(os.environ['CALLOSUM_CONTROL_TOKEN'],'preserve-existing-env')
+                    self.assertFalse(result['reclaimed'])
+                    if kind=='empty':
+                        self.assertEqual(result['status'],'STOPPED_EMPTY_COORDINATOR')
+                        stop.assert_called_once_with(99,lab.signal.SIGTERM)
+                        master.wait.assert_called_once_with(timeout=5)
+                    else:
+                        self.assertEqual(result['status'],'RETAINED')
+                        stop.assert_not_called()
+                        master.wait.assert_not_called()
+                finally:
+                    runner.log.close()
 
 
 class LabTest(unittest.TestCase):
@@ -562,17 +764,19 @@ class LabTest(unittest.TestCase):
             token.write_text('fixture-only-token-not-a-real-secret')
             token.chmod(0o600)
             args=SimpleNamespace(node_id=node_id,config=str(config),token_file=str(token),python=sys.executable)
-            status=dict(topology_verified=True,operations=[dict(state='COMMITTED')]*2)
+            status=dict(topology_verified=True,operations=[dict(state='COMMITTED')]*2,
+                        fingerprint='fixture-config',startup_aborted=False,registered_nodes=[])
             def rpc(url,method,*args,**kwargs):
                 if method=='health':
                     return dict(id=next(n['id'] for n in configured['nodes'] if n['url']==url))
                 return {'status':status,'register':dict(registered=True),
                         'dispatch_status':{'fixture-transfer':'DRAINED'}}[method]
-            runtime=SimpleNamespace(rpc=Mock(side_effect=rpc),config=Mock())
+            runtime=SimpleNamespace(rpc=Mock(side_effect=rpc),config=Mock(return_value=dict(fingerprint='fixture-config')))
             runner=Mock()
             with patch.object(lab.sys,'platform','linux'), \
                     patch.dict(os.environ,{'CALLOSUM_DESTRUCTIVE_ACK':'1'}), \
                     patch.object(lab,'inventory',return_value=self.inventoried_host()), \
+                    patch.object(lab,'startup_checks'),patch.object(lab,'port_in_use',return_value=False), \
                     patch.object(lab,'start_service') as start, \
                     patch.object(lab,'validate_node_traces',return_value=[dict(status='PASS',fixture=True)]), \
                     patch.object(lab.importlib,'import_module',return_value=runtime):

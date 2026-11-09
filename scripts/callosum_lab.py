@@ -86,6 +86,8 @@ class Runner:
         self.services_may_be_live = False
         self.configuration_effects = []
         self.commands_started = []
+        self.children = {}
+        self.device_open_checked = False
 
     def say(self, text):
         print(text, flush=True)
@@ -482,6 +484,7 @@ def start_service(root, run, role, node, runner):
         runner.services_may_be_live = True
         child = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=out,
                                  stderr=subprocess.STDOUT, start_new_session=True)
+        runner.children[name] = child
     marker.write_text(json.dumps(dict(pid=child.pid, stamp=process_stamp(child.pid),
         state_dir=str(state), config=str(run / 'topology.json'))))
     # Record ownership before waiting. On failure leave all resources/journals intact.
@@ -532,6 +535,58 @@ def stop_owned(run):
         results.append(dict(service=marker.stem, status='STOP_SIGNAL_SENT'))
     return dict(services=results, reclaimed=False,
                 warning='Stopping does NOT prove DMA drain. Retain all journals and extents; no restart/reuse.')
+
+
+def rollback_empty_startup(root, run, runner):
+    """Stop only this invocation's unused coordinator; never clear a campaign."""
+    master = runner.children.get('master')
+    if master is None:
+        return dict(status='NOT_APPLICABLE',reclaimed=False)
+    process_fd=None
+    try:
+        for name, child in runner.children.items():
+            require(name=='master' or child.poll() is not None,
+                    'local participant remains alive; retain all services')
+        record=json.loads((run/'master.process.json').read_text())
+        require(master.pid==record['pid'] and master.poll() is None
+                and process_stamp(master.pid)==record['stamp'] and record['stamp'] is not None,
+                'coordinator process ownership is unverified')
+        require(hasattr(os,'pidfd_open') and hasattr(signal,'pidfd_send_signal'),
+                'safe PID-bound signalling unavailable; retain coordinator')
+        process_fd=os.pidfd_open(master.pid,0)
+        require(process_stamp(master.pid)==record['stamp'], 'coordinator PID changed')
+        cmdline=Path(f'/proc/{master.pid}/cmdline').read_bytes().decode(errors='replace').split('\0')
+        require(record['state_dir'] in cmdline and record['config'] in cmdline,
+                'coordinator command does not match owned campaign')
+        sys.path.insert(0,str(source_path(root)/'scripts'))
+        runtime=importlib.import_module('callosum_runtime')
+        config=runtime.config(run/'topology.json')
+        secret=(run/'control.token').read_text().strip()
+        # The authenticated RPC seals registration under the authority lock.
+        # A status snapshot alone cannot authorize termination.
+        previous=os.environ.get('CALLOSUM_CONTROL_TOKEN')
+        try:
+            os.environ['CALLOSUM_CONTROL_TOKEN']=secret
+            sealed=runtime.rpc(config['master'],'abort_empty_startup',
+                dict(fingerprint=config['fingerprint']),timeout=5)
+        finally:
+            if previous is None:
+                os.environ.pop('CALLOSUM_CONTROL_TOKEN',None)
+            else:
+                os.environ['CALLOSUM_CONTROL_TOKEN']=previous
+        require(sealed.get('startup_aborted') is True and sealed.get('no_participants_admitted') is True,
+                'coordinator did not prove empty sealed startup')
+        signal.pidfd_send_signal(process_fd,signal.SIGTERM)
+        master.wait(timeout=5)
+        result=dict(status='STOPPED_EMPTY_COORDINATOR',reclaimed=False,
+            note='Admission sealed; owned coordinator exited. Keep files, registrations and arenas unchanged.')
+    except Exception as error:
+        result=dict(status='RETAINED',reason=str(error),reclaimed=False)
+    finally:
+        if process_fd is not None:
+            os.close(process_fd)
+    (run/'startup-cleanup.json').write_text(json.dumps(result,indent=2))
+    return result
 
 
 def remote_command(peer, command, tty=False, options=()):
@@ -690,6 +745,47 @@ class ConfigurationError(RuntimeError):
         super().__init__('; '.join(issues))
 
 
+def port_in_use(url):
+    endpoint=urlparse(url)
+    with socket.socket() as sock:
+        sock.settimeout(1)
+        return sock.connect_ex((endpoint.hostname,endpoint.port))==0
+
+
+def startup_checks(config, node_id, runner):
+    """Read/open-only checks before builds; no mmap, payload write or process kill."""
+    runner.stage='local-startup-validation'
+    node,launch=validate_launch_config(config,node_id)
+    issues=[]
+    try:
+        descriptor=os.open(node['path'],os.O_RDWR | os.O_CLOEXEC)
+    except OSError as error:
+        issues.append(f'DAX read/write open denied or unavailable: {node["path"]}: {error.strerror}. Use an authorized device account; no mapping was made')
+    else:
+        os.close(descriptor)
+        runner.device_open_checked=True
+    _,hard=resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    required=config['pools'][node['pool']]['capacity']
+    if os.geteuid()!=0 and hard!=resource.RLIM_INFINITY and hard<required:
+        issues.append(f'Memlock hard limit={hard} bytes is smaller than mapping={required}; obtain authorized locked-memory permission')
+    urls=[node['url']]
+    if node_id==launch['controller']:
+        urls.append(config['master'])
+    for url in urls:
+        if port_in_use(url):
+            issues.append(f'Port already occupied: {url}. Existing services are retained; use the existing campaign or inspect its owner/journal before stopping it. No process was killed')
+    if issues:
+        raise ConfigurationError(issues)
+
+
+def check_peer_campaign(status, fingerprint, node_id):
+    require(status.get('fingerprint')==fingerprint and status.get('startup_aborted') is False
+            and isinstance(status.get('registered_nodes'),list),
+            'coordinator campaign/version mismatch or admission closed; retain previous campaign')
+    require(node_id not in status['registered_nodes'],
+            'node already registered in this campaign; do not restart it or reuse its targets')
+
+
 def configuration_inputs(root, args):
     """Read-only input gate. Collect independent errors without importing native code."""
     issues, config, secret = [], None, None
@@ -811,6 +907,12 @@ def node_run(root, run, args, runner):
     (run/'inventory.json').write_text(json.dumps(inv,indent=2))
     runner.stage='local-device-validation'
     node = validate_node_extent(config,args.node_id,inv)
+    startup_checks(config,args.node_id,runner)
+    os.environ['CALLOSUM_CONTROL_TOKEN']=secret
+    fingerprint=runtime.config(args.config)['fingerprint']
+    if args.node_id!=launch['controller'] and port_in_use(config['master']):
+        runner.stage='existing-coordinator-validation'
+        check_peer_campaign(runtime.rpc(config['master'],'status',timeout=5),fingerprint,args.node_id)
     runner.call('host-preflight',['bash',root/'scripts/capture_preflight.sh','--output',run/'preflight',
         '--checkout',source,'--python',args.python,'--dax',selected['path']],clean_env())
     if not (run/'setup.json').exists():
@@ -831,7 +933,8 @@ def node_run(root, run, args, runner):
     wait_seconds = launch.get('wait_seconds',1800)
     runner.stage='service-readiness'
     if args.node_id != launch['controller']:
-        wait_rpc(runtime,config['master'],'status',wait_seconds,runner)
+        status=wait_rpc(runtime,config['master'],'status',wait_seconds,runner)
+        check_peer_campaign(status,fingerprint,args.node_id)
         start_service(root,run,'agent',args.node_id,runner)
         runner.say(f'[READY] node={args.node_id}; evidence={run}; services retained')
         return
@@ -1056,14 +1159,19 @@ def main(argv=None):
         return 0
     except (Exception,KeyboardInterrupt) as error:
         started=runner.services_may_be_live or any(run.glob('*.process.json'))
+        cleanup=rollback_empty_startup(root,run,runner)
+        unused_stopped=cleanup['status']=='STOPPED_EMPTY_COORDINATOR'
         failure=dict(status='FAIL',stage=runner.stage,error=str(error),evidence=str(run),
+            startup_cleanup=cleanup,
             issues=getattr(error,'issues',[str(error)]),
             local_services_started_this_run=started,
             side_effects=dict(evidence_directory_created=True,
                 configuration=runner.configuration_effects,commands_started=runner.commands_started,
+                device_open_checked=runner.device_open_checked,
                 device_access_possible=started),
-            retry_after_input_correction=not started,
-            action=('Retain all services, mappings, logs and journals. No automatic retry/reclaim.' if started
+            retry_after_input_correction=not started or (unused_stopped and set(runner.children)=={'master'}),
+            action=('The unused owned coordinator was stopped after admission was sealed. Keep all evidence; no mappings or arenas were reclaimed. Correct the startup error; earlier campaigns still require lifetime checks.' if unused_stopped else
+                    'Retain all services, mappings, logs and journals. No automatic retry/reclaim.' if started
                     else 'This invocation started no local service and mapped no DAX. Correct all listed inputs and rerun. Preserve any existing configuration; earlier campaigns require a separate lifetime check.'))
         (run/'failure.json').write_text(json.dumps(failure,indent=2))
         runner.say('\n'+json.dumps(failure,indent=2))

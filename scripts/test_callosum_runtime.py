@@ -17,6 +17,42 @@ import callosum_runtime as runtime
 
 
 class RuntimeTest(unittest.TestCase):
+    def test_preflight_empty_startup_abort(self):
+        import threading
+        import urllib.request
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            log=runtime.Log(root/'master.jsonl','master')
+            config=dict(fingerprint='empty-startup-fixture',mode='local-file-test',
+                        pools={p:dict(capacity=65536) for p in ('A','B')})
+            master=runtime.Master(config,root/'master.sqlite',log)
+            service=runtime.server('http://127.0.0.1:0',master)
+            worker=threading.Thread(target=service.serve_forever,daemon=True)
+            worker.start()
+            url=f'http://127.0.0.1:{service.server_address[1]}'
+            try:
+                with patch.dict(os.environ,CALLOSUM_CONTROL_TOKEN='startup-fixture-private-token-'*2):
+                    request=urllib.request.Request(url+'/abort_empty_startup',
+                        data=json.dumps(dict(fingerprint=config['fingerprint'])).encode(),
+                        headers={'Authorization':'Bearer wrong-token'})
+                    with urllib.request.urlopen(request,timeout=5) as response:
+                        denied=json.load(response)
+                    self.assertFalse(denied['ok'])
+                    self.assertFalse(master.startup_aborted)
+                    result=runtime.rpc(url,'abort_empty_startup',dict(fingerprint=config['fingerprint']))
+                    self.assertTrue(result['no_participants_admitted'])
+                    self.assertFalse(result['reclaimed'])
+                    self.assertEqual(result,runtime.rpc(url,'abort_empty_startup',dict(fingerprint=config['fingerprint'])))
+                    self.assertTrue(runtime.rpc(url,'status')['startup_aborted'])
+                    with self.assertRaisesRegex(RuntimeError,'admission is closed'):
+                        runtime.rpc(url,'register',{})
+            finally:
+                service.shutdown()
+                service.server_close()
+                worker.join(5)
+                master.db.close()
+                log.file.close()
+
     def test_initiation_native_file_path(self):
         import ctypes
         import hashlib
