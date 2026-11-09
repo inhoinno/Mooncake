@@ -14,6 +14,7 @@ import json
 import math
 import mmap
 import os
+import re
 from pathlib import Path
 import secrets
 import sqlite3
@@ -101,6 +102,10 @@ class Log:
 def config(path):
     c = json.loads(Path(path).read_text())
     require(c['mode'] in ('rdma', 'local-file-test'), 'unknown mode')
+    page_mode = c.get('mr_page_mode', 'native')
+    require(page_mode in ('native', 'huge2MB'), 'mr_page_mode must be native or huge2MB')
+    require(page_mode == 'native' or c['mode'] == 'rdma',
+            'huge2MB requires real devdax/RDMA, not file or anonymous DRAM')
     expected_path = 'direct_dax_write' if c['mode'] == 'rdma' else 'file_copy'
     require(c.get('path_mode', expected_path) == expected_path,
             'unsupported path_mode; staged WRITE is not implemented; no fallback')
@@ -148,6 +153,8 @@ def config(path):
                     alignment & (alignment-1) == 0 and
                     p['capacity'] % alignment == 0 and p.get('map_offset',0) % alignment == 0,
                     'invalid device mapping alignment')
+            if page_mode == 'huge2MB':
+                require(alignment == 2**21, 'huge2MB requires 2097152-byte DAX alignment')
         require(len(set(identities)) == 2, 'physical pools must be independent')
         require(all(n.get('te_endpoint') and n.get('rdma_device') for n in c['nodes']),
                 'explicit TE endpoint and RDMA device required per worker')
@@ -172,6 +179,45 @@ def config(path):
     return c
 
 
+def mapping_page_evidence(address, capacity, device, page_mode):
+    """Report kernel VMA geometry, not an RNIC translation-page guarantee.
+
+    Device DAX selects its fault granularity from device alignment. MAP_HUGETLB
+    selects a different backing allocator and must not replace this mapping.
+    """
+    result = dict(mode=page_mode, backing='devdax', hugetlb=False,
+                  device_alignment_bytes=None, kernel_page_size_bytes=None,
+                  mmu_page_size_bytes=None, virtual_alignment_2MiB=address % 2**21 == 0,
+                  rnic_page_size_bytes=None, rnic_page_size_status='UNVERIFIED_DRIVER_SELECTED')
+    try:
+        info = os.stat(device)
+        require(stat.S_ISCHR(info.st_mode), 'expected DAX character device')
+        sysdev = Path(f'/sys/dev/char/{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}')
+        result['device_alignment_bytes'] = int((sysdev/'align').read_text().strip(), 0)
+        header = re.compile(r'^([0-9a-f]+)-([0-9a-f]+)\s')
+        selected = False
+        with open('/proc/self/smaps') as stream:
+            for line in stream:
+                match = header.match(line)
+                if match:
+                    if selected:
+                        break
+                    selected = int(match[1],16) == address and int(match[2],16) == address+capacity
+                elif selected and line.startswith(('KernelPageSize:', 'MMUPageSize:')):
+                    field = 'kernel_page_size_bytes' if line.startswith('Kernel') else 'mmu_page_size_bytes'
+                    result[field] = int(line.split()[1])*1024
+        result['vma_evidence_status'] = 'OBSERVED' if result['kernel_page_size_bytes'] else 'UNAVAILABLE'
+    except (OSError, ValueError, RuntimeError) as error:
+        result['vma_evidence_status'] = 'UNAVAILABLE'
+        result['evidence_error'] = str(error)
+    if page_mode == 'huge2MB':
+        require(result['device_alignment_bytes'] == 2**21 and
+                result['kernel_page_size_bytes'] == 2**21 and
+                result['virtual_alignment_2MiB'] and capacity % 2**21 == 0,
+                'huge2MB requires observed 2 MiB device/VMA geometry; no fallback or device reconfiguration')
+    return result
+
+
 class Mapping:
     def __init__(self, c, node):
         p = c['pools'][node['pool']]
@@ -179,16 +225,26 @@ class Mapping:
                 'set CALLOSUM_DESTRUCTIVE_ACK=1 for dedicated-arena access')
         self.capacity = p['capacity']
         self.fd = os.open(node['path'], os.O_RDWR)
-        info = os.fstat(self.fd)
-        offset = p.get('map_offset', 0)
-        if c['mode'] == 'rdma':
-            require(stat.S_ISCHR(info.st_mode), 'RDMA mode requires explicit devdax character device')
-        else:
-            require(stat.S_ISREG(info.st_mode) and info.st_size >= offset + self.capacity,
-                    'test pool file too small')
-        self.memory = mmap.mmap(self.fd, self.capacity, flags=mmap.MAP_SHARED,
-                                prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=offset)
-        self.address = ctypes.addressof(ctypes.c_char.from_buffer(self.memory))
+        try:
+            info = os.fstat(self.fd)
+            offset = p.get('map_offset', 0)
+            if c['mode'] == 'rdma':
+                require(stat.S_ISCHR(info.st_mode), 'RDMA mode requires explicit devdax character device')
+            else:
+                require(stat.S_ISREG(info.st_mode) and info.st_size >= offset + self.capacity,
+                        'test pool file too small')
+            self.memory = mmap.mmap(self.fd, self.capacity, flags=mmap.MAP_SHARED,
+                                    prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=offset)
+            self.address = ctypes.addressof(ctypes.c_char.from_buffer(self.memory))
+            self.page_evidence = (mapping_page_evidence(self.address,self.capacity,node['path'],
+                                  c.get('mr_page_mode','native')) if c['mode']=='rdma' else
+                                  dict(mode='native',backing='file',hugetlb=False))
+        except BaseException:
+            # Registration has not started. No engine or DMA can reference this mapping.
+            if hasattr(self,'memory'):
+                self.memory.close()
+            os.close(self.fd)
+            raise
 
     def bounds(self, offset, length):
         require(isinstance(offset, int) and isinstance(length, int) and
@@ -277,7 +333,7 @@ class Agent:
         if c.get('metadata') == 'P2PHANDSHAKE' and self.engine:
             self.segment = self.segment.rsplit(':', 1)[0] + ':' + str(self.engine.get_rpc_port())
         self.log.emit('agent_ready', pool=self.node['pool'], epoch=self.epoch,
-                      mode=c['mode'], evidence_class='TRANSFER_ONLY')
+                      mode=c['mode'], mr_pages=self.mapping.page_evidence, evidence_class='TRANSFER_ONLY')
 
     def descriptor(self):
         return dict(id=self.node['id'], pool=self.node['pool'],
@@ -286,6 +342,8 @@ class Agent:
                     segment=self.segment, fingerprint=self.c['fingerprint'], abi_version=2,
                     runtime_sha256=RUNTIME_SHA256,
                     implementation_sha256=IMPLEMENTATION_SHA256,
+                    transport_request_timing_version=1,
+                    mr_pages=self.mapping.page_evidence,
                     configured_qps=os.environ.get('MC_NUM_QP_PER_EP', 'default'))
 
     def handle(self, method, d):
@@ -334,16 +392,35 @@ class Agent:
                 require(d['transfer_id'] not in self.jobs, 'benchmark replay refused')
                 self.jobs[d['transfer_id']] = 'RUNNING'
             try:
+                samples = []
                 result = write_loop(lambda src,dst,n: self.engine.relay_write_batch_drained(
                     [target['segment']], [src], [dst], [n])[0],
                     self.mapping.address + extent['offset'], target['remote_base'],
-                    d['block_bytes'], TOTAL_BYTES, self.c.get('max_inflight_bytes',64*1024**2))
+                    d['block_bytes'], TOTAL_BYTES, self.c.get('max_inflight_bytes',64*1024**2),samples)
+                from callosum_benchmark_report import write_request_csv
+                observed = dict(result,status='PENDING_VALIDATION',transfer_id=d['transfer_id'],
+                                path_mode='direct_dax_write')
+                artifact = Path(self.log.file.name).parent / ('transport-observed-'+d['transfer_id']+'.json')
+                with artifact.open('x') as stream:
+                    json.dump(observed,stream)
+                write_request_csv(artifact.with_suffix('.csv'),observed)
                 self.jobs[d['transfer_id']] = 'DRAINED'
                 self.log.emit('transport_baseline_complete', transfer_id=d['transfer_id'],
-                              opcode='WRITE', actual_transport='rdma', **result)
+                              opcode='WRITE', actual_transport='rdma',
+                              **{k:v for k,v in result.items() if k != 'requests'})
                 return result
             except BaseException:
                 self.jobs[d['transfer_id']] = 'QUARANTINED'
+                try:
+                    artifact = Path(self.log.file.name).parent / ('transport-failed-'+d['transfer_id']+'.json')
+                    with artifact.open('x') as stream:
+                        partial=dict(status='FAIL',transfer_id=d['transfer_id'],requests=samples,
+                                     path_mode='direct_dax_write',block_bytes=d['block_bytes'])
+                        json.dump(partial,stream)
+                    from callosum_benchmark_report import write_request_csv
+                    write_request_csv(artifact.with_suffix('.csv'),partial)
+                except OSError:
+                    pass
                 raise
         if method == 'marker':
             # The first page is reserved for destructive topology challenges.
@@ -613,6 +690,10 @@ class Master:
                 return dict(mode=self.c['mode'], evidence_class='TRANSFER_ONLY',
                     fingerprint=self.c['fingerprint'], startup_aborted=self.startup_aborted,
                     registered_nodes=[row[0] for row in self.db.execute('SELECT id FROM members ORDER BY id')],
+                    benchmark_request_timing_versions={i:json.loads(v).get('transport_request_timing_version',0)
+                        for i,v in self.db.execute('SELECT id,descriptor FROM members')},
+                    mr_pages={i:json.loads(v).get('mr_pages')
+                        for i,v in self.db.execute('SELECT id,descriptor FROM members')},
                     topology_verified=self.topology_ok,
                     operations=[dict(id=i, state=s) for i,s in self.db.execute('SELECT id,state FROM operations')])
         if method == 'preflight':
@@ -697,12 +778,15 @@ class Master:
                     'baseline destination checksum mismatch')
             with self.lock:
                 self.operation(identity, 'DRAINED_RETAINED', dict(source=source,
-                    destination=destination,benchmark=True,result=result))
+                    destination=destination,benchmark=True,result={k:v for k,v in result.items() if k != 'requests'}))
             return dict(result, status='PASS', transfer_id=identity,
                         evidence_class='TRANSFER_ONLY', block_unit=d['block_unit'],
                         configured_qps=16, active_qps_verified=False,
                         qp_gate='INCOMPLETE_REQUIRES_ENDPOINT_EVIDENCE',
                         path_mode='direct_dax_write', actual_transport='rdma',
+                        mr_page_mode=self.c.get('mr_page_mode','native'),
+                        mr_pages={m['id']:m.get('mr_pages') for m in members
+                                  if m['id'] in (source_node['id'],receiver['id'])},
                         checksum_scope='final block window', store_compatible=False)
         except BaseException:
             with self.lock:
@@ -893,6 +977,7 @@ def main():
                      'batch_cap','max_inflight_bytes','fingerprint') if k in c}
         effective.setdefault('batch_cap', 32)
         effective.setdefault('max_inflight_bytes', 64*1024**2)
+        effective['mr_page_mode'] = c.get('mr_page_mode','native')
         effective['policy'] = dict(forced=True, transfer_us=-1, recompute_us=-1,
                                    margin_us=0, margin_fraction=0, uncertainty_us=0)
         effective['policy'].update(c.get('policy', {}))
@@ -931,10 +1016,15 @@ def main():
     elif args.role == 'transport-benchmark':
         require(args.node and args.receiver and args.block_size and args.block_unit,
                 'baseline requires --node source --receiver --block-size --block-unit')
+        wall_start = time.time_ns()
         start = time.monotonic_ns()
         result = rpc(c['master'], 'transport_benchmark', dict(node=args.node,receiver=args.receiver,
             key=args.key,block_size=args.block_size,block_unit=args.block_unit),timeout=1200)
         result['requester_rpc_ns'] = time.monotonic_ns()-start
+        result['controller_start_unix_ns'] = wall_start
+        result['controller_end_unix_ns'] = time.time_ns()
+        from callosum_benchmark_report import enrich_trial
+        result = enrich_trial(result)
         print(json.dumps(result,indent=2))
     else:
         node = next(n for n in c['nodes'] if n['id'] == args.node)

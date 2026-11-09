@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from callosum_runtime import config, require, rpc, server
 from callosum_transport_benchmark import SIZES, TOTAL_BYTES, block_bytes, write_loop
+from callosum_benchmark_report import write_report, write_request_csv, enrich_trial
 
 
 def source_identity():
@@ -111,15 +112,49 @@ def resident_pages(address, node, length, maps=None):
     return dict(pages_by_node=counts, kernel_page_bytes=page_size)
 
 
+def allocation_geometry(capacity, page_mode):
+    require(type(capacity) is int and capacity>0 and page_mode in ('native','huge2MB'),
+            'invalid DRAM allocation size/page mode')
+    huge=2**21
+    return ((capacity+huge-1)//huge)*huge if page_mode=='huge2MB' else capacity
+
+
+def hugepage_capacity(node, capacity, sysroot=Path('/sys')):
+    root=sysroot/f'devices/system/node/node{node}/hugepages/hugepages-2048kB'
+    free=int((root/'free_hugepages').read_text())
+    required=allocation_geometry(capacity,'huge2MB')//2**21
+    require(free>=required,
+            f'NUMA node {node} has {free} free 2 MiB HugeTLB pages; needs {required}. '
+            'Ask the lab owner to provision this node; no global hugepage settings are changed')
+    return dict(free_pages_before=free,required_pages=required,page_bytes=2**21)
+
+
 class Memory:
-    def __init__(self, capacity, node):
-        self.capacity, self.node = capacity, node
-        self.memory = mmap.mmap(-1, capacity, flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS,
+    def __init__(self, capacity, node, page_mode='native'):
+        self.capacity, self.node = allocation_geometry(capacity,page_mode), node
+        self.page_mode=page_mode
+        self.page_evidence=dict(mode=page_mode,backing='anonymous_dram',hugetlb=page_mode=='huge2MB',
+                               allocation_bytes=self.capacity,rnic_page_size_bytes=None,
+                               rnic_page_size_status='UNVERIFIED_DRIVER_SELECTED')
+        flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS
+        if page_mode=='huge2MB':
+            self.page_evidence.update(hugepage_capacity(node,self.capacity))
+            # Linux MAP_HUGETLB | (log2(2 MiB) << MAP_HUGE_SHIFT). Never use on DAX.
+            flags |= 0x40000 | (21 << 26)
+        self.memory = mmap.mmap(-1, self.capacity, flags=flags,
                                 prot=mmap.PROT_READ | mmap.PROT_WRITE)
-        self.address = ctypes.addressof(ctypes.c_char.from_buffer(self.memory))
-        bind_memory(self.address, capacity, node)
-        ctypes.memset(self.address, 0x5A, capacity)  # First touch, outside measurements.
-        self.placement = resident_pages(self.address, node, capacity)
+        try:
+            self.address = ctypes.addressof(ctypes.c_char.from_buffer(self.memory))
+            bind_memory(self.address, self.capacity, node)
+            ctypes.memset(self.address, 0x5A, self.capacity)  # First touch, outside measurements.
+            self.placement = resident_pages(self.address, node, self.capacity)
+            if page_mode=='huge2MB':
+                require(self.address % 2**21==0 and self.placement['kernel_page_bytes']==2**21,
+                        'HugeTLB allocation/page evidence mismatch; no fallback')
+            self.page_evidence.update(self.placement)
+        except BaseException:
+            self.memory.close()  # No engine registration exists yet.
+            raise
 
     def digest(self, length):
         require(0 < length <= self.capacity, 'digest outside DRAM window')
@@ -153,6 +188,7 @@ class Receiver:
                                 epoch=secrets.token_hex(16), segment=segment,
                                 capacity=memory.capacity, memory='dram', placement=placement,
                                 configured_qps=16, active_qps_verified=False, source_identity=source_identity())
+        self.description['mr_pages']=getattr(memory,'page_evidence',dict(mode='native'))
 
     def handle(self, method, d):
         with self.lock:
@@ -209,10 +245,17 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
     safety = safety if safety is not None else {}
     peer_url = f"http://{urlparse(peer['url']).hostname}:{args.control_port}"
     health = rpc(peer_url, 'health')
+    page_mode=getattr(args,'page_mode','native')
     require(health['node_id'] == peer['id'] and health['peer_id'] == node['id'] and
             health['fingerprint'] == c['fingerprint'] and health['memory'] == 'dram' and
             health['configured_qps'] == 16 and health['source_identity'] == source_identity(),
             'wrong DRAM receiver or mismatched benchmark source')
+    require(health.get('mr_pages',{}).get('mode','native')==page_mode,
+            'DRAM sender/receiver page mode mismatch; no mixed-backing result')
+    if page_mode=='huge2MB':
+        for pages in (health['mr_pages'],getattr(memory,'page_evidence',{})):
+            require(pages.get('hugetlb') is True and pages.get('kernel_page_bytes')==2**21,
+                    'HugeTLB sender/receiver allocation evidence missing; no WRITE permitted')
     results = []
     for size in args.sizes:
         length = block_bytes(size, args.unit)
@@ -220,6 +263,8 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
         expected = memory.digest(length)
         for index in range(args.repetitions):
             identity = secrets.token_hex(16)
+            protocol_wall_start = time.time_ns()
+            protocol_start = time.monotonic_ns()
             # A lost prepare reply might still authorize a target. Do not auto-retry.
             safety['exposed'] = True
             target = rpc(peer_url, 'prepare', dict(attempt=identity, length=length,
@@ -237,13 +282,30 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
             for _ in range(args.warmup_blocks):
                 require(write(memory.address, target['remote_base'], length) == length,
                         'short warmup WRITE')
-            result = write_loop(write, memory.address, target['remote_base'], length,
-                                TOTAL_BYTES, length)
+            samples = []
+            try:
+                result = write_loop(write, memory.address, target['remote_base'], length,
+                                    TOTAL_BYTES, length,samples)
+                observed=dict(result,status='PENDING_VALIDATION',attempt=identity,path_mode='dram_rdma_write')
+                save(output/f'observed-{identity}.json',observed)
+                write_request_csv(output/f'observed-{identity}.csv',observed)
+            except BaseException:
+                try:
+                    partial=dict(status='FAIL',attempt=identity,requests=samples,
+                                 path_mode='dram_rdma_write',block_bytes=length)
+                    save(output/f'failed-{identity}.json',partial)
+                    write_request_csv(output/f'failed-{identity}.csv',partial)
+                except OSError:
+                    pass
+                raise
             after = snapshot(placement)
             local_placement = resident_pages(memory.address, memory.node, memory.capacity)
             verified = rpc(peer_url, 'complete', dict(attempt=identity, sender_drained=True), timeout=300)
             require(verified['checksum'] == expected, 'receiver validation failed')
             safety['exposed'] = False
+            result['protocol_e2e_ns'] = time.monotonic_ns()-protocol_start
+            result['controller_start_unix_ns'] = protocol_wall_start
+            result['controller_end_unix_ns'] = time.time_ns()
             result.update(status='PASS', evidence_class='TRANSFER_ONLY', path_mode='dram_rdma_write',
                 actual_transport='rdma', opcode='WRITE', direction=f"{node['id']}->{peer['id']}",
                 block_unit=args.unit, declared_size=size, repetition=index, attempt=identity,
@@ -254,7 +316,12 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                 checksum_scope='final reused block window', receiver=verified,
                 sender_before=before, sender_after=after, sender_placement=local_placement,
                 store_compatible=False, gpu_delivery_proven=False, serving_proven=False)
+            result.update(source=node['id'],receiver_node=peer['id'],mr_page_mode=page_mode,
+                          mr_pages={node['id']:getattr(memory,'page_evidence',None),
+                                    peer['id']:health.get('mr_pages')})
+            result = enrich_trial(result)
             save(output / f'block-{size}{args.unit}-rep-{index}.json', result)
+            write_request_csv(output/f'requests-{size}{args.unit}-rep-{index}.csv',result,len(results))
             results.append(result)
             print(f"[PASS] {size} {args.unit} rep={index}: {result['GBps']:.3f} GB/s", flush=True)
     return results
@@ -288,6 +355,7 @@ def main():
     parser.add_argument('--control-port', type=int, default=19201)
     parser.add_argument('--te-port', type=int, default=19401)
     parser.add_argument('--numa-node', type=int)
+    parser.add_argument('--page-mode',choices=['native','huge2MB'],default='native')
     parser.add_argument('--sizes', nargs='+', type=int, choices=SIZES, default=list(SIZES))
     parser.add_argument('--unit', choices=['MB', 'MiB'], default='MiB')
     parser.add_argument('--repetitions', type=int, default=3)
@@ -322,7 +390,7 @@ def main():
         os.environ['CALLOSUM_CONTROL_TOKEN'] = secret
         os.environ.setdefault('MC_NUM_QP_PER_EP', '16')
         require(os.environ['MC_NUM_QP_PER_EP'] == '16', 'benchmark requires 16 configured QPs')
-        capacity = max(block_bytes(n, args.unit) for n in args.sizes)
+        capacity = allocation_geometry(max(block_bytes(n, args.unit) for n in args.sizes),args.page_mode)
         soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
         require(soft == resource.RLIM_INFINITY or soft >= capacity, 'raise memlock before registration')
         output.mkdir(parents=True, exist_ok=False)
@@ -343,7 +411,8 @@ def main():
         require(Path(engine_module.__file__).resolve() ==
                 (Path(receipt['build'])/'python/mooncake/engine.so').resolve(), 'stale engine module')
         stage = 'dram-allocation'
-        memory = Memory(capacity, placement['memory_numa_node'])
+        memory = (Memory(capacity, placement['memory_numa_node']) if args.page_mode=='native' else
+                  Memory(capacity, placement['memory_numa_node'],args.page_mode))
         stage = 'engine-registration'
         engine = engine_module.TransferEngine()
         require(engine.relay_abi_version() == 2, 'engine relay ABI mismatch')
@@ -355,7 +424,8 @@ def main():
         segment = endpoint.rsplit(':', 1)[0] + ':' + str(engine.get_rpc_port())
         save(output/'environment.json', dict(node=node['id'], peer=peer['id'], role=args.role, pid=os.getpid(),
              fingerprint=c['fingerprint'], host=socket.gethostname(), placement=placement,
-             residency=memory.placement, capacity=capacity, memlock=[soft, hard],
+             residency=memory.placement, mr_pages=getattr(memory,'page_evidence',None),
+             capacity=capacity, memlock=[soft, hard],
              configured_qps=16, active_qps_verified=False, setup_run=str(Path(args.setup_run).resolve()),
              modules={str(Path(m.__file__).resolve()): hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()
                       for m in (engine_module, native)},
@@ -365,11 +435,11 @@ def main():
         if args.role == 'receiver':
             service = Receiver(memory, segment, node['id'], peer['id'], c['fingerprint'], placement, output)
             http = server(control, service)
-            threading.Thread(target=http.serve_forever, daemon=True).start()
             stopped = threading.Event()
             signal.signal(signal.SIGINT, lambda *_: stopped.set())
             signal.signal(signal.SIGTERM, lambda *_: stopped.set())
             signal.signal(signal.SIGHUP, lambda *_: stopped.set())
+            threading.Thread(target=http.serve_forever, daemon=True).start()
             print(f'[READY] DRAM receiver {node["id"]} at {control}; evidence={output}', flush=True)
             while True:
                 stopped.wait()
@@ -388,14 +458,11 @@ def main():
             signal.signal(signal.SIGHUP, interrupted)
             try:
                 results = sweep(engine, memory, c, node, peer, placement, args, output, safety)
+                report = write_report(output,results)
                 save(output/'summary.json', dict(status='PASS', evidence_class='TRANSFER_ONLY',
                      path_mode='dram_rdma_write', results=results, active_qps_verified=False,
-                     interpretation='Serial drained WRITE control; no saturation or serving claim.'))
-                with (output/'summary.csv').open('x') as stream:
-                    stream.write('block_bytes,repetition,bytes,native_calls,sender_write_loop_ns,GBps,GiBps\n')
-                    for row in results:
-                        stream.write(','.join(str(row[k]) for k in
-                            ('block_bytes','repetition','bytes','native_calls','sender_write_loop_ns','GBps','GiBps'))+'\n')
+                     report=report,interpretation='Serial drained WRITE control; no saturation or serving claim.'))
+                print((output/'report.md').read_text(),flush=True)
             except BaseException as error:
                 if safety.get('exposed'):
                     retain_uncertain(error, output)

@@ -25,6 +25,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from urllib.parse import urlparse
 from urllib.error import URLError
@@ -34,6 +35,9 @@ SOURCE_FILES = (
     'scripts/callosum_runtime.py', 'scripts/callosum_dispatch.py',
     'scripts/callosum_initiation.py', 'scripts/callosum_worker.py',
     'scripts/callosum_transport_benchmark.py', 'scripts/validate_relay_trace.py',
+    'scripts/callosum_benchmark_report.py',
+    'scripts/callosum_write_mini.py',
+    'scripts/callosum_write_matrix.py', 'scripts/callosum_dram_benchmark.py',
     'mooncake-store/src/pool_relay.cpp', 'mooncake-store/include/pool_relay.h',
     'mooncake-integration/pool_relay/bindings.cpp',
     'mooncake-integration/pool_relay/relay_batch.h',
@@ -82,6 +86,7 @@ class Runner:
         self.run_dir = Path(run)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.log = (self.run_dir / 'commands.log').open('a', buffering=1)
+        self.log_lock = threading.RLock()
         self.stage = 'initialization'
         self.services_may_be_live = False
         self.configuration_effects = []
@@ -90,10 +95,11 @@ class Runner:
         self.device_open_checked = False
 
     def say(self, text):
-        print(text, flush=True)
-        self.log.write(text + '\n')
+        with self.log_lock:
+            print(text, flush=True)
+            self.log.write(text + '\n')
 
-    def call(self, stage, command, env=None, capture=False, input_text=None):
+    def call(self, stage, command, env=None, capture=False, input_text=None, log_stdout=True):
         self.stage = stage
         command = [str(v) for v in command]
         self.commands_started.append(stage)
@@ -101,7 +107,8 @@ class Runner:
         # No shell, errexit, nounset or pipefail. Child failure is explicit.
         if capture:
             result = subprocess.run(command, env=env, text=True, capture_output=True, input=input_text)
-            self.log.write(result.stdout + result.stderr)
+            with self.log_lock:
+                self.log.write((result.stdout if log_stdout else '[raw JSON saved in trial artifact]\n') + result.stderr)
             require(result.returncode == 0,
                     f'{stage}: exit={result.returncode}\n{result.stderr[-3000:]}')
             return result.stdout
@@ -431,6 +438,101 @@ def load_setup(run):
     env.update(MC_NUM_QP_PER_EP='16', CALLOSUM_DESTRUCTIVE_ACK='1',
                CALLOSUM_CONTROL_TOKEN=(run / 'control.token').read_text().strip())
     return data, env
+
+
+def transport_sweep(root, args):
+    """Reuse a live campaign under the caller's credentials. Never repair permissions."""
+    parent = Path(root)/'runs'
+    parent.mkdir(exist_ok=True)
+    run = Path(args.run_dir).resolve() if args.run_dir else Path(tempfile.mkdtemp(prefix='cxl-write-sweep-',dir=parent))
+    if args.run_dir:
+        require(not run.exists(), 'Sweep evidence directory already exists; preserve it')
+        run.mkdir(parents=True)
+    runner = Runner(run)
+    remote_mutation_possible = False
+    try:
+        from callosum_benchmark_report import enrich_trial, write_request_csv, write_report
+        runner.stage = 'campaign-receipt'
+        require(args.setup_run, '--setup-run must select the existing healthy campaign')
+        campaign = Path(args.setup_run).resolve()
+        receipt, env = load_setup(campaign)
+        python = receipt['env']['PYTHON_BIN']
+        require(os.access(python, os.X_OK),
+                'Campaign interpreter is not executable by this caller. Use the same sudo execution '
+                'context as campaign creation; do not chmod/chown the build recursively.')
+        config = campaign/'topology.json'
+        manifest = json.loads(config.read_text())
+        nodes = {n['id']:n for n in manifest['nodes']}
+        source = args.source or manifest['lab_run']['source']
+        receiver = args.receiver or manifest['lab_run']['requester']
+        require(source in nodes and receiver in nodes and nodes[source]['pool'] != nodes[receiver]['pool'],
+                'Select a source and receiver from distinct pools')
+        require(args.repetitions > 0 and args.unit in ('MB','MiB') and args.sizes and
+                len(set(args.sizes)) == len(args.sizes), 'Invalid sweep settings')
+        from callosum_transport_benchmark import block_bytes, TOTAL_BYTES
+        sizes = [block_bytes(size,args.unit) for size in args.sizes]
+        require(max(sizes) <= manifest.get('max_inflight_bytes',67108864),
+                'Block exceeds the running campaign budget; do not hot-edit its manifest')
+        relay = source_path(root)/'scripts/run_callosum_relay.sh'
+        def command(stage, *values):
+            options = dict(capture=True)
+            if stage.startswith('block-'):
+                options['log_stdout'] = False
+            result = json.loads(runner.call(stage,['bash',relay,*values,'--config',config],env,**options))
+            (run/(stage+'.json')).write_text(json.dumps(result,indent=2)+'\n')
+            return result
+        effective = command('effective-config','check')
+        status = command('status-before','status')
+        require(status.get('fingerprint') == effective['config']['fingerprint'] and
+                status.get('topology_verified') and not status.get('startup_aborted') and
+                set(status.get('registered_nodes',[])) == set(nodes) and
+                all(o['state'] in ('COMMITTED','DRAINED_RETAINED') for o in status.get('operations',[])),
+                'Campaign is not healthy and ready; retain services/journals and inspect status-before.json')
+        require(status.get('benchmark_request_timing_versions',{}).get(source) == 1,
+                'Running sender has no per-request timing. Existing aggregate files can be reported offline. '
+                'Do not hot-restart live agents; prepare an authorized updated campaign for latency measurement.')
+        key = 'transport-' + secrets.token_hex(12)
+        # RPC uncertainty can include a new allocation even if the client receives no reply.
+        remote_mutation_possible = True
+        command('source-seed','seed','--node',source,'--key',key,'--bytes',max(sizes))
+        rows = []
+        for size in args.sizes:
+            for repetition in range(args.repetitions):
+                row = command(f'block-{size}{args.unit}-rep-{repetition}',
+                    'transport-benchmark','--node',source,'--receiver',receiver,'--key',key,
+                    '--block-size',size,'--block-unit',args.unit)
+                require(row.get('status') == 'PASS' and row.get('bytes') == TOTAL_BYTES and
+                        row.get('actual_transport') == 'rdma' and row.get('path_mode') == 'direct_dax_write',
+                        'Transport result failed byte/path validation')
+                require(row.get('request_timing_version') == 1 and 'requests' in row,
+                        'Missing per-request timing; do not infer latency samples from aggregate time')
+                row.update(repetition=repetition,direction=f'{source}->{receiver}',warmup_blocks=0,warmup_bytes=0)
+                row = enrich_trial(row)
+                (run/f'block-{size}{args.unit}-rep-{repetition}.json').write_text(json.dumps(row,indent=2)+'\n')
+                write_request_csv(run/f'requests-{size}{args.unit}-rep-{repetition}.csv',row,len(rows))
+                rows.append(row)
+                runner.say(f"[PASS] {size} {args.unit} rep={repetition}: {row['GBps']:.3f} GB/s")
+        summary = dict(status='PASS',evidence_class='TRANSFER_ONLY',path_mode='direct_dax_write',
+                       source=source,receiver=receiver,results=rows,active_qps_verified=False,
+                       services_retained=True,evidence=str(run))
+        summary['report'] = write_report(run,rows)
+        (run/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+        runner.say((run/'report.md').read_text())
+        runner.say(f'[evidence] {run}')
+        return 0
+    except Exception as error:
+        failure = dict(status='FAIL',stage=runner.stage,error=str(error),evidence=str(run),
+            local_services_started=False,local_devices_mapped=False,
+            remote_mutation_possible=remote_mutation_possible,
+            action=('Retain live services, arenas and journals. No automatic retry or reclaim.'
+                    if remote_mutation_possible else
+                    'No seed/WRITE RPC was sent. Correct input/access and rerun under the campaign execution account. '
+                    'No ownership or permission repair was attempted.'))
+        (run/'failure.json').write_text(json.dumps(failure,indent=2)+'\n')
+        runner.say(json.dumps(failure,indent=2))
+        return 1
+    finally:
+        runner.log.close()
 
 
 def process_stamp(pid):
@@ -1093,16 +1195,27 @@ def main(argv=None):
         help='Check manifest/token and node selection only; no build, SSH, service, inventory or device access')
     parser.add_argument('--check-delivery',action='store_true',
         help='Audit committed parent/submodule inputs; no network or changes to Git')
+    parser.add_argument('--transport-sweep',action='store_true',
+        help='Use a retained healthy campaign for a CXL WRITE sweep; no build or service restart')
+    parser.add_argument('--setup-run',help='Existing successful campaign for --transport-sweep')
+    parser.add_argument('--source',help='Sweep source node ID; default: campaign source')
+    parser.add_argument('--receiver',help='Sweep receiver node ID; default: campaign requester')
+    parser.add_argument('--sizes',nargs='+',type=int,default=[1,2,4,8,16,32,64])
+    parser.add_argument('--unit',choices=['MB','MiB'],default='MiB')
+    parser.add_argument('--repetitions',type=int,default=1)
     args=parser.parse_args(argv)
     root=Path(args.root).resolve()
-    require(sum((args.initialize,args.check_config,args.check_delivery))<=1,
-            'Use only one of --initialize, --check-config or --check-delivery')
+    require(sum((args.initialize,args.check_config,args.check_delivery,args.transport_sweep))<=1,
+            'Use only one of --initialize, --check-config, --check-delivery or --transport-sweep')
     require(not (args.initialize or args.check_config) or args.action=='node',
             '--initialize and --check-config require --action node; do not combine them with build/prepare actions')
     if args.check_delivery:
         result=check_delivery(root)
         print(json.dumps(result,indent=2))
         return 0 if result['status']=='PASS' else 1
+    if args.transport_sweep:
+        source_path(root)
+        return transport_sweep(root,args)
     if args.action=='inventory':
         print(json.dumps(inventory()))
         return 0

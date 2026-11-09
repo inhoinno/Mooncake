@@ -9,6 +9,15 @@ target_include_directories(callosum_relay_native PRIVATE ../../mooncake-store/in
 target_compile_features(callosum_relay_native PRIVATE cxx_std_17)
 target_link_libraries(callosum_relay_native PRIVATE Threads::Threads)
 enable_testing()
+add_test(NAME callosum_write_matrix
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_write_matrix.py")
+set_tests_properties(callosum_write_matrix PROPERTIES LABELS "relay;benchmark;t0" TIMEOUT 60)
+add_test(NAME callosum_write_mini
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_write_mini.py")
+set_tests_properties(callosum_write_mini PROPERTIES LABELS "relay;benchmark;t0" TIMEOUT 60)
+add_test(NAME callosum_benchmark_reporting
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_benchmark_report.py")
+set_tests_properties(callosum_benchmark_reporting PROPERTIES LABELS "relay;benchmark;t0" TIMEOUT 60)
 add_test(NAME callosum_dram_write_baseline_control
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_dram_benchmark.py")
 set_tests_properties(callosum_dram_write_baseline_control PROPERTIES

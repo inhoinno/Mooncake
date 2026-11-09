@@ -1015,5 +1015,124 @@ class LabTest(unittest.TestCase):
                     kill.assert_called_once_with(123,lab.signal.SIGTERM)
 
 
+class TransportSweepTest(unittest.TestCase):
+    def fixture(self, root):
+        (root/'Mooncake-dev/scripts').mkdir(parents=True)
+        (root/'Mooncake-dev/scripts/callosum_runtime.py').touch()
+        campaign=root/'campaign'
+        campaign.mkdir()
+        (campaign/'setup.json').write_text(json.dumps(dict(status='PASS',env={'PYTHON_BIN':sys.executable})))
+        (campaign/'control.token').write_text('private-sweep-fixture-token-'*2)
+        (campaign/'topology.json').write_text(json.dumps(LabTest.node_manifest()))
+        return SimpleNamespace(setup_run=str(campaign),run_dir=str(root/'evidence'),
+            source='b1',receiver='a1',sizes=[1,2],unit='MiB',repetitions=1)
+
+    def response(self, stage, command, env, capture=False, log_stdout=True):
+        self.assertEqual(env['PYTHON_BIN'],sys.executable)
+        self.assertGreaterEqual(len(env['CALLOSUM_CONTROL_TOKEN']),32)
+        if stage=='effective-config':
+            return json.dumps({'config':{'fingerprint':'fp'}})
+        if stage=='status-before':
+            return json.dumps(dict(fingerprint='fp',topology_verified=True,startup_aborted=False,
+                registered_nodes=['a1','b1'],operations=[{'state':'COMMITTED'}],
+                benchmark_request_timing_versions={'b1':1,'a1':1}))
+        if stage=='source-seed':
+            return json.dumps({'status':'PASS'})
+        size=int(stage.split('-')[1].split('MiB')[0])
+        length=size*1024**2
+        count=8*1024**3//length
+        samples=[dict(request_index=i,request_bytes=length,sender_start_offset_ns=i*10,
+                      sender_end_offset_ns=i*10+5,write_request_e2e_ns=5,native_calls=1,status='PASS')
+                 for i in range(count)]
+        return json.dumps(dict(status='PASS',bytes=8*1024**3,actual_transport='rdma',
+             path_mode='direct_dax_write',sender_write_loop_ns=1000000,block_bytes=length,
+             request_timing_version=1,requests=samples,logical_blocks=count,native_calls=count))
+
+    def test_sweep_receipt_permission_failure_precedes_all_rpcs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            args=self.fixture(root)
+            with patch.object(os,'access',return_value=False),patch.object(lab.Runner,'call') as call, \
+                 patch.object(os,'chmod') as chmod,patch.object(os,'chown') as chown, \
+                 patch('sys.stdout',new=io.StringIO()):
+                self.assertEqual(lab.transport_sweep(root,args),1)
+                call.assert_not_called(); chmod.assert_not_called(); chown.assert_not_called()
+            result=json.loads((root/'evidence/failure.json').read_text())
+            self.assertFalse(result['remote_mutation_possible'])
+            self.assertIn('sudo',result['error'])
+
+    def test_sweep_full_sequence_uses_receipt_without_services_or_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            args=self.fixture(root)
+            with patch.object(lab.Runner,'call',side_effect=self.response) as call, \
+                 patch.object(lab,'prepare') as prepare,patch.object(lab,'start_service') as start, \
+                 patch('sys.stdout',new=io.StringIO()):
+                self.assertEqual(lab.transport_sweep(root,args),0)
+                prepare.assert_not_called(); start.assert_not_called()
+            self.assertEqual([c.args[0] for c in call.call_args_list],
+                ['effective-config','status-before','source-seed','block-1MiB-rep-0','block-2MiB-rep-0'])
+            result=json.loads((root/'evidence/summary.json').read_text())
+            self.assertEqual(len(result['results']),2)
+            self.assertNotIn('private-sweep-fixture-token',(root/'evidence/commands.log').read_text())
+
+    def test_sweep_unknown_campaign_state_prevents_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            args=self.fixture(root)
+            def reply(stage,command,env,capture=False,**kwargs):
+                result=json.loads(self.response(stage,command,env,capture,**kwargs))
+                if stage=='status-before': result['operations']=[{'state':'QUARANTINED'}]
+                return json.dumps(result)
+            with patch.object(lab.Runner,'call',side_effect=reply) as call,patch('sys.stdout',new=io.StringIO()):
+                self.assertEqual(lab.transport_sweep(root,args),1)
+            self.assertEqual(call.call_count,2)
+            self.assertFalse(json.loads((root/'evidence/failure.json').read_text())['remote_mutation_possible'])
+
+    def test_sweep_failed_transfer_retains_state_and_does_not_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            args=self.fixture(root)
+            def reply(stage,command,env,capture=False,**kwargs):
+                if stage.startswith('block-'): raise RuntimeError('unknown completion')
+                return self.response(stage,command,env,capture,**kwargs)
+            with patch.object(lab.Runner,'call',side_effect=reply) as call,patch('sys.stdout',new=io.StringIO()):
+                self.assertEqual(lab.transport_sweep(root,args),1)
+            self.assertEqual(call.call_count,4)
+            self.assertTrue(json.loads((root/'evidence/failure.json').read_text())['remote_mutation_possible'])
+
+    def test_sweep_actual_shell_missing_receipt_and_existing_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            entry=Path(lab.__file__).resolve().parents[2]/'scripts/callosum_lab.sh'
+            command=['bash',str(entry),'--transport-sweep','--setup-run',str(root/'missing'),
+                     '--run-dir',str(root/'evidence')]
+            result=subprocess.run(command,env=dict(lab.clean_env(),PYTHON_BIN=sys.executable),
+                                  text=True,capture_output=True)
+            self.assertEqual(result.returncode,1)
+            evidence=json.loads((root/'evidence/failure.json').read_text())
+            self.assertEqual(evidence['stage'],'campaign-receipt')
+            before={p.name:p.read_bytes() for p in (root/'evidence').iterdir()}
+            result=subprocess.run(command,env=dict(lab.clean_env(),PYTHON_BIN=sys.executable),
+                                  text=True,capture_output=True)
+            self.assertEqual(result.returncode,1)
+            self.assertEqual(before,{p.name:p.read_bytes() for p in (root/'evidence').iterdir()})
+
+    def test_sweep_old_sender_requires_instrumented_campaign_before_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            args=self.fixture(root)
+            def reply(stage,command,env,capture=False,**kwargs):
+                result=json.loads(self.response(stage,command,env,capture,**kwargs))
+                result.pop('benchmark_request_timing_versions',None)
+                return json.dumps(result)
+            with patch.object(lab.Runner,'call',side_effect=reply) as call,patch('sys.stdout',new=io.StringIO()):
+                self.assertEqual(lab.transport_sweep(root,args),1)
+            self.assertEqual(call.call_count,2)
+            failure=json.loads((root/'evidence/failure.json').read_text())
+            self.assertFalse(failure['remote_mutation_possible'])
+            self.assertIn('no per-request timing',failure['error'])
+
+
 if __name__=='__main__':
     unittest.main()

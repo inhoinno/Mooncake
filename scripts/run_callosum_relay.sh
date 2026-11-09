@@ -18,6 +18,10 @@ if [[ ${1:-} == build ]]; then
   exit
 fi
 export PYTHONPATH="$native_build:$script_dir:${PYTHONPATH:-}"
+if [[ ${1:-} == benchmark-report ]]; then
+  shift
+  exec "$python_bin" "$script_dir/callosum_benchmark_report.py" "$@"
+fi
 if [[ ${1:-} == dram-benchmark ]]; then
   shift
   exec "$python_bin" "$script_dir/callosum_dram_benchmark.py" "$@"
