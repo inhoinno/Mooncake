@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -16,6 +17,167 @@ import callosum_lab as lab
 
 
 class LabTest(unittest.TestCase):
+    def test_private_configuration_pair_is_exclusive_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            config,token=root/'lab.json',root/'control.token'
+            secret='fixture-shared-random-token-'*2
+            data=self.node_manifest()
+            result=lab.install_configuration(str(config),str(token),data,secret)
+            self.assertEqual(result['status'],'CREATED')
+            self.assertEqual(config.stat().st_mode & 0o777,0o600)
+            self.assertEqual(token.stat().st_mode & 0o777,0o600)
+            before=(config.read_bytes(),token.read_bytes())
+            self.assertEqual(lab.install_configuration(str(config),str(token),data,secret)['status'],'EXISTS_MATCHED')
+            with self.assertRaisesRegex(RuntimeError,'conflict'):
+                lab.install_configuration(str(config),str(token),dict(data,master='changed'),secret)
+            self.assertEqual(before,(config.read_bytes(),token.read_bytes()))
+
+    def test_partial_or_insecure_configuration_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            config,token=root/'lab.json',root/'control.token'
+            data,secret=self.node_manifest(),'fixture-private-shared-token-'*2
+            config.write_text(json.dumps(data))
+            with self.assertRaisesRegex(RuntimeError,'Partial'):
+                lab.install_configuration(str(config),str(token),data,secret)
+            self.assertFalse(token.exists())
+            token.write_text(secret)
+            token.chmod(0o644)
+            with self.assertRaisesRegex(RuntimeError,'conflict'):
+                lab.install_configuration(str(config),str(token),data,secret)
+            self.assertEqual(token.stat().st_mode & 0o777,0o644)
+
+    def exercise_initializer(self,authorize=True,conflict=False):
+        # SSH is a fake boundary here. Execute the actual peer installer with
+        # private stdin against a second temporary checkout, never a lab host.
+        with tempfile.TemporaryDirectory() as directory,patch('sys.stdout',new=io.StringIO()):
+            base=Path(directory)
+            root,peer_root=base/'local checkout',base/'peer checkout'
+            root.mkdir()
+            peer_root.mkdir()
+            template=root/'experiments/two_worker_metadata_lookup/lab.example.json'
+            template.parent.mkdir(parents=True)
+            data=self.node_manifest()
+            data['nodes'][0]['id']='consumer-17'
+            data['nodes'][1]['id']='producer-91'
+            data['lab_run'].update(controller='consumer-17',requester='consumer-17',source='producer-91')
+            template.write_text(json.dumps(data))
+            run=root/'evidence'
+            runner=lab.Runner(run)
+            peer_inventory=dict(self.inventoried_host(),host='fixture-peer')
+            original_call=runner.call
+            stages=[]
+            def call(stage,command,env=None,capture=False,input_text=None):
+                stages.append(stage)
+                if stage=='peer-read-only-inventory':
+                    return json.dumps(peer_inventory)
+                self.assertEqual(stage,'peer-private-config-install')
+                remote=shlex.split(command[-1])
+                self.assertEqual(remote[0],'python3')
+                return original_call(stage,[sys.executable]+remote[1:],env,capture,input_text)
+            runner.call=call
+            args=SimpleNamespace(config=str(root/'lab.json'),token_file=str(root/'control.token'),
+                node_id='consumer-17',peer='operator@fixture-peer',remote_root=str(peer_root))
+            fields={}
+            for node in data['nodes']:
+                ip=lab.urlparse(node['url']).hostname
+                fields[node['id']]=dict(ip=ip,engine_ip=ip,path=node['path'],hca=node['rdma_device'],
+                                       pool=data['pools'][node['pool']])
+            if conflict:
+                (peer_root/'lab.json').write_text('{"preserve":"existing-config"}')
+                (peer_root/'control.token').write_text('preserve-existing-token-'*2)
+                (peer_root/'control.token').chmod(0o600)
+            try:
+                with patch.object(lab.sys,'platform','linux'), \
+                        patch.object(lab,'inventory',return_value=dict(self.inventoried_host(),host='fixture-local')), \
+                        patch.object(lab,'host_fields',side_effect=lambda label,inv:fields[label]), \
+                        patch.object(lab,'ask',return_value='INITIALIZE CONFIG' if authorize else 'CANCEL'), \
+                        patch.object(lab,'prepare') as prepare,patch.object(lab,'start_service') as start:
+                    if not authorize or conflict:
+                        with self.assertRaises(RuntimeError):
+                            lab.initialize_configuration(root,run,args,runner)
+                    else:
+                        lab.initialize_configuration(root,run,args,runner)
+                        secret=(root/'control.token').read_text()
+                        self.assertEqual(secret,(peer_root/'control.token').read_text())
+                        self.assertEqual(json.loads((root/'lab.json').read_text()),
+                                         json.loads((peer_root/'lab.json').read_text()))
+                        self.assertEqual(json.loads((root/'lab.json').read_text())['lab_run']['controller'],'consumer-17')
+                        self.assertNotIn(secret.strip(),(run/'commands.log').read_text())
+                        self.assertEqual((peer_root/'control.token').stat().st_mode & 0o777,0o600)
+                    prepare.assert_not_called()
+                    start.assert_not_called()
+                if not authorize:
+                    self.assertFalse((root/'lab.json').exists())
+                    self.assertFalse((peer_root/'lab.json').exists())
+                if conflict:
+                    self.assertEqual((peer_root/'lab.json').read_text(),'{"preserve":"existing-config"}')
+                    self.assertEqual((peer_root/'control.token').read_text(),'preserve-existing-token-'*2)
+                return stages
+            finally:
+                runner.log.close()
+
+    def test_initializer_collects_data_and_installs_identical_private_pair(self):
+        self.assertEqual(self.exercise_initializer(),['peer-read-only-inventory','peer-private-config-install'])
+
+    def test_initializer_cancellation_does_not_create_config_or_start_services(self):
+        self.assertEqual(self.exercise_initializer(authorize=False),['peer-read-only-inventory'])
+
+    def test_initializer_preserves_conflicting_peer_configuration(self):
+        self.assertEqual(self.exercise_initializer(conflict=True),['peer-read-only-inventory','peer-private-config-install'])
+
+    def test_missing_manifest_reports_initialization_not_transport_failure(self):
+        with tempfile.TemporaryDirectory() as directory,patch('sys.stdout',new=io.StringIO()):
+            root=Path(directory)
+            (root/'Mooncake-dev/scripts').mkdir(parents=True)
+            (root/'Mooncake-dev/scripts/callosum_runtime.py').write_text('# fixture')
+            for node in ('a1','b1'):
+                run=root/('evidence-'+node)
+                with patch.object(lab.sys,'platform','linux'), \
+                        patch.dict(os.environ,{'CALLOSUM_DESTRUCTIVE_ACK':'1'}), \
+                        patch.object(lab,'prepare') as prepare,patch.object(lab,'start_service') as start:
+                    code=lab.main(['--root',str(root),'--run-dir',str(run),'--action','node',
+                        '--node-id',node,'--config',str(root/'absent.json'),'--token-file',str(root/'absent.token')])
+                    self.assertEqual(code,1)
+                    failure=json.loads((run/'failure.json').read_text())
+                    self.assertEqual(failure['stage'],'configuration-validation')
+                    self.assertIn('--initialize',failure['error'])
+                    self.assertFalse(failure['local_services_started_this_run'])
+                    prepare.assert_not_called()
+                    start.assert_not_called()
+
+    def test_canonical_entrypoint_supplies_default_shared_file_paths(self):
+        root=Path(lab.__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            stub=Path(directory)/'python-stub'
+            stub.write_text('#!'+sys.executable+'\nimport json,sys; print(json.dumps(sys.argv[1:]))\n')
+            stub.chmod(0o755)
+            env=dict(lab.clean_env(),PYTHON_BIN=str(stub),NODE_ID='arbitrary-id')
+            env.pop('CONFIG',None)
+            env.pop('TOKEN_FILE',None)
+            env.pop('CALLOSUM_ROOT',None)
+            result=subprocess.run(['bash',str(root/'scripts/callosum_lab.sh'),'--initialize'],
+                                  env=env,cwd=directory,text=True,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            argv=json.loads(result.stdout)
+            self.assertEqual(Path(argv[argv.index('--config')+1]).resolve(),root/'lab.json')
+            self.assertEqual(Path(argv[argv.index('--token-file')+1]).resolve(),root/'control.token')
+            self.assertEqual(argv[argv.index('--node-id')+1],'arbitrary-id')
+            self.assertIn('--initialize',argv)
+
+    def test_initialize_flag_precedes_normal_node_workflow(self):
+        with tempfile.TemporaryDirectory() as directory,patch('sys.stdout',new=io.StringIO()):
+            root=Path(directory)
+            (root/'Mooncake-dev/scripts').mkdir(parents=True)
+            (root/'Mooncake-dev/scripts/callosum_runtime.py').write_text('# fixture')
+            order=[]
+            with patch.object(lab,'initialize_configuration',side_effect=lambda *args:order.append('initialize')), \
+                    patch.object(lab,'node_run',side_effect=lambda *args:order.append('run')):
+                self.assertEqual(lab.main(['--root',str(root),'--run-dir',str(root/'evidence'),
+                    '--action','node','--node-id','some-controller','--initialize']),0)
+            self.assertEqual(order,['initialize','run'])
+
     def test_embedded_patch_is_complete(self):
         payload=base64.b64decode(lab.PATCH_B64)
         self.assertEqual(hashlib.sha256(payload).hexdigest(), lab.PATCH_SHA256)

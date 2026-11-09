@@ -10,6 +10,7 @@ import argparse
 import base64
 import hashlib
 import importlib.util
+import inspect
 import ipaddress
 import json
 import os
@@ -150,22 +151,24 @@ class Runner:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.log = (self.run_dir / 'commands.log').open('a', buffering=1)
         self.stage = 'initialization'
+        self.services_may_be_live = False
 
     def say(self, text):
         print(text, flush=True)
         self.log.write(text + '\n')
 
-    def call(self, stage, command, env=None, capture=False):
+    def call(self, stage, command, env=None, capture=False, input_text=None):
         self.stage = stage
         command = [str(v) for v in command]
         self.say('\n[stage] ' + stage + '\n$ ' + shlex.join(command))
         # No shell, errexit, nounset or pipefail. Child failure is explicit.
         if capture:
-            result = subprocess.run(command, env=env, text=True, capture_output=True)
+            result = subprocess.run(command, env=env, text=True, capture_output=True, input=input_text)
             self.log.write(result.stdout + result.stderr)
             require(result.returncode == 0,
                     f'{stage}: exit={result.returncode}\n{result.stderr[-3000:]}')
             return result.stdout
+        require(input_text is None, 'Private stdin requires capture=True')
         with subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True, errors='replace') as child:
             for line in child.stdout:
@@ -390,6 +393,112 @@ def manifest(a, b):
         batch_cap=32, max_inflight_bytes=67108864, pools=dict(A=a['pool'],B=b['pool']), nodes=nodes)
 
 
+def install_configuration(config_path, token_path, config, secret):
+    """Create a private shared pair, or accept an exact existing pair. Never overwrite."""
+    # Keep dependencies local: the initializer sends this function over the
+    # existing authorized SSH channel, not a new service or public endpoint.
+    import hmac
+    import json
+    import os
+    from pathlib import Path
+    config_path, token_path = Path(config_path), Path(token_path)
+    paths=(config_path,token_path)
+    if (not all(p.is_absolute() and p.parent.is_dir() and not p.is_symlink() for p in paths)
+            or config_path==token_path or not isinstance(config,dict)
+            or not isinstance(secret,str) or len(secret)<32):
+        raise RuntimeError('Invalid configuration destinations or shared token')
+    present=[p.exists() for p in paths]
+    if any(present):
+        if not all(present) or not all(p.is_file() for p in paths):
+            raise RuntimeError('Partial/existing configuration: preserve files and resolve ownership; no overwrite')
+        if (token_path.stat().st_mode & 0o077
+                or json.loads(config_path.read_text())!=config
+                or not hmac.compare_digest(token_path.read_text().strip(),secret)):
+            raise RuntimeError('Existing configuration/token conflict; no overwrite')
+        return dict(status='EXISTS_MATCHED',config=str(config_path),token_file=str(token_path))
+    for path,text in ((config_path,json.dumps(config,indent=2)+'\n'),(token_path,secret+'\n')):
+        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,'w') as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+    return dict(status='CREATED',config=str(config_path),token_file=str(token_path))
+
+
+def initialize_configuration(root, run, args, runner):
+    """Explicit first-run setup. Inventory is read-only; configuration copy uses SSH."""
+    runner.stage='configuration-initialization'
+    require(sys.platform.startswith('linux'), 'Initialize on an authorized Linux lab host')
+    root=Path(root).resolve()
+    require(args.config and args.token_file, 'Configuration and token paths are required')
+    config_path,token_path=Path(args.config).resolve(),Path(args.token_file).resolve()
+    try:
+        config_relative=config_path.relative_to(root)
+        token_relative=token_path.relative_to(root)
+    except ValueError:
+        raise RuntimeError('Initialization destinations must be inside the selected checkout')
+    require(config_path!=token_path and config_path.parent.is_dir() and token_path.parent.is_dir(),
+            'Distinct existing configuration/token parent directories required')
+    existing=(config_path.exists(),token_path.exists())
+    require(existing[0]==existing[1], 'Partial configuration exists; preserve files instead of replacing them')
+    template_path=root/'experiments/two_worker_metadata_lookup/lab.example.json'
+    config=json.loads((config_path if existing[0] else template_path).read_text())
+    launch=config.get('lab_run',{})
+    nodes=config.get('nodes',[])
+    require(len(nodes)==2 and launch.get('profile')=='two_worker_smoke',
+            'This initialization profile requires the two-worker template')
+    require(args.node_id and args.node_id==launch.get('controller'),
+            '--initialize must run on the configured controller node; other nodes use the copied shared files')
+    require(len({n.get('id') for n in nodes})==2 and
+            all(isinstance(n.get('id'),str) and isinstance(n.get('pool'),str) for n in nodes),
+            'Invalid template node records')
+    peer_node=next(n for n in nodes if n['id']!=args.node_id)
+    peer=args.peer or ask('Authorized peer SSH target (configuration/inventory only)')
+    peer_root=Path(args.remote_root or ask('Peer Callosum checkout root',str(root)))
+    require(peer_root.is_absolute(), 'Peer checkout root must be absolute')
+    remote_config,remote_token=peer_root/config_relative,peer_root/token_relative
+    # The peer must already have this repository. This call reads inventory only.
+    remote_inv=json.loads(runner.call('peer-read-only-inventory',remote_command(peer,
+        ['python3',peer_root/'Mooncake-dev/scripts/callosum_lab.py','--action','inventory']),
+        env=clean_env(),capture=True))
+    local_inv=inventory()
+    require(local_inv['host']!=remote_inv['host'], 'Peer is the same host; two physical workers required')
+    inventories={args.node_id:local_inv,peer_node['id']:remote_inv}
+    runner.stage='configuration-initialization'
+    if not existing[0]:
+        fields={n['id']:host_fields(n['id'],inventories[n['id']]) for n in nodes}
+        for node in nodes:
+            host=fields[node['id']]
+            node.update(path=host['path'],rdma_device=host['hca'],
+                        url=f'http://{host["ip"]}:19101',te_endpoint=f'{host["engine_ip"]}:19301')
+            config['pools'][node['pool']]=host['pool']
+        config['master']=f'http://{fields[args.node_id]["ip"]}:19100'
+        secret=secrets.token_hex(32)
+    else:
+        require(token_path.is_file() and token_path.stat().st_mode & 0o077==0,
+                'Existing TOKEN_FILE must be private')
+        secret=token_path.read_text().strip()
+    validate_launch_config(config,args.node_id)
+    for node in nodes:
+        validate_node_extent(config,node['id'],inventories[node['id']])
+    runner.say('[proposed-config]\n'+json.dumps(config,indent=2))
+    runner.say(f'[config-copy] local={config_path}, {token_path}; peer={peer}:{remote_config}, {remote_token}')
+    require(ask('Confirm exclusive test extents, independent devices and authorized config copy. Type INITIALIZE CONFIG')
+            =='INITIALIZE CONFIG','Configuration initialization not authorized; no files or devices changed')
+    (run/'initialization-inventory.json').write_text(json.dumps(inventories,indent=2))
+    install_configuration(str(config_path),str(token_path),config,secret)
+    # Token goes through stdin, never argv, output or the command log.
+    installer=inspect.getsource(install_configuration)+"""
+import json,sys
+bundle=json.load(sys.stdin)
+print(json.dumps(install_configuration(sys.argv[1],sys.argv[2],bundle['config'],bundle['token'])))
+"""
+    runner.call('peer-private-config-install',remote_command(peer,
+        ['python3','-c',installer,remote_config,remote_token]),
+        env=clean_env(),capture=True,input_text=json.dumps(dict(config=config,token=secret)))
+    runner.say('[CONFIG READY] Shared manifest/token installed on both hosts; peer may now run its normal command. No DAX mapped yet.')
+
+
 def load_setup(run):
     data = json.loads((run / 'setup.json').read_text())
     require(data['status'] == 'PASS', 'Preparation is not PASS')
@@ -447,6 +556,8 @@ def start_service(root, run, role, node, runner):
         command += ['--node', node]
     console = run / f'{name}-console.log'
     with console.open('x') as out:
+        # Set before spawning: marker persistence can fail after a child starts.
+        runner.services_may_be_live = True
         child = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=out,
                                  stderr=subprocess.STDOUT, start_new_session=True)
     marker.write_text(json.dumps(dict(pid=child.pid, stamp=process_stamp(child.pid),
@@ -660,8 +771,12 @@ def node_run(root, run, args, runner):
             'Set CALLOSUM_DESTRUCTIVE_ACK=1 only for owned exclusive extents without outstanding DMA')
     require(not (run/'topology.json').exists(), 'Campaign already started; retain journals and do not restart')
     config_path, token_path = Path(args.config).resolve(), Path(args.token_file).resolve()
+    require(config_path.is_file(),
+            f'Missing shared manifest: {config_path}. First run the configured controller command with --initialize; do not use the null template as a live config.')
     config = json.loads(config_path.read_text())
     selected,launch=validate_launch_config(config,args.node_id)
+    require(token_path.is_file(),
+            f'Missing shared token file: {token_path}. Use --initialize on the configured controller to create/copy the shared pair.')
     source = source_path(root)
     sys.path.insert(0,str(source/'scripts'))
     runtime = importlib.import_module('callosum_runtime')
@@ -847,6 +962,8 @@ def main(argv=None):
     parser.add_argument('--node-id',default='',help='Select a node record; hostnames never select behavior')
     parser.add_argument('--config',help='Approved common manifest for independent-terminal node mode')
     parser.add_argument('--token-file',help='Private shared control token file; never place the token in argv')
+    parser.add_argument('--initialize',action='store_true',
+        help='Explicitly collect inventory, initialize/copy shared configuration through authorized SSH, then run this node')
     args=parser.parse_args(argv)
     root=Path(args.root).resolve()
     if args.action=='inventory':
@@ -885,6 +1002,8 @@ def main(argv=None):
             else:
                 prepare(root,run,args,runner)
         elif args.action=='node':
+            if args.initialize:
+                initialize_configuration(root,run,args,runner)
             node_run(root,run,args,runner)
         elif args.action=='start-b1':
             start_service(root,run,'agent','b1',runner)
@@ -892,8 +1011,11 @@ def main(argv=None):
             full_run(root,run,args,runner)
         return 0
     except (Exception,KeyboardInterrupt) as error:
+        started=runner.services_may_be_live or any(run.glob('*.process.json'))
         failure=dict(status='FAIL',stage=runner.stage,error=str(error),evidence=str(run),
-            action='Retain all services, mappings, logs and journals. No automatic retry/reclaim.')
+            local_services_started_this_run=started,
+            action=('Retain all services, mappings, logs and journals. No automatic retry/reclaim.' if started
+                    else 'No local service was started by this invocation. Preserve logs and fix the named setup stage; do not reclaim any earlier run.'))
         (run/'failure.json').write_text(json.dumps(failure,indent=2))
         runner.say('\n'+json.dumps(failure,indent=2))
         return 1

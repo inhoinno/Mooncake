@@ -6,9 +6,10 @@ python_bin=${PYTHON_BIN:-python3}
 native_build=${CALLOSUM_NATIVE_BUILD:-$repo_dir/build-callosum-relay}
 if [[ ${1:-} == lab ]]; then
   shift
+  lab_root=${CALLOSUM_ROOT:-$repo_dir/..}
   exec "$python_bin" "$script_dir/callosum_lab.py" --action node \
-    --root "${CALLOSUM_ROOT:-$repo_dir/..}" --node-id "${NODE_ID:-}" \
-    --config "${CONFIG:-}" --token-file "${TOKEN_FILE:-}" "$@"
+    --root "$lab_root" --node-id "${NODE_ID:-}" \
+    --config "${CONFIG:-$lab_root/lab.json}" --token-file "${TOKEN_FILE:-$lab_root/control.token}" "$@"
 fi
 if [[ ${1:-} == build ]]; then
   cmake -S "$repo_dir/mooncake-integration/pool_relay" -B "$native_build" \
