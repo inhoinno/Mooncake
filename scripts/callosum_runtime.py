@@ -77,6 +77,26 @@ class Log:
         with self.lock:
             self.file.write(json.dumps(record, sort_keys=True) + '\n')
 
+    def payload_trace(self, identity):
+        require(isinstance(identity, str) and len(identity) == 32
+                and all(c in '0123456789abcdef' for c in identity), 'invalid trace transfer ID')
+        # Authenticated control traffic only. Do not expose arbitrary files,
+        # object keys, payload, target addresses or registration secrets.
+        allowed = {'stage','node','monotonic_ns','wall_time_ns','evidence_class',
+                   'transfer_id','sender','receiver','chunk','batch_id','cardinality',
+                   'bytes','opcode','duration_ns','mode','path_mode','actual_transport',
+                   'object_byte_start'}
+        events = []
+        with self.lock:
+            self.file.flush()
+            with open(self.file.name) as stream:
+                for line in stream:
+                    event = json.loads(line)
+                    if event.get('transfer_id') == identity and event.get('stage') in ('batch_complete','chunk_complete'):
+                        require(len(events) < 2048, 'trace exceeds bounded smoke evidence limit')
+                        events.append({k:v for k,v in event.items() if k in allowed})
+        return events
+
 
 def config(path):
     c = json.loads(Path(path).read_text())
@@ -271,6 +291,8 @@ class Agent:
     def handle(self, method, d):
         if method == 'health':
             return self.descriptor()
+        if method == 'payload_trace':
+            return self.log.payload_trace(d.get('transfer_id'))
         if method == 'dispatch_status':
             return self.dispatcher.status()
         if method == 'dispatch':

@@ -192,6 +192,9 @@ class WorkerInitiator:
             if entry['state'] not in ('READY', 'MISS', 'CANCELLED_DRAINED', 'RELEASED'):
                 raise RuntimeError('target access is uncertain; retain allocation')
             entry['target'] = None
+            # A cached exception traceback can retain the load frame and owner.
+            # Released tombstones reject replay before consulting this field.
+            entry['error'] = None
             entry['state'] = 'RELEASED'
 
     def status(self):

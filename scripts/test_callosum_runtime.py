@@ -31,6 +31,8 @@ class RuntimeTest(unittest.TestCase):
             # This test owns both temporary files. Do not relax Mapping's guard.
             with patch.dict(os.environ, CALLOSUM_DESTRUCTIVE_ACK='1'):
                 mapping = runtime.Mapping(cfg, cfg['nodes'][0])
+            self.addCleanup(mapping.memory.close)
+            self.addCleanup(os.close, mapping.fd)
             owner = ctypes.create_string_buffer(source['length'])
             target = Target(ctypes.addressof(owner), source['length'], 'host-allocation-1', owner)
             calls = []
@@ -68,6 +70,10 @@ class RuntimeTest(unittest.TestCase):
                 worker.load(intent, missing, target)
             self.assertEqual(worker.status()[1]['state'], 'MISS')
             worker.release(intent, missing.consumer_id)
+            (root / 'initiation-status.log').write_text(json.dumps(dict(
+                validation_scope='ADAPTER_ONLY', evidence_class='TRANSFER_ONLY',
+                phase=first.phase, checksum=first.result['checksum'],
+                serving_proven=False, consumers=worker.status()), indent=2))
 
         self.run_cluster(2, exercise=exercise)
 
@@ -586,8 +592,18 @@ class RuntimeTest(unittest.TestCase):
                 self.assertLess(stages.index('verified'), stages.index('published'))
                 self.assertTrue(any(e.get('request_id') == 'req-1' and e['stage']=='published' for e in events))
                 import validate_relay_trace
-                trace = events + [json.loads(line) for path in (root/'state').glob('agent-*.jsonl')
-                                  for line in path.read_text().splitlines()]
+                # The operator launcher retrieves bounded payload evidence through
+                # the same authenticated control service, not SSH/file copying.
+                payload = [e for node in c['nodes'] for e in runtime.rpc(node['url'],
+                    'payload_trace',dict(transfer_id=result['transfer_id']))]
+                self.assertTrue(payload)
+                self.assertTrue(all(e['stage'] in ('batch_complete','chunk_complete') for e in payload))
+                with self.assertRaisesRegex(RuntimeError, 'invalid trace transfer ID'):
+                    runtime.rpc(urls[1], 'payload_trace',dict(transfer_id='../../not-a-log'))
+                with patch.dict(os.environ,CALLOSUM_CONTROL_TOKEN='wrong-token-for-control-test-'*2):
+                    with self.assertRaisesRegex(RuntimeError, 'unauthorized'):
+                        runtime.rpc(urls[1], 'payload_trace',dict(transfer_id=result['transfer_id']))
+                trace = events + payload
                 verdict = validate_relay_trace.validate(trace, result['transfer_id'],65537,'file-copy')
                 self.assertEqual(verdict['status'],'PASS')
                 self.assertFalse(verdict['serving_proven'])

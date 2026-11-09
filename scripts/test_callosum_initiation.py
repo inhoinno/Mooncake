@@ -148,6 +148,31 @@ class InitiationTest(unittest.TestCase):
         self.assertEqual(worker.status()[0]['state'], 'MISS')
         worker.release(self.intent, 'block-0')  # No transport or target access occurred.
 
+    def test_function_release_miss_owner(self):
+        import gc
+        import weakref
+        class Allocation:
+            pass
+        owner = Allocation()
+        reference = weakref.ref(owner)
+        destination = Target(0x30000, 4096, 'miss-allocation', owner)
+        def miss(*args):
+            raise CacheMiss('missing before submission')
+        worker = WorkerInitiator('a1', 'epoch1', miss)
+        worker.accept(self.intent)
+        # assertRaises clears traceback frames and would hide this regression.
+        try:
+            worker.load(self.intent, self.demand, destination)
+        except CacheMiss:
+            pass
+        else:
+            self.fail('expected an authoritative miss')
+        del destination, owner
+        self.assertIsNotNone(reference())
+        worker.release(self.intent, self.demand.consumer_id)
+        gc.collect()
+        self.assertIsNone(reference())  # No cached traceback may retain this owner.
+
     def test_status_bounds_and_completion_phase(self):
         worker = WorkerInitiator('a1', 'epoch1',
             lambda *args: Delivery('host_validated', {}), max_entries=1)
@@ -161,6 +186,35 @@ class InitiationTest(unittest.TestCase):
         self.assertNotIn('address', record)
         with self.assertRaisesRegex(RuntimeError, 'ledger full'):
             worker.accept(Intent('another', 'context', 'a1', 'epoch1', 1))
+
+    def test_failure_worker_checks_before_cuda(self):
+        from unittest.mock import Mock, patch
+        from callosum_worker import PoolWorker
+        worker = PoolWorker.__new__(PoolWorker)
+        worker.config, worker.node = {'master': 'unused'}, {'id': 'a1'}
+        worker.mapping, worker.cuda = Mock(), Mock()
+        fetched = dict(length=4096, version='source-v1')
+        with patch('callosum_worker.rpc', return_value=fetched):
+            with self.assertRaisesRegex(RuntimeError, 'generation differs'):
+                worker.load_into('key', self.target.address, 4096, 'request',
+                                 expected_length=4096, expected_version='source-v2')
+            with self.assertRaisesRegex(RuntimeError, 'length differs'):
+                worker.load_into('key', self.target.address, 8192, 'request', expected_length=8192)
+        worker.cuda.copy.assert_not_called()
+        worker.mapping.digest.assert_not_called()
+
+    def test_function_worker_adapter_reuses_loader(self):
+        from unittest.mock import Mock
+        from callosum_worker import PoolWorker
+        worker = PoolWorker.__new__(PoolWorker)
+        worker.epoch, worker.log = 'epoch1', Mock()
+        worker.load_into = Mock(return_value={'transfer_id': 'fixture-completion'})
+        delivery = worker._deliver_intent(self.intent, self.demand, self.target)
+        worker.load_into.assert_called_once_with(self.demand.key, self.target.address,
+            self.target.capacity, self.intent.request_id, tp_rank=0,
+            expected_length=4096, expected_version='')
+        self.assertEqual(delivery.phase, 'gpu_ready')  # Loader fixture, NOT CUDA evidence.
+        self.assertFalse(worker.log.emit.call_args.kwargs['serving_proven'])
 
 
 if __name__ == '__main__':
