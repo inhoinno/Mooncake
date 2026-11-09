@@ -7,7 +7,6 @@ No DAX write occurs before explicit extent authorization. A failed hardware run
 retains services, mappings and journals; this program never reclaims arenas.
 """
 import argparse
-import base64
 import hashlib
 import importlib.util
 import inspect
@@ -31,8 +30,6 @@ from urllib.parse import urlparse
 from urllib.error import URLError
 
 
-PATCH_SHA256 = '4e8ec5312e451ad15c30a9a4cea2d54d1cea76a1a3f14cc5a55d86c23e3c08e3'
-PATCH_B64 = 'ZGlmZiAtLWdpdCBhL21vb25jYWtlLWludGVncmF0aW9uL3Bvb2xfcmVsYXkvQ01ha2VMaXN0cy50eHQgYi9tb29uY2FrZS1pbnRlZ3JhdGlvbi9wb29sX3JlbGF5L0NNYWtlTGlzdHMudHh0CmluZGV4IDQwNmM1MDQwLi45MzgxNDlkMyAxMDA2NDQKLS0tIGEvbW9vbmNha2UtaW50ZWdyYXRpb24vcG9vbF9yZWxheS9DTWFrZUxpc3RzLnR4dAorKysgYi9tb29uY2FrZS1pbnRlZ3JhdGlvbi9wb29sX3JlbGF5L0NNYWtlTGlzdHMudHh0CkBAIC00Niw2ICs0Niw4IEBAIGZvcmVhY2godGVzdF9tZXRob2QKICAgICBzZXRfcHJvcGVydHkoVEVTVCBjYWxsb3N1bV9ydW50aW1lXyR7dGVzdF9tZXRob2R9IEFQUEVORCBQUk9QRVJUWSBMQUJFTFMgZnVuY3Rpb25hbCkKICAgZW5kaWYoKQogZW5kZm9yZWFjaCgpCitzZXRfcHJvcGVydHkoVEVTVCBjYWxsb3N1bV9ydW50aW1lX2luaXRpYXRpb25fbmF0aXZlX2ZpbGVfcGF0aCBBUFBFTkQKKyAgUFJPUEVSVFkgTEFCRUxTICJhZGFwdGVyO2luaXRpYXRpb24iKQogCiAjIFRoZXNlIHZhbGlkYXRlIGEgQ2FsbG9zdW0tZmFjaW5nIGNvbnRyYWN0LCBub3QgYW4gaW5zdGFsbGVkIER5bmFtbyBpbnRlZ3JhdGlvbi4KIGZvcmVhY2goY2F0ZWdvcnkgcHJlZmxpZ2h0IGZ1bmN0aW9uIGZhaWx1cmUgc3RhdHVzKQpkaWZmIC0tZ2l0IGEvc2NyaXB0cy9jYWxsb3N1bV9pbml0aWF0aW9uLnB5IGIvc2NyaXB0cy9jYWxsb3N1bV9pbml0aWF0aW9uLnB5CmluZGV4IDU1MmI5MWQxLi4wMWQ4ZDI1OCAxMDA2NDQKLS0tIGEvc2NyaXB0cy9jYWxsb3N1bV9pbml0aWF0aW9uLnB5CisrKyBiL3NjcmlwdHMvY2FsbG9zdW1faW5pdGlhdGlvbi5weQpAQCAtMTkyLDYgKzE5Miw5IEBAIGNsYXNzIFdvcmtlckluaXRpYXRvcjoKICAgICAgICAgICAgIGlmIGVudHJ5WydzdGF0ZSddIG5vdCBpbiAoJ1JFQURZJywgJ01JU1MnLCAnQ0FOQ0VMTEVEX0RSQUlORUQnLCAnUkVMRUFTRUQnKToKICAgICAgICAgICAgICAgICByYWlzZSBSdW50aW1lRXJyb3IoJ3RhcmdldCBhY2Nlc3MgaXMgdW5jZXJ0YWluOyByZXRhaW4gYWxsb2NhdGlvbicpCiAgICAgICAgICAgICBlbnRyeVsndGFyZ2V0J10gPSBOb25lCisgICAgICAgICAgICAjIEEgY2FjaGVkIGV4Y2VwdGlvbiB0cmFjZWJhY2sgY2FuIHJldGFpbiB0aGUgbG9hZCBmcmFtZSBhbmQgb3duZXIuCisgICAgICAgICAgICAjIFJlbGVhc2VkIHRvbWJzdG9uZXMgcmVqZWN0IHJlcGxheSBiZWZvcmUgY29uc3VsdGluZyB0aGlzIGZpZWxkLgorICAgICAgICAgICAgZW50cnlbJ2Vycm9yJ10gPSBOb25lCiAgICAgICAgICAgICBlbnRyeVsnc3RhdGUnXSA9ICdSRUxFQVNFRCcKIAogICAgIGRlZiBzdGF0dXMoc2VsZik6CmRpZmYgLS1naXQgYS9zY3JpcHRzL3J1bl9jYWxsb3N1bV9yZWxheS5zaCBiL3NjcmlwdHMvcnVuX2NhbGxvc3VtX3JlbGF5LnNoCmluZGV4IDhjNzdmYmEwLi5kNjJiMDY3NiAxMDA2NDQKLS0tIGEvc2NyaXB0cy9ydW5fY2FsbG9zdW1fcmVsYXkuc2gKKysrIGIvc2NyaXB0cy9ydW5fY2FsbG9zdW1fcmVsYXkuc2gKQEAgLTE1LDYgKzE1LDcgQEAgaWYgW1sgJHsxOi19ICE9IC0taGVscCAmJiAkezE6LX0gIT0gLWggXV07IHRoZW4KICAgIiRweXRob25fYmluIiAtYyAnaW1wb3J0IGNhbGxvc3VtX3JlbGF5X25hdGl2ZSBhcyBuOyBhc3NlcnQgbi5BQklfVkVSU0lPTiA9PSAyLCAicmVidWlsZCBuYXRpdmUgcmVsYXkgbW9kdWxlIicKIGZpCiBpZiBbWyAkezE6LX0gPT0gdGVzdCBdXTsgdGhlbgotICBleGVjICIkcHl0aG9uX2JpbiIgIiRzY3JpcHRfZGlyL3Rlc3RfY2FsbG9zdW1fcnVudGltZS5weSIKKyAgc2hpZnQKKyAgZXhlYyBjdGVzdCAtLXRlc3QtZGlyICIkbmF0aXZlX2J1aWxkIiAtLW91dHB1dC1vbi1mYWlsdXJlIC0tbm8tdGVzdHM9ZXJyb3IgIiRAIgogZmkKIGV4ZWMgIiRweXRob25fYmluIiAiJHNjcmlwdF9kaXIvY2FsbG9zdW1fcnVudGltZS5weSIgIiRAIgpkaWZmIC0tZ2l0IGEvc2NyaXB0cy90ZXN0X2NhbGxvc3VtX2luaXRpYXRpb24ucHkgYi9zY3JpcHRzL3Rlc3RfY2FsbG9zdW1faW5pdGlhdGlvbi5weQppbmRleCBlYmQ3Yzk3OS4uOGJmMTdmNGEgMTAwNjQ0Ci0tLSBhL3NjcmlwdHMvdGVzdF9jYWxsb3N1bV9pbml0aWF0aW9uLnB5CisrKyBiL3NjcmlwdHMvdGVzdF9jYWxsb3N1bV9pbml0aWF0aW9uLnB5CkBAIC0xNDgsNiArMTQ4LDMxIEBAIGNsYXNzIEluaXRpYXRpb25UZXN0KHVuaXR0ZXN0LlRlc3RDYXNlKToKICAgICAgICAgc2VsZi5hc3NlcnRFcXVhbCh3b3JrZXIuc3RhdHVzKClbMF1bJ3N0YXRlJ10sICdNSVNTJykKICAgICAgICAgd29ya2VyLnJlbGVhc2Uoc2VsZi5pbnRlbnQsICdibG9jay0wJykgICMgTm8gdHJhbnNwb3J0IG9yIHRhcmdldCBhY2Nlc3Mgb2NjdXJyZWQuCiAKKyAgICBkZWYgdGVzdF9mdW5jdGlvbl9yZWxlYXNlX21pc3Nfb3duZXIoc2VsZik6CisgICAgICAgIGltcG9ydCBnYworICAgICAgICBpbXBvcnQgd2Vha3JlZgorICAgICAgICBjbGFzcyBBbGxvY2F0aW9uOgorICAgICAgICAgICAgcGFzcworICAgICAgICBvd25lciA9IEFsbG9jYXRpb24oKQorICAgICAgICByZWZlcmVuY2UgPSB3ZWFrcmVmLnJlZihvd25lcikKKyAgICAgICAgZGVzdGluYXRpb24gPSBUYXJnZXQoMHgzMDAwMCwgNDA5NiwgJ21pc3MtYWxsb2NhdGlvbicsIG93bmVyKQorICAgICAgICBkZWYgbWlzcygqYXJncyk6CisgICAgICAgICAgICByYWlzZSBDYWNoZU1pc3MoJ21pc3NpbmcgYmVmb3JlIHN1Ym1pc3Npb24nKQorICAgICAgICB3b3JrZXIgPSBXb3JrZXJJbml0aWF0b3IoJ2ExJywgJ2Vwb2NoMScsIG1pc3MpCisgICAgICAgIHdvcmtlci5hY2NlcHQoc2VsZi5pbnRlbnQpCisgICAgICAgICMgYXNzZXJ0UmFpc2VzIGNsZWFycyB0cmFjZWJhY2sgZnJhbWVzIGFuZCB3b3VsZCBoaWRlIHRoaXMgcmVncmVzc2lvbi4KKyAgICAgICAgdHJ5OgorICAgICAgICAgICAgd29ya2VyLmxvYWQoc2VsZi5pbnRlbnQsIHNlbGYuZGVtYW5kLCBkZXN0aW5hdGlvbikKKyAgICAgICAgZXhjZXB0IENhY2hlTWlzczoKKyAgICAgICAgICAgIHBhc3MKKyAgICAgICAgZWxzZToKKyAgICAgICAgICAgIHNlbGYuZmFpbCgnZXhwZWN0ZWQgYW4gYXV0aG9yaXRhdGl2ZSBtaXNzJykKKyAgICAgICAgZGVsIGRlc3RpbmF0aW9uLCBvd25lcgorICAgICAgICBzZWxmLmFzc2VydElzTm90Tm9uZShyZWZlcmVuY2UoKSkKKyAgICAgICAgd29ya2VyLnJlbGVhc2Uoc2VsZi5pbnRlbnQsIHNlbGYuZGVtYW5kLmNvbnN1bWVyX2lkKQorICAgICAgICBnYy5jb2xsZWN0KCkKKyAgICAgICAgc2VsZi5hc3NlcnRJc05vbmUocmVmZXJlbmNlKCkpICAjIE5vIGNhY2hlZCB0cmFjZWJhY2sgbWF5IHJldGFpbiB0aGlzIG93bmVyLgorCiAgICAgZGVmIHRlc3Rfc3RhdHVzX2JvdW5kc19hbmRfY29tcGxldGlvbl9waGFzZShzZWxmKToKICAgICAgICAgd29ya2VyID0gV29ya2VySW5pdGlhdG9yKCdhMScsICdlcG9jaDEnLAogICAgICAgICAgICAgbGFtYmRhICphcmdzOiBEZWxpdmVyeSgnaG9zdF92YWxpZGF0ZWQnLCB7fSksIG1heF9lbnRyaWVzPTEpCkBAIC0xNjIsNiArMTg3LDM1IEBAIGNsYXNzIEluaXRpYXRpb25UZXN0KHVuaXR0ZXN0LlRlc3RDYXNlKToKICAgICAgICAgd2l0aCBzZWxmLmFzc2VydFJhaXNlc1JlZ2V4KFJ1bnRpbWVFcnJvciwgJ2xlZGdlciBmdWxsJyk6CiAgICAgICAgICAgICB3b3JrZXIuYWNjZXB0KEludGVudCgnYW5vdGhlcicsICdjb250ZXh0JywgJ2ExJywgJ2Vwb2NoMScsIDEpKQogCisgICAgZGVmIHRlc3RfZmFpbHVyZV93b3JrZXJfY2hlY2tzX2JlZm9yZV9jdWRhKHNlbGYpOgorICAgICAgICBmcm9tIHVuaXR0ZXN0Lm1vY2sgaW1wb3J0IE1vY2ssIHBhdGNoCisgICAgICAgIGZyb20gY2FsbG9zdW1fd29ya2VyIGltcG9ydCBQb29sV29ya2VyCisgICAgICAgIHdvcmtlciA9IFBvb2xXb3JrZXIuX19uZXdfXyhQb29sV29ya2VyKQorICAgICAgICB3b3JrZXIuY29uZmlnLCB3b3JrZXIubm9kZSA9IHsnbWFzdGVyJzogJ3VudXNlZCd9LCB7J2lkJzogJ2ExJ30KKyAgICAgICAgd29ya2VyLm1hcHBpbmcsIHdvcmtlci5jdWRhID0gTW9jaygpLCBNb2NrKCkKKyAgICAgICAgZmV0Y2hlZCA9IGRpY3QobGVuZ3RoPTQwOTYsIHZlcnNpb249J3NvdXJjZS12MScpCisgICAgICAgIHdpdGggcGF0Y2goJ2NhbGxvc3VtX3dvcmtlci5ycGMnLCByZXR1cm5fdmFsdWU9ZmV0Y2hlZCk6CisgICAgICAgICAgICB3aXRoIHNlbGYuYXNzZXJ0UmFpc2VzUmVnZXgoUnVudGltZUVycm9yLCAnZ2VuZXJhdGlvbiBkaWZmZXJzJyk6CisgICAgICAgICAgICAgICAgd29ya2VyLmxvYWRfaW50bygna2V5Jywgc2VsZi50YXJnZXQuYWRkcmVzcywgNDA5NiwgJ3JlcXVlc3QnLAorICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZXhwZWN0ZWRfbGVuZ3RoPTQwOTYsIGV4cGVjdGVkX3ZlcnNpb249J3NvdXJjZS12MicpCisgICAgICAgICAgICB3aXRoIHNlbGYuYXNzZXJ0UmFpc2VzUmVnZXgoUnVudGltZUVycm9yLCAnbGVuZ3RoIGRpZmZlcnMnKToKKyAgICAgICAgICAgICAgICB3b3JrZXIubG9hZF9pbnRvKCdrZXknLCBzZWxmLnRhcmdldC5hZGRyZXNzLCA4MTkyLCAncmVxdWVzdCcsIGV4cGVjdGVkX2xlbmd0aD04MTkyKQorICAgICAgICB3b3JrZXIuY3VkYS5jb3B5LmFzc2VydF9ub3RfY2FsbGVkKCkKKyAgICAgICAgd29ya2VyLm1hcHBpbmcuZGlnZXN0LmFzc2VydF9ub3RfY2FsbGVkKCkKKworICAgIGRlZiB0ZXN0X2Z1bmN0aW9uX3dvcmtlcl9hZGFwdGVyX3JldXNlc19sb2FkZXIoc2VsZik6CisgICAgICAgIGZyb20gdW5pdHRlc3QubW9jayBpbXBvcnQgTW9jaworICAgICAgICBmcm9tIGNhbGxvc3VtX3dvcmtlciBpbXBvcnQgUG9vbFdvcmtlcgorICAgICAgICB3b3JrZXIgPSBQb29sV29ya2VyLl9fbmV3X18oUG9vbFdvcmtlcikKKyAgICAgICAgd29ya2VyLmVwb2NoLCB3b3JrZXIubG9nID0gJ2Vwb2NoMScsIE1vY2soKQorICAgICAgICB3b3JrZXIubG9hZF9pbnRvID0gTW9jayhyZXR1cm5fdmFsdWU9eyd0cmFuc2Zlcl9pZCc6ICdmaXh0dXJlLWNvbXBsZXRpb24nfSkKKyAgICAgICAgZGVsaXZlcnkgPSB3b3JrZXIuX2RlbGl2ZXJfaW50ZW50KHNlbGYuaW50ZW50LCBzZWxmLmRlbWFuZCwgc2VsZi50YXJnZXQpCisgICAgICAgIHdvcmtlci5sb2FkX2ludG8uYXNzZXJ0X2NhbGxlZF9vbmNlX3dpdGgoc2VsZi5kZW1hbmQua2V5LCBzZWxmLnRhcmdldC5hZGRyZXNzLAorICAgICAgICAgICAgc2VsZi50YXJnZXQuY2FwYWNpdHksIHNlbGYuaW50ZW50LnJlcXVlc3RfaWQsIHRwX3Jhbms9MCwKKyAgICAgICAgICAgIGV4cGVjdGVkX2xlbmd0aD00MDk2LCBleHBlY3RlZF92ZXJzaW9uPScnKQorICAgICAgICBzZWxmLmFzc2VydEVxdWFsKGRlbGl2ZXJ5LnBoYXNlLCAnZ3B1X3JlYWR5JykgICMgTG9hZGVyIGZpeHR1cmUsIE5PVCBDVURBIGV2aWRlbmNlLgorICAgICAgICBzZWxmLmFzc2VydEZhbHNlKHdvcmtlci5sb2cuZW1pdC5jYWxsX2FyZ3Mua3dhcmdzWydzZXJ2aW5nX3Byb3ZlbiddKQorCiAKIGlmIF9fbmFtZV9fID09ICdfX21haW5fXyc6CiAgICAgdW5pdHRlc3QubWFpbigpCmRpZmYgLS1naXQgYS9zY3JpcHRzL3Rlc3RfY2FsbG9zdW1fcnVudGltZS5weSBiL3NjcmlwdHMvdGVzdF9jYWxsb3N1bV9ydW50aW1lLnB5CmluZGV4IDE2MDZhOGMyLi41OWZjZWJhNCAxMDA2NDQKLS0tIGEvc2NyaXB0cy90ZXN0X2NhbGxvc3VtX3J1bnRpbWUucHkKKysrIGIvc2NyaXB0cy90ZXN0X2NhbGxvc3VtX3J1bnRpbWUucHkKQEAgLTMxLDYgKzMxLDggQEAgY2xhc3MgUnVudGltZVRlc3QodW5pdHRlc3QuVGVzdENhc2UpOgogICAgICAgICAgICAgIyBUaGlzIHRlc3Qgb3ducyBib3RoIHRlbXBvcmFyeSBmaWxlcy4gRG8gbm90IHJlbGF4IE1hcHBpbmcncyBndWFyZC4KICAgICAgICAgICAgIHdpdGggcGF0Y2guZGljdChvcy5lbnZpcm9uLCBDQUxMT1NVTV9ERVNUUlVDVElWRV9BQ0s9JzEnKToKICAgICAgICAgICAgICAgICBtYXBwaW5nID0gcnVudGltZS5NYXBwaW5nKGNmZywgY2ZnWydub2RlcyddWzBdKQorICAgICAgICAgICAgc2VsZi5hZGRDbGVhbnVwKG1hcHBpbmcubWVtb3J5LmNsb3NlKQorICAgICAgICAgICAgc2VsZi5hZGRDbGVhbnVwKG9zLmNsb3NlLCBtYXBwaW5nLmZkKQogICAgICAgICAgICAgb3duZXIgPSBjdHlwZXMuY3JlYXRlX3N0cmluZ19idWZmZXIoc291cmNlWydsZW5ndGgnXSkKICAgICAgICAgICAgIHRhcmdldCA9IFRhcmdldChjdHlwZXMuYWRkcmVzc29mKG93bmVyKSwgc291cmNlWydsZW5ndGgnXSwgJ2hvc3QtYWxsb2NhdGlvbi0xJywgb3duZXIpCiAgICAgICAgICAgICBjYWxscyA9IFtdCkBAIC02OCw2ICs3MCwxMCBAQCBjbGFzcyBSdW50aW1lVGVzdCh1bml0dGVzdC5UZXN0Q2FzZSk6CiAgICAgICAgICAgICAgICAgd29ya2VyLmxvYWQoaW50ZW50LCBtaXNzaW5nLCB0YXJnZXQpCiAgICAgICAgICAgICBzZWxmLmFzc2VydEVxdWFsKHdvcmtlci5zdGF0dXMoKVsxXVsnc3RhdGUnXSwgJ01JU1MnKQogICAgICAgICAgICAgd29ya2VyLnJlbGVhc2UoaW50ZW50LCBtaXNzaW5nLmNvbnN1bWVyX2lkKQorICAgICAgICAgICAgKHJvb3QgLyAnaW5pdGlhdGlvbi1zdGF0dXMubG9nJykud3JpdGVfdGV4dChqc29uLmR1bXBzKGRpY3QoCisgICAgICAgICAgICAgICAgdmFsaWRhdGlvbl9zY29wZT0nQURBUFRFUl9PTkxZJywgZXZpZGVuY2VfY2xhc3M9J1RSQU5TRkVSX09OTFknLAorICAgICAgICAgICAgICAgIHBoYXNlPWZpcnN0LnBoYXNlLCBjaGVja3N1bT1maXJzdC5yZXN1bHRbJ2NoZWNrc3VtJ10sCisgICAgICAgICAgICAgICAgc2VydmluZ19wcm92ZW49RmFsc2UsIGNvbnN1bWVycz13b3JrZXIuc3RhdHVzKCkpLCBpbmRlbnQ9MikpCiAKICAgICAgICAgc2VsZi5ydW5fY2x1c3RlcigyLCBleGVyY2lzZT1leGVyY2lzZSkKIAo='
 SOURCE_FILES = (
     'scripts/callosum_runtime.py', 'scripts/callosum_dispatch.py',
     'scripts/callosum_initiation.py', 'scripts/callosum_worker.py',
@@ -43,77 +40,12 @@ SOURCE_FILES = (
     'mooncake-integration/pool_relay/scatter_layout.h',
     'mooncake-integration/transfer_engine/transfer_engine_py.cpp',
 )
-TRACE_PATCH = r"""diff --git a/scripts/callosum_runtime.py b/scripts/callosum_runtime.py
---- a/scripts/callosum_runtime.py
-+++ b/scripts/callosum_runtime.py
-@@ -77,6 +77,26 @@ class Log:
-         with self.lock:
-             self.file.write(json.dumps(record, sort_keys=True) + '\n')
- 
-+    def payload_trace(self, identity):
-+        require(isinstance(identity, str) and len(identity) == 32
-+                and all(c in '0123456789abcdef' for c in identity), 'invalid trace transfer ID')
-+        # Authenticated control traffic only. Do not expose arbitrary files,
-+        # object keys, payload, target addresses or registration secrets.
-+        allowed = {'stage','node','monotonic_ns','wall_time_ns','evidence_class',
-+                   'transfer_id','sender','receiver','chunk','batch_id','cardinality',
-+                   'bytes','opcode','duration_ns','mode','path_mode','actual_transport',
-+                   'object_byte_start'}
-+        events = []
-+        with self.lock:
-+            self.file.flush()
-+            with open(self.file.name) as stream:
-+                for line in stream:
-+                    event = json.loads(line)
-+                    if event.get('transfer_id') == identity and event.get('stage') in ('batch_complete','chunk_complete'):
-+                        require(len(events) < 2048, 'trace exceeds bounded smoke evidence limit')
-+                        events.append({k:v for k,v in event.items() if k in allowed})
-+        return events
-+
- 
- def config(path):
-     c = json.loads(Path(path).read_text())
-@@ -271,6 +291,8 @@ class Agent:
-     def handle(self, method, d):
-         if method == 'health':
-             return self.descriptor()
-+        if method == 'payload_trace':
-+            return self.log.payload_trace(d.get('transfer_id'))
-         if method == 'dispatch_status':
-             return self.dispatcher.status()
-         if method == 'dispatch':
-"""
 PACKAGES = (
     'build-essential', 'cmake', 'git', 'pkg-config', 'python3-dev', 'python3-venv',
     'libgoogle-glog-dev', 'libgflags-dev', 'libjsoncpp-dev', 'libnuma-dev',
     'libibverbs-dev', 'libasio-dev', 'libyaml-cpp-dev',
     'daxctl', 'rdma-core', 'ibverbs-utils', 'iproute2',
 )
-TRACE_TEST_PATCH = """diff --git a/scripts/test_callosum_runtime.py b/scripts/test_callosum_runtime.py
---- a/scripts/test_callosum_runtime.py
-+++ b/scripts/test_callosum_runtime.py
-@@ -592,8 +592,18 @@ class RuntimeTest(unittest.TestCase):
-                 self.assertLess(stages.index('verified'), stages.index('published'))
-                 self.assertTrue(any(e.get('request_id') == 'req-1' and e['stage']=='published' for e in events))
-                 import validate_relay_trace
--                trace = events + [json.loads(line) for path in (root/'state').glob('agent-*.jsonl')
--                                  for line in path.read_text().splitlines()]
-+                # The operator launcher retrieves bounded payload evidence through
-+                # the same authenticated control service, not SSH/file copying.
-+                payload = [e for node in c['nodes'] for e in runtime.rpc(node['url'],
-+                    'payload_trace',dict(transfer_id=result['transfer_id']))]
-+                self.assertTrue(payload)
-+                self.assertTrue(all(e['stage'] in ('batch_complete','chunk_complete') for e in payload))
-+                with self.assertRaisesRegex(RuntimeError, 'invalid trace transfer ID'):
-+                    runtime.rpc(urls[1], 'payload_trace',dict(transfer_id='../../not-a-log'))
-+                with patch.dict(os.environ,CALLOSUM_CONTROL_TOKEN='wrong-token-for-control-test-'*2):
-+                    with self.assertRaisesRegex(RuntimeError, 'unauthorized'):
-+                        runtime.rpc(urls[1], 'payload_trace',dict(transfer_id=result['transfer_id']))
-+                trace = events + payload
-                 verdict = validate_relay_trace.validate(trace, result['transfer_id'],65537,'file-copy')
-                 self.assertEqual(verdict['status'],'PASS')
-                 self.assertFalse(verdict['serving_proven'])
-"""
 
 
 def require(condition, message):
@@ -189,24 +121,6 @@ def source_path(root):
     return source
 
 
-def apply_remaining_patch(source, run, runner):
-    payload = base64.b64decode(PATCH_B64)
-    require(hashlib.sha256(payload).hexdigest() == PATCH_SHA256, 'embedded patch checksum failed')
-    # Check each bounded patch separately: a host may already have the original
-    # software fixes but not the read-only trace contract.
-    for name,data in (('remaining.patch',payload),('runtime-trace.patch',TRACE_PATCH.encode()),
-                      ('runtime-trace-test.patch',TRACE_TEST_PATCH.encode())):
-        patch = Path(run) / name
-        patch.write_bytes(data)
-        command = ['git', '-C', str(source), 'apply']
-        done = subprocess.run(command + ['--reverse', '--check', str(patch)], capture_output=True)
-        if done.returncode == 0:
-            runner.say(f'[patch] {name} already applied; preserve working tree')
-            continue
-        runner.call('patch-check', command + ['--check', patch])
-        runner.call('patch-apply', command + [patch])
-
-
 def package_files(package):
     return subprocess.check_output(['dpkg', '-L', package], text=True).splitlines()
 
@@ -226,7 +140,8 @@ def prepare(root, run, args, runner):
     runner.call('source-head', ['git', '-C', source, 'log', '-1', '--oneline'])
     runner.call('source-status', ['git', '-C', source, 'status', '--short'])
     runner.call('launcher-tests', [args.python, source/'scripts/test_callosum_lab.py', '-v'], clean_env())
-    apply_remaining_patch(source, run, runner)
+    # Build the selected checkout. Historical backports must be delivered as
+    # source changes, never replayed over current or partially updated files.
     runner.stage = 'native-dependencies'
     missing = []
     for package in PACKAGES:

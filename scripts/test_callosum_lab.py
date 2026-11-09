@@ -1,6 +1,4 @@
 """Portable orchestration tests. These are not glog/RDMA hardware validation."""
-import base64
-import hashlib
 import io
 import json
 import os
@@ -353,36 +351,84 @@ class LabTest(unittest.TestCase):
                     '--action','node','--node-id','some-controller','--initialize']),0)
             self.assertEqual(order,['initialize'])
 
-    def test_embedded_patch_is_complete(self):
-        payload=base64.b64decode(lab.PATCH_B64)
-        self.assertEqual(hashlib.sha256(payload).hexdigest(), lab.PATCH_SHA256)
-        self.assertTrue(payload.endswith(b'\n'))
-        self.assertEqual(payload.count(b'diff --git '),5)
+    def exercise_preparation_source_boundary(self, variant):
+        """Real prepare orchestration up to the first external dependency.
 
-    def test_embedded_patch_applies_to_base_and_is_idempotent(self):
+        Git inspection is real. The nested test child is stubbed to prevent
+        recursion; missing OS packages stop before any install. This does not
+        claim Linux build or partial-source compatibility.
+        """
         source=Path(lab.__file__).resolve().parent.parent
         files=('mooncake-integration/pool_relay/CMakeLists.txt','scripts/callosum_initiation.py',
                'scripts/run_callosum_relay.sh','scripts/test_callosum_initiation.py',
                'scripts/test_callosum_runtime.py','scripts/callosum_runtime.py')
         with tempfile.TemporaryDirectory() as directory,patch('sys.stdout',new=io.StringIO()):
             root=Path(directory)
-            checkout=root/'checkout'
+            checkout=root/'Mooncake-dev'
             checkout.mkdir()
             for file in files:
-                data=subprocess.check_output(['git','-C',str(source),'show','996d08c0:'+file])
                 target=checkout/file
                 target.parent.mkdir(parents=True,exist_ok=True)
-                target.write_bytes(data)
+                shutil.copy2(source/file,target)
+            if variant=='mixed':
+                path=checkout/'scripts/callosum_initiation.py'
+                path.write_text(path.read_text().replace("            entry['error'] = None\n",''))
+            if variant=='local-edits':
+                for name in ('scripts/run_callosum_relay.sh','mooncake-integration/pool_relay/CMakeLists.txt'):
+                    with (checkout/name).open('a') as stream:
+                        stream.write('\n# unrelated operator edit must survive\n')
+            subprocess.run(['git','-C',str(checkout),'init','-q'],check=True)
+            subprocess.run(['git','-C',str(checkout),'add','.'],check=True)
+            subprocess.run(['git','-C',str(checkout),'-c','user.name=Fixture',
+                '-c','user.email=fixture@example.invalid','-c','commit.gpgsign=false',
+                'commit','-qm','current-source fixture'],check=True)
+            before={p:lab.digest(checkout/p) for p in files}
+            # Source preservation is not permission to use an incomplete fix.
+            # Execute the actual lifetime regression against the mixed module.
+            behavior=subprocess.run([sys.executable,str(checkout/'scripts/test_callosum_initiation.py'),
+                'InitiationTest.test_function_release_miss_owner'],
+                text=True,capture_output=True,env=dict(lab.clean_env(),PYTHONPATH=str(source/'scripts')))
+            if variant=='mixed':
+                self.assertNotEqual(behavior.returncode,0)
+                self.assertIn('AssertionError',behavior.stderr)
+            else:
+                self.assertEqual(behavior.returncode,0,behavior.stderr)
             runner=lab.Runner(root/'evidence')
+            original_call=runner.call
+            calls=[]
+            def call(stage,command,*args,**kwargs):
+                calls.append((stage,list(map(str,command))))
+                if stage=='launcher-tests':
+                    return ''  # Full suite runs outside this nested fixture.
+                return original_call(stage,command,*args,**kwargs)
+            runner.call=call
+            original_run=subprocess.run
+            def os_command(command,*args,**kwargs):
+                if command[0]=='dpkg-query':
+                    return subprocess.CompletedProcess(command,1,stdout='',stderr='fixture: absent')
+                return original_run(command,*args,**kwargs)
             try:
-                lab.apply_remaining_patch(checkout,root/'evidence',runner)
-                expected={p:lab.digest(checkout/p) for p in files}
-                lab.apply_remaining_patch(checkout,root/'evidence',runner)
-                self.assertEqual(expected,{p:lab.digest(checkout/p) for p in files})
-                self.assertIn("entry['error'] = None",(checkout/'scripts/callosum_initiation.py').read_text())
-                self.assertIn("if method == 'payload_trace':",(checkout/'scripts/callosum_runtime.py').read_text())
+                with patch.object(lab.sys,'platform','linux'), \
+                        patch.object(lab.subprocess,'run',side_effect=os_command):
+                    with self.assertRaisesRegex(RuntimeError,'Missing packages'):
+                        lab.prepare(root,root/'evidence',
+                            SimpleNamespace(python=sys.executable,skip_apt=True),runner)
+                self.assertEqual(runner.stage,'native-dependencies')
+                self.assertEqual([stage for stage,_ in calls],['source-head','source-status','launcher-tests'])
+                self.assertEqual(before,{p:lab.digest(checkout/p) for p in files})
+                self.assertFalse(list((root/'evidence').glob('*.patch')))
+                self.assertFalse(runner.services_may_be_live)
             finally:
                 runner.log.close()
+
+    def test_preparation_current_checkout_does_not_replay_old_patches(self):
+        self.exercise_preparation_source_boundary('current')
+
+    def test_preparation_preserves_mixed_source_without_guessing_patch_state(self):
+        self.exercise_preparation_source_boundary('mixed')
+
+    def test_preparation_preserves_local_edits_without_runtime_patch_mutation(self):
+        self.exercise_preparation_source_boundary('local-edits')
 
     def test_environment_excludes_stale_libraries_and_headers(self):
         with patch.dict(os.environ, {'LD_PRELOAD':'old.so','PYTHONPATH':'old',
