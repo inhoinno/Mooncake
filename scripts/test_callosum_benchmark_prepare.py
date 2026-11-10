@@ -20,6 +20,26 @@ import test_callosum_write_matrix as matrix_tests
 
 
 class PreparationTest(unittest.TestCase):
+    def test_peer_export_resolves_private_inputs_relative_to_config_not_ssh_cwd(self):
+        import shlex
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); inputs=root/'inputs'; inputs.mkdir()
+            private=inputs/'token'; private.write_text('private-controller-token-'*3); private.chmod(0o600)
+            (inputs/'topology.json').write_text('{"fixture":true}')
+            target=root/'matrix.json'
+            target.write_text(json.dumps(dict(workflow=dict(node='a1'),
+                fresh_session=dict(controller='a1'),token_file='inputs/token',topology_file='inputs/topology.json')))
+            args=SimpleNamespace(peer='operator@host')
+            def ssh(argv,**kwargs):
+                command=shlex.split(argv[-1])
+                command[2]=command[2].replace("Path('/etc/machine-id').read_text().strip()",repr('remote-machine'))
+                return subprocess.run([sys.executable,*command[1:]],cwd=inputs,check=True,
+                    capture_output=True,text=True).stdout
+            with patch.object(matrix.subprocess,'check_output',side_effect=ssh):
+                value=matrix.peer_inputs(args,target,('-p','2022'))
+            self.assertEqual(value['topology'],dict(fixture=True))
+            self.assertEqual(value['token'],private.read_text().strip())
+
     def test_peer_session_reports_init_checkout_and_profile_differences_without_secrets(self):
         local=dict(controller='a1',profile=dict(sizes=[1,2]),software={'launcher.py':'old'})
         peer=dict(controller='a1',profile=dict(sizes=[1,4]),software={'launcher.py':'new'})
@@ -743,6 +763,16 @@ class PreparationTest(unittest.TestCase):
         # Binds are modelled, not listeners. These fixtures issue no network traffic.
         stack.enter_context(patch.object(prep.socket,'socket'))
         return path,args
+
+    def test_hugetlb_permission_accepts_configured_primary_group_without_root(self):
+        with tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+            root=Path(directory); path,args=self.inspect_fixture(root,stack)
+            with patch.object(prep.os,'geteuid',return_value=1000), \
+                 patch.object(prep.os,'getegid',return_value=0),patch.object(prep.os,'getgroups',return_value=[]):
+                report=prep.inspect(path,args,root/'work',matrix.load,live=False)
+            self.assertFalse(any(i['check']=='hugetlb_permission' for i in report['issues']))
+            self.assertEqual(report['execution_account']['effective_uid'],1000)
+            self.assertEqual(report['hugetlb_permission']['uid'],1000)
 
     def test_failure_stale_agent_and_zero_pages_reported_together_then_repeat_is_read_only(self):
         with tempfile.TemporaryDirectory() as directory:

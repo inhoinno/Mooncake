@@ -286,6 +286,7 @@ def inspect(path,args,work,loader,live=True):
     result=dict(status='BLOCKED',scope='READ_ONLY_PREPARATION',node=args.node,issues=[],
                 purpose='FORMAL_PERFORMANCE',
                 services_started=False,devices_mapped=False,created_unix_ns=time.time_ns(),software=software())
+    result['execution_account']=dict(uid=os.getuid(),effective_uid=os.geteuid(),gid=os.getgid())
     receiver_probes=live or getattr(args,'action',None)=='prepare'
     def check(name,operation):
         if not live and name=='cxl_status':
@@ -401,8 +402,9 @@ def inspect(path,args,work,loader,live=True):
                 effective=int(next(s.split(':')[1] for s in Path('/proc/self/status').read_text().splitlines()
                                    if s.startswith('CapEff:')).strip(),16)
                 group=int(Path('/proc/sys/vm/hugetlb_shm_group').read_text())
-                require(os.geteuid()==0 or effective & (1<<14) or group in os.getgroups(),
-                        'HugeTLB permission missing: use the lab-approved privileged account or HugeTLB group; provisioning pages does not grant allocation permission')
+                require(os.geteuid()==0 or effective & (1<<14) or group in {os.getegid(),*os.getgroups()},
+                        'HugeTLB permission missing for the ordinary benchmark account: configure an approved HugeTLB group/session; '
+                        'provisioning pages does not grant allocation permission. Do not rerun the whole benchmark with sudo.')
                 return dict(uid=os.geteuid(),hugetlb_group=group)
             check('hugetlb_permission',huge_permission)
         soft,hard=resource.getrlimit(resource.RLIMIT_MEMLOCK)
@@ -410,7 +412,10 @@ def inspect(path,args,work,loader,live=True):
         if 'cxl' in args.backings: required=max(required,c['pools'][node['pool']]['capacity'])
         result['memlock']=dict(soft=soft,hard=hard,required=required)
         if soft!=resource.RLIM_INFINITY and soft<required and hard!=resource.RLIM_INFINITY and hard<required:
-            result['issues'].append(dict(check='memlock',error=f'hard limit {hard} below {required}; an authorized OS/session limit change is required'))
+            result['issues'].append(dict(check='memlock',error=f'hard limit {hard} below {required}; an authorized OS/session limit change is required',
+                required_bytes=required,configured_hard_bytes=hard,
+                next_action='Raise this ordinary account session hard limit, then start a new login session and rerun prepare. '
+                            'ulimit cannot raise a hard limit without permission; do not run the whole benchmark as root.'))
         if numa and needed:
             pages=check('hugepages',lambda:huge_snapshot(numa['node']))
             # Existing matching receiver MRs consume pages but must not reserve them twice.

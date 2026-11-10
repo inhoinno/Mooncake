@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path
 import resource
 import signal
@@ -13,6 +14,40 @@ import sys
 import tempfile
 import time
 from urllib.parse import urlparse
+
+def benchmark_account():
+    """Drop accidental sudo before project imports, config reads or file creation."""
+    if os.geteuid()!=0: return
+    if not (os.environ.get('SUDO_UID') and os.environ.get('SUDO_USER')):
+        raise RuntimeError('Run the benchmark as its ordinary account, not a root shell; no files created')
+    uid=int(os.environ['SUDO_UID'])
+    account=pwd.getpwnam(os.environ['SUDO_USER'])
+    if not (uid>0 and account.pw_uid==uid):
+        raise RuntimeError('invalid sudo invoking account; no files created')
+    os.initgroups(account.pw_name,account.pw_gid)
+    os.setgid(account.pw_gid)
+    os.setuid(uid)
+    if not (os.getuid()==uid and os.geteuid()==uid):
+        raise RuntimeError('failed to drop benchmark privileges')
+    if hasattr(os,'getresuid'):
+        if os.getresuid()!=(uid,uid,uid):
+            raise RuntimeError('saved root UID remains; benchmark refused')
+    if hasattr(os,'getresgid'):
+        if os.getresgid()!=(account.pw_gid,)*3:
+            raise RuntimeError('saved root GID remains; benchmark refused')
+    # sudo -E must not leave root's cache/SSH environment in ordinary children.
+    for name in ('HOME','XDG_CACHE_HOME','XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_RUNTIME_DIR'):
+        os.environ.pop(name,None)
+    os.environ.update(USER=account.pw_name,LOGNAME=account.pw_name)
+
+
+if __name__=='__main__':
+    try: benchmark_account()
+    except Exception as error:
+        print(json.dumps(dict(status='FAIL',stage='execution-account',error=str(error),
+            services_started=False,devices_mapped=False,files_created=False)),file=sys.stderr)
+        raise SystemExit(1)
+
 
 from callosum_lab import Runner, clean_env
 from callosum_runtime import config, require, rpc
@@ -24,6 +59,23 @@ from callosum_benchmark_report import write_report
 def resolve(base,value):
     require(isinstance(value,str) and value.strip(),'nonempty path required')
     return (base/Path(value)).resolve()
+
+
+def evidence_directory(parent,prefix):
+    require(os.geteuid()!=0,'root-owned benchmark evidence is prohibited')
+    return Path(tempfile.mkdtemp(prefix=prefix,dir=Path(parent).resolve()))
+
+
+def receiver_exit_error(child,log,mode,env):
+    code=child.poll()
+    if code is None: return
+    with Path(log).open('rb') as stream:
+        stream.seek(0,os.SEEK_END); stream.seek(max(0,stream.tell()-8192))
+        tail=stream.read().decode(errors='replace')
+    secret=env.get('CALLOSUM_CONTROL_TOKEN')
+    if secret: tail=tail.replace(secret,'[REDACTED]')
+    raise RuntimeError(f'{mode} receiver exited (exit={code}); log={log}\n'
+                       f'--- receiver log tail ---\n{tail}\n--- end receiver log ---')
 
 
 def load(path,args):
@@ -164,7 +216,7 @@ def receive(spec,c,args,topology,receipt,private,env,out,runner):
                 state_dir=str(out/mode),config=str(topology),mode=mode)))
             deadline=time.monotonic()+60
             while True:
-                require(child.poll() is None,f'{mode} receiver exited; inspect {out}/{mode}.log')
+                receiver_exit_error(child,out/f'{mode}.log',mode,env)
                 try:
                     live=receiver_health(spec,c,args,mode)
                     break
@@ -317,12 +369,12 @@ def peer_inputs(args,remote_config,ssh_options):
     require(args.peer,'prepare requires --peer user@IP; no address is inferred or contacted automatically')
     code='''import json,sys
 from pathlib import Path
-p=Path(sys.argv[1]); c=json.loads(p.read_text())
+p=Path(sys.argv[1]).resolve(); c=json.loads(p.read_text())
 assert c.get('workflow'), 'Run init on this peer first'
-private=Path(c['token_file'])
+private=(p.parent/c['token_file']).resolve()
 assert private.stat().st_mode & 0o077 == 0, 'Token is not private'
 value=dict(session=c['fresh_session'],workflow=c['workflow'],
-    topology=json.loads(Path(c['topology_file']).read_text()),
+    topology=json.loads((p.parent/c['topology_file']).resolve().read_text()),
     machine_id=Path('/etc/machine-id').read_text().strip())
 if c['workflow']['node']==c['fresh_session']['controller']:
     value['token']=private.read_text().strip()
@@ -569,6 +621,7 @@ def main():
     args=parser.parse_args(); runner=None; phase='configuration'; work=None
     transition_possible=False; host_resources_changed=False
     try:
+        benchmark_account()
         apply_session_profile(args)
         require(not args.create_token or args.action=='init','--create-token is only valid with init')
         require(len(set(args.backings))==len(args.backings) and len(set(args.page_modes))==len(args.page_modes),
@@ -587,7 +640,7 @@ def main():
             root=Path(args.config).resolve().parent/'runs'
             root.mkdir(parents=True,exist_ok=True)
             # No old config/receipt/env is read to choose this directory.
-            runner=Runner(Path(tempfile.mkdtemp(prefix='write-session-',dir=root)))
+            runner=Runner(evidence_directory(root,'write-session-'))
             runner.remote_mutation_possible=False
             preparation.fresh_configuration(args.config,args,runner)
             if args.generate_only: return 0
@@ -702,7 +755,7 @@ def main():
             resource.setrlimit(resource.RLIMIT_MEMLOCK,(needed,hard))
         os.environ['CALLOSUM_CONTROL_TOKEN']=env['CALLOSUM_CONTROL_TOKEN']
         root.mkdir(parents=True,exist_ok=True)
-        out=Path(tempfile.mkdtemp(prefix=f'matrix-{args.node}-',dir=root))
+        out=evidence_directory(root,f'matrix-{args.node}-')
         runner=Runner(out); runner.remote_mutation_possible=False
         (out/'local-readiness.json').write_text(json.dumps(local,indent=2))
         (out/'peer-readiness.json').write_text(json.dumps(peer,indent=2))

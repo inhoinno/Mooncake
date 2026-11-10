@@ -5,6 +5,8 @@ import io
 import json
 import mmap
 import os
+import builtins
+import runpy
 from pathlib import Path
 import subprocess
 import sys
@@ -22,6 +24,104 @@ import test_callosum_dram_benchmark as dram_tests
 
 
 class MatrixTest(unittest.TestCase):
+    def test_script_drops_sudo_before_any_project_import_or_argparse(self):
+        state=dict(uid=0); imports=[]; original=builtins.__import__
+        def importer(name,*a,**kw):
+            if name.startswith('callosum_'): imports.append((name,state['uid']))
+            return original(name,*a,**kw)
+        with patch.object(sys,'argv',['matrix','--help']), \
+             patch.object(matrix.os,'geteuid',side_effect=lambda:state['uid']), \
+             patch.object(matrix.os,'getuid',side_effect=lambda:state['uid']), \
+             patch.object(matrix.os,'getresuid',side_effect=lambda:(state['uid'],)*3,create=True), \
+             patch.object(matrix.os,'getresgid',return_value=(1000,)*3,create=True), \
+             patch.dict(os.environ,SUDO_UID='1000',SUDO_USER='fixture',XDG_CACHE_HOME='/root/cache'), \
+             patch.object(matrix.pwd,'getpwnam',return_value=SimpleNamespace(pw_uid=1000,pw_gid=1000,pw_name='fixture')), \
+             patch.object(matrix.os,'initgroups'),patch.object(matrix.os,'setgid'), \
+             patch.object(matrix.os,'setuid',side_effect=lambda n:state.update(uid=n)), \
+             patch.object(builtins,'__import__',side_effect=importer),contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as stopped:
+                runpy.run_path(str(Path(matrix.__file__)),run_name='__main__')
+            self.assertEqual(stopped.exception.code,0)
+            self.assertNotIn('XDG_CACHE_HOME',os.environ)
+            self.assertEqual(os.environ['USER'],'fixture')
+        self.assertTrue(imports)
+        self.assertTrue(all(uid==1000 for _,uid in imports))
+
+    def test_accidental_sudo_drops_all_user_ids_before_creating_evidence(self):
+        calls=[]; state=dict(uid=0)
+        with patch.object(matrix.os,'geteuid',side_effect=lambda:state['uid']), \
+             patch.object(matrix.os,'getuid',side_effect=lambda:state['uid']), \
+             patch.object(matrix.os,'getresuid',side_effect=lambda:(state['uid'],)*3,create=True), \
+             patch.object(matrix.os,'getresgid',return_value=(1000,)*3,create=True), \
+             patch.dict(os.environ,SUDO_UID='1000',SUDO_USER='fixture'), \
+             patch.object(matrix.pwd,'getpwnam',return_value=SimpleNamespace(pw_uid=1000,pw_gid=1000,pw_name='fixture')), \
+             patch.object(matrix.os,'initgroups',side_effect=lambda *a:calls.append(('groups',a))), \
+             patch.object(matrix.os,'setgid',side_effect=lambda n:calls.append(('gid',n))), \
+             patch.object(matrix.os,'setuid',side_effect=lambda n:(calls.append(('uid',n)),state.update(uid=n))), \
+             patch.object(matrix.os,'chown') as change,tempfile.TemporaryDirectory() as directory:
+            matrix.benchmark_account()
+            out=matrix.evidence_directory(Path(directory),'matrix-')
+            self.assertTrue(out.is_dir())
+            self.assertEqual(calls,[('groups',('fixture',1000)),('gid',1000),('uid',1000)])
+            change.assert_not_called()
+
+    def test_root_cannot_create_run_directory_or_use_a_forged_invoker(self):
+        with patch.object(matrix.os,'geteuid',return_value=0), \
+             patch.object(matrix.tempfile,'mkdtemp') as create:
+            with self.assertRaisesRegex(RuntimeError,'root-owned benchmark evidence'):
+                matrix.evidence_directory(Path('/unused'),'matrix-')
+            with patch.dict(os.environ,SUDO_UID='1000',SUDO_USER='fixture'), \
+                 patch.object(matrix.pwd,'getpwnam',return_value=SimpleNamespace(pw_uid=2000)), \
+                 patch.object(matrix.os,'setuid') as drop:
+                with self.assertRaisesRegex(RuntimeError,'invalid sudo invoking account'):
+                    matrix.benchmark_account()
+                drop.assert_not_called()
+            create.assert_not_called()
+
+    def test_cli_rejects_direct_root_before_configuration_or_run_creation(self):
+        with patch.object(sys,'argv',['matrix','init','--config','unused.json','--node','a1']), \
+             patch.object(matrix.os,'geteuid',return_value=0),patch.dict(os.environ,{},clear=True), \
+             patch.object(matrix,'apply_session_profile') as read_config, \
+             patch.object(matrix.tempfile,'mkdtemp') as create,contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(matrix.main(),1)
+            read_config.assert_not_called(); create.assert_not_called()
+
+    def test_receiver_exit_reports_real_error_and_redacts_control_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log=Path(directory)/'native.log'
+            log.write_text('ImportError: missing native dependency\nprivate-token-value\n')
+            child=SimpleNamespace(poll=lambda:1)
+            with self.assertRaisesRegex(RuntimeError,'ImportError: missing native dependency') as failure:
+                matrix.receiver_exit_error(child,log,'native',dict(CALLOSUM_CONTROL_TOKEN='private-token-value'))
+            self.assertIn('exit=1',str(failure.exception))
+            self.assertNotIn('private-token-value',str(failure.exception))
+            self.assertIn('[REDACTED]',str(failure.exception))
+            matrix.receiver_exit_error(SimpleNamespace(poll=lambda:None),log,'native',{})
+
+    def test_receive_start_failure_surfaces_child_log_without_restarting_or_killing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); path,args=self.fixture(root)
+            args.node='a1'; args.action='receive'; args.page_modes=['native']
+            spec,c,topology,receipt,private,env,_=matrix.load(path,args)
+            out=root/'receive'; runner=Runner(out)
+            child=SimpleNamespace(pid=os.getpid(),poll=lambda:1)
+            def start(command,**kw):
+                kw['stdout'].write('ImportError: test receiver dependency missing\n')
+                kw['stdout'].flush()
+                return child
+            try:
+                with patch.object(matrix,'receiver_health',side_effect=RuntimeError('not running')), \
+                     patch.object(matrix.socket,'socket'), \
+                     patch.object(matrix.resource,'getrlimit',return_value=(matrix.resource.RLIM_INFINITY,)*2), \
+                     patch.object(matrix.subprocess,'Popen',side_effect=start) as starts, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(RuntimeError,'test receiver dependency missing'):
+                        matrix.receive(spec,c,args,topology,receipt,private,env,out,runner)
+                starts.assert_called_once()
+                self.assertEqual(runner.stage,'receiver-start-native')
+                self.assertTrue((out/'owned-pids.json').is_file())
+            finally: runner.log.close()
+
     def fixture(self,root):
         mini_tests.MiniTest().fixture(root)
         topology=json.loads((root/'topology.json').read_text())
