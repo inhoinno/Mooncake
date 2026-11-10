@@ -222,6 +222,86 @@ def grant_dax_access(report,path,args,work,loader,runner,live=False):
     return save_readiness(work,report,secret)
 
 
+def grant_process_memlock(report,path,args,work,loader,runner,live=False):
+    """Raise only this ordinary process's limit; children inherit it."""
+    if not any(i['check']=='memlock' for i in report['issues']): return report
+    if any(i['check'] not in {'memlock','hugetlb_permission','hugepages_capacity'} for i in report['issues']): return report
+    require(sys.platform=='linux' and report.get('local_addresses') and report.get('numa'),
+            'memlock preparation requires verified local Linux inventory')
+    needed=report['memlock']['required']; pid=os.getpid()
+    require(type(needed) is int and needed>0,'invalid requested memlock limit')
+    attempt=dict(status='PLANNED',pid=pid,uid=os.getuid(),required_bytes=needed,
+                 session_only=True,change_possible=False)
+    archive(work,'memlock-permission.json',attempt)
+    try:
+        runner.call(args.action+'-memlock-sudo',['sudo','-v'])
+        old_soft,old_hard=resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        target_soft='unlimited' if old_soft==resource.RLIM_INFINITY else str(max(old_soft,needed))
+        target_hard='unlimited' if old_hard==resource.RLIM_INFINITY else str(max(old_hard,needed))
+        attempt.update(status='WRITING',change_possible=True)
+        archive(work,'memlock-permission.json',attempt)
+        runner.process_memlock_change_possible=True
+        runner.call(args.action+'-memlock-limit',['sudo','-n','prlimit','--pid',str(pid),
+                    '--memlock='+target_soft+':'+target_hard])
+        soft,hard=resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        require((soft==resource.RLIM_INFINITY or soft>=needed) and
+                (hard==resource.RLIM_INFINITY or hard>=needed),'process memlock permission did not take effect')
+        attempt.update(status='CONFIGURED',soft_bytes=soft,hard_bytes=hard)
+    except Exception as error: attempt.update(status='FAILED',error=str(error))
+    archive(work,'memlock-permission.json',attempt)
+    report=inspect(path,args,work,loader,live=live)
+    if attempt['status']=='FAILED':
+        report['status']='BLOCKED'
+        report['issues'].append(dict(check='memlock_setup',error=attempt['error'],
+            next_action='Inspect memlock-permission.json and sudo authorization for prlimit; no root benchmark fallback.'))
+    report['memlock_preparation']=attempt
+    return save_readiness(work,report,loader(path,args)[5]['CALLOSUM_CONTROL_TOKEN'])
+
+
+def grant_hugetlb_permission(report,path,args,work,loader,runner,live=False):
+    """Prepare anonymous MAP_HUGETLB access, not an unused hugetlbfs mount."""
+    if not any(i['check']=='hugetlb_permission' for i in report['issues']): return report
+    allowed={'hugetlb_permission','hugepages_capacity','memlock'}
+    if any(i['check'] not in allowed for i in report['issues']): return report
+    require(args.action in ('init','prepare') and sys.platform=='linux' and
+            report.get('local_addresses') and report.get('numa'),
+            'HugeTLB permission preparation requires verified local init/prepare')
+    control=Path('/proc/sys/vm/hugetlb_shm_group')
+    gid=os.getegid()
+    require(gid>0,'automatic HugeTLB access requires a non-root primary group')
+    attempt=dict(status='PLANNED',previous_gid=None,target_gid=gid,uid=os.getuid(),
+        control_file=str(control),global_setting=True,change_possible=False,automatic_restore=False)
+    archive(work,'hugetlb-permission.json',attempt)
+    try:
+        previous=int(control.read_text()); attempt['previous_gid']=previous
+        require(previous==0,
+                f'HugeTLB group {previous} already has a policy; refusing to replace it with {gid}. '
+                'Use the approved existing group/session or obtain explicit policy-change approval.')
+        runner.say(f'[HugeTLB access] sudo will set vm.hugetlb_shm_group from 0 to current group {gid}; '
+                   'this permits that group, not only one UID. No mount or account switch.')
+        runner.call(args.action+'-hugetlb-permission-sudo',['sudo','-v'])
+        require(int(control.read_text())==previous,'HugeTLB group changed during authorization; no write')
+        attempt.update(status='WRITING',change_possible=True)
+        archive(work,'hugetlb-permission.json',attempt)
+        runner.hugetlb_permission_change_possible=True
+        runner.hugetlb_permission_evidence=str(Path(work)/'hugetlb-permission.json')
+        runner.call(args.action+'-hugetlb-permission-write',['sudo','-n','tee','--',str(control)],
+                    capture=True,input_text=str(gid)+'\n')
+        attempt['observed_gid']=int(control.read_text())
+        require(attempt['observed_gid']==gid,'HugeTLB group write did not take effect')
+        attempt['status']='CONFIGURED'
+    except Exception as error:
+        attempt.update(status='FAILED',error=str(error))
+    archive(work,'hugetlb-permission.json',attempt)
+    report=inspect(path,args,work,loader,live=live)
+    if attempt['status']=='FAILED':
+        report['status']='BLOCKED'
+        report['issues'].append(dict(check='hugetlb_permission_setup',error=attempt['error'],
+            next_action='Inspect hugetlb-permission.json. Correct sudo or existing group policy; no whole-benchmark sudo fallback.'))
+    report['hugetlb_permission_preparation']=attempt
+    return save_readiness(work,report,loader(path,args)[5]['CALLOSUM_CONTROL_TOKEN'])
+
+
 def inspect_resources(path,args,work,loader,runner,live=False):
     """init/prepare may grant selected DAX access and grow local HugeTLB.
 
@@ -230,6 +310,8 @@ def inspect_resources(path,args,work,loader,runner,live=False):
     """
     report=inspect(path,args,work,loader,live=live)
     report=grant_dax_access(report,path,args,work,loader,runner,live=live)
+    report=grant_hugetlb_permission(report,path,args,work,loader,runner,live=live)
+    report=grant_process_memlock(report,path,args,work,loader,runner,live=live)
     needed=report.get('hugepages_required_for_new_buffer',0)
     capacity=[i for i in report['issues'] if i['check']=='hugepages_capacity']
     if not needed or not capacity or report.get('reused_huge_receiver'):

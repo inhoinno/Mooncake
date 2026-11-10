@@ -20,6 +20,94 @@ import test_callosum_write_matrix as matrix_tests
 
 
 class PreparationTest(unittest.TestCase):
+    def test_full_resource_preparation_configures_hugetlb_access_and_reuses_it(self):
+        from callosum_lab import Runner
+        for initial in (0,2000):
+            with self.subTest(initial=initial),tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+                root=Path(directory); path,args=self.inspect_fixture(root,stack)
+                group=dict(value=initial); original=Path.read_text
+                def read(p,*a,**kw):
+                    if str(p)=='/proc/sys/vm/hugetlb_shm_group': return str(group['value'])
+                    return original(p,*a,**kw)
+                runner=Runner(root/'work'); commands=[]
+                def command(stage,argv,**kw):
+                    commands.append(argv)
+                    if 'tee' in argv:
+                        self.assertEqual(argv,['sudo','-n','tee','--','/proc/sys/vm/hugetlb_shm_group'])
+                        group['value']=int(kw['input_text'])
+                try:
+                    with patch.object(Path,'read_text',new=read), \
+                         patch.object(prep.os,'geteuid',return_value=1000), \
+                         patch.object(prep.os,'getegid',return_value=1000), \
+                         patch.object(prep.os,'getgroups',return_value=[1000]), \
+                         patch.object(runner,'call',side_effect=command),contextlib.redirect_stdout(io.StringIO()):
+                        result=prep.inspect_resources(path,args,root/'work',matrix.load,runner,live=False)
+                        if initial==0:
+                            self.assertEqual(result['status'],'INPUTS_CHECKED_NOT_STARTED',result['issues'])
+                            self.assertEqual(group['value'],1000)
+                            count=len(commands)
+                            again=prep.inspect_resources(path,args,root/'work',matrix.load,runner,live=False)
+                            self.assertEqual(len(commands),count)
+                            self.assertEqual(again['status'],'INPUTS_CHECKED_NOT_STARTED')
+                        else:
+                            self.assertEqual(result['status'],'BLOCKED')
+                            self.assertEqual(group['value'],2000); self.assertEqual(commands,[])
+                    record=json.loads((root/'work/hugetlb-permission.json').read_text())
+                    self.assertEqual(record['change_possible'],initial==0)
+                    self.assertFalse(record['automatic_restore'])
+                finally: runner.log.close()
+
+    def test_memlock_sudo_targets_only_current_process_and_is_rechecked(self):
+        from callosum_lab import Runner
+        for denied in (False,True):
+            with self.subTest(denied=denied),tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+                root=Path(directory); path,args=self.inspect_fixture(root,stack)
+                limits=dict(value=(8388608,8388608)); runner=Runner(root/'work')
+                def command(stage,argv,**kw):
+                    if denied: raise RuntimeError('sudo denied fixture')
+                    if 'prlimit' in argv:
+                        self.assertEqual(argv[:5],['sudo','-n','prlimit','--pid',str(os.getpid())])
+                        limits['value']=(2**31,2**31)
+                        self.assertEqual(argv[-1],'--memlock=2147483648:2147483648')
+                try:
+                    with patch.object(prep.resource,'getrlimit',side_effect=lambda _:limits['value']), \
+                         patch.object(runner,'call',side_effect=command),contextlib.redirect_stdout(io.StringIO()):
+                        initial=prep.inspect(path,args,root/'work',matrix.load,live=False)
+                        result=prep.grant_process_memlock(initial,path,args,root/'work',matrix.load,runner,live=False)
+                    self.assertEqual(result['status'],'BLOCKED' if denied else 'INPUTS_CHECKED_NOT_STARTED')
+                    record=json.loads((root/'work/memlock-permission.json').read_text())
+                    self.assertEqual(record['pid'],os.getpid()); self.assertTrue(record['session_only'])
+                    self.assertFalse(runner.children)
+                finally: runner.log.close()
+
+    def test_hugetlb_sudo_denial_and_partial_change_preserve_evidence_without_fallback(self):
+        from callosum_lab import Runner
+        for partial in (False,True):
+            with self.subTest(partial=partial),tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+                root=Path(directory); path,args=self.inspect_fixture(root,stack)
+                group=dict(value=0); original=Path.read_text; runner=Runner(root/'work')
+                def read(p,*a,**kw):
+                    if str(p)=='/proc/sys/vm/hugetlb_shm_group': return str(group['value'])
+                    return original(p,*a,**kw)
+                def command(stage,argv,**kw):
+                    if not partial: raise RuntimeError('sudo denied')
+                    if 'tee' in argv:
+                        group['value']=1000
+                        raise RuntimeError('write returned failure after possible change')
+                try:
+                    with patch.object(Path,'read_text',new=read), \
+                         patch.object(prep.os,'geteuid',return_value=1000), \
+                         patch.object(prep.os,'getegid',return_value=1000), \
+                         patch.object(prep.os,'getgroups',return_value=[1000]), \
+                         patch.object(runner,'call',side_effect=command),contextlib.redirect_stdout(io.StringIO()):
+                        result=prep.inspect_resources(path,args,root/'work',matrix.load,runner,live=False)
+                    self.assertEqual(result['status'],'BLOCKED')
+                    record=json.loads((root/'work/hugetlb-permission.json').read_text())
+                    self.assertEqual(record['change_possible'],partial)
+                    self.assertEqual(group['value'],1000 if partial else 0)
+                    self.assertFalse(runner.children)
+                finally: runner.log.close()
+
     def test_peer_export_resolves_private_inputs_relative_to_config_not_ssh_cwd(self):
         import shlex
         with tempfile.TemporaryDirectory() as directory:

@@ -744,7 +744,12 @@ def main():
             args.peer_report=str(work/'peer-readiness.json')
         require(args.peer_report,'run prepare on both hosts, exchange readiness.json, then supply --peer-report; no service started')
         peer=preparation.verify_peer(args.peer_report,env['CALLOSUM_CONTROL_TOKEN'],c,spec,args)
+        root.mkdir(parents=True,exist_ok=True)
+        out=evidence_directory(root,f'matrix-{args.node}-')
+        runner=Runner(out); runner.remote_mutation_possible=False
+        runner.stage='run-local-resource-permissions'
         local=preparation.inspect(args.config,args,work,load)
+        local=preparation.grant_process_memlock(local,args.config,args,work,load,runner)
         require(local['status']=='PREPARED_NOT_TESTED',f'local preparation BLOCKED; inspect {work}/readiness.json')
         require(sys.platform=='linux','matrix execution requires the Linux lab; portable tests are separate')
         # Raise only this process's soft limit within the existing hard limit.
@@ -754,9 +759,6 @@ def main():
         if soft!=resource.RLIM_INFINITY and soft<needed:
             resource.setrlimit(resource.RLIMIT_MEMLOCK,(needed,hard))
         os.environ['CALLOSUM_CONTROL_TOKEN']=env['CALLOSUM_CONTROL_TOKEN']
-        root.mkdir(parents=True,exist_ok=True)
-        out=evidence_directory(root,f'matrix-{args.node}-')
-        runner=Runner(out); runner.remote_mutation_possible=False
         (out/'local-readiness.json').write_text(json.dumps(local,indent=2))
         (out/'peer-readiness.json').write_text(json.dumps(peer,indent=2))
         public=dict(spec); public['token_file']='[private file path omitted]'
@@ -810,6 +812,9 @@ def main():
                      owned_service_transition_possible=transition_possible,
                      hugepage_pool_change_possible=host_resources_changed,
                      hugepage_provision_evidence=getattr(runner,'hugepage_provision_evidence',None),
+                     hugetlb_permission_change_possible=bool(runner and getattr(runner,'hugetlb_permission_change_possible',False)),
+                     hugetlb_permission_evidence=getattr(runner,'hugetlb_permission_evidence',None),
+                     process_memlock_change_possible=bool(runner and getattr(runner,'process_memlock_change_possible',False)),
                      dax_permission_change_possible=bool(runner and getattr(runner,'device_access_change_possible',False)),
                      dax_access_evidence=getattr(runner,'device_access_evidence',None),
                      action=('Retain owned processes, mappings and journals; inspect transition evidence. No automatic reclaim.'
@@ -818,6 +823,8 @@ def main():
                              if host_resources_changed else
                              'No service or WRITE started. The selected DAX ACL may have changed; inspect dax-access.json. No automatic permission revocation.'
                              if runner and getattr(runner,'device_access_change_possible',False) else
+                             'No service or WRITE started. HugeTLB group policy may have changed; inspect hugetlb-permission.json. No automatic global restoration.'
+                             if runner and getattr(runner,'hugetlb_permission_change_possible',False) else
                              'No new service or WRITE started. Correct configuration/resources and rerun.'))
         if runner: (runner.run_dir/'failure.json').write_text(json.dumps(failure,indent=2))
         print(json.dumps(failure,indent=2),file=sys.stderr)
