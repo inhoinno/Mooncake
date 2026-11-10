@@ -101,7 +101,7 @@ def huge_snapshot(node,sysroot=Path('/sys')):
                 control_file=str(local/'nr_hugepages'))
 
 
-def provision(node,needed,work,sysroot=Path('/sys')):
+def provision(node,needed,work,sysroot=Path('/sys'),writer=None):
     """Grow only this NUMA node by the missing capacity. Never shrink on errors."""
     require(type(node) is int and node>=0 and type(needed) is int and needed>=0,'invalid HugeTLB requirement')
     before=huge_snapshot(node,sysroot)
@@ -110,7 +110,17 @@ def provision(node,needed,work,sysroot=Path('/sys')):
                 changed=False,reclaimed=False)
     archive(work,'hugepage-provision.json',record)
     if target!=before['total_pages']:
-        with Path(before['control_file']).open('w') as stream: stream.write(str(target))
+        try:
+            if writer is None:
+                with Path(before['control_file']).open('w') as stream: stream.write(str(target))
+            else:
+                writer(Path(before['control_file']),target)
+        except Exception as error:
+            record.update(status='WRITE_FAILED',error=str(error),change_possible=True)
+            try: record['after']=huge_snapshot(node,sysroot)
+            except OSError as probe: record['after_error']=str(probe)
+            archive(work,'hugepage-provision.json',record)
+            raise
         record['changed']=True
     after=huge_snapshot(node,sysroot); record['after']=after
     record['status']='PASS' if after['available_pages']>=needed and after['total_pages']>=target else 'PARTIAL'
@@ -119,6 +129,156 @@ def provision(node,needed,work,sysroot=Path('/sys')):
             f'partial NUMA HugeTLB allocation: available={after["available_pages"]}, needed={needed}; '
             'no service started; provision record retained; no rollback/shrink performed')
     return record
+
+
+def dax_acl_change(text,uid,owner):
+    """Grant one UID rw without widening another ACL entry's effective access."""
+    entries={}
+    def bits(value):
+        require(len(value)==3 and all(c in (expected,'-') for c,expected in zip(value,'rwx')),'invalid device ACL permissions')
+        return sum(bit for c,bit in zip(value,(4,2,1)) if c!='-')
+    def perms(value): return ''.join(c if value & bit else '-' for c,bit in zip('rwx',(4,2,1)))
+    for line in text.splitlines():
+        line=line.split('#',1)[0].strip()
+        if not line: continue
+        fields=line.split(':')
+        require(len(fields)==3 and fields[0] in ('user','group','mask','other'),'unsupported device ACL')
+        kind,identity,value=fields
+        require(not identity or kind in ('user','group') and identity.isdecimal(),'numeric device ACL required')
+        require((kind,identity) not in entries,'duplicate device ACL entry')
+        entries[kind,identity]=bits(value)
+    require({('user',''),('group',''),('other','')}<=set(entries),'incomplete device ACL')
+    if uid==owner:
+        require(entries['user',''] & 6 != 6,'ACL already allows rw; inspect other OS/device restrictions')
+        return 'u::'+perms(entries['user','']|6)
+    mask=entries.get(('mask',''),entries['group','']); expanded=mask|6
+    current=entries.get(('user',str(uid)),0)
+    require(current & mask & 6 != 6,'ACL already allows rw; inspect other OS/device restrictions')
+    for (kind,identity),value in entries.items():
+        if kind=='group' or kind=='user' and identity and identity!=str(uid):
+            require(not value & (expanded & ~mask),
+                    'ACL mask expansion would grant another principal access; administrator review required')
+    return f'u:{uid}:{perms(current|6)},m::{perms(expanded)}'
+
+
+def grant_dax_access(report,path,args,work,loader,runner,live=False):
+    """Use sudo only for one verified character device ACL, not the benchmark."""
+    inventory=report.get('dax_inventory') or {}
+    if not any(i['check']=='dax_access' for i in report['issues']) or inventory.get('read_write_access'):
+        return report
+    # Invalid/missing devices and unverified extents are not permission repairs.
+    if not (sys.platform=='linux' and report.get('local_addresses') and inventory.get('extent_validated')):
+        return report
+    require(getattr(args,'action',None) in ('init','prepare'),'DAX access preparation is limited to init/prepare')
+    device=Path(inventory['path']); name=device.name
+    numbers=name[3:].split('.') if name.startswith('dax') else []
+    require(device.parent==Path('/dev') and len(numbers)==2 and all(n.isdecimal() for n in numbers),
+            'automatic DAX access requires a direct /dev/daxN.N path')
+    st=os.lstat(device)
+    require(stat.S_ISCHR(st.st_mode) and st.st_rdev==inventory['device_number'] and
+            st.st_ino==inventory['inode'],'DAX identity changed or path is a symlink; no permission change')
+    uid=os.getuid(); secret=loader(path,args)[5]['CALLOSUM_CONTROL_TOKEN']
+    attempt=dict(status='PLANNED',path=str(device),uid=uid,device_number=st.st_rdev,inode=st.st_ino,
+        owner_uid=st.st_uid,owner_gid=st.st_gid,mode_before=oct(stat.S_IMODE(st.st_mode)),
+        change_possible=False,protection_scope='DEVICE_WIDE; exclusive pool extent remains software bounded')
+    archive(work,'dax-access.json',attempt)
+    try:
+        prefix=[] if os.geteuid()==0 else ['sudo','-n']
+        if prefix: runner.call(args.action+'-dax-sudo',['sudo','-v'])
+        tools=[Path('/usr/bin/getfacl'),Path('/usr/bin/setfacl')]
+        if not all(t.is_file() and os.access(t,os.X_OK) for t in tools):
+            require(not getattr(args,'skip_apt',False),
+                    'ACL tools missing. Retry prepare without --skip-apt for automatic installation of package acl.')
+            attempt['acl_package_install_requested']=True
+            archive(work,'dax-access.json',attempt)
+            runner.call(args.action+'-dax-acl-tools',prefix+['apt-get','install','-y','acl'])
+        require(all(t.is_file() and os.access(t,os.X_OK) for t in tools),'package acl did not provide usable getfacl/setfacl')
+        before=runner.call(args.action+'-dax-acl-before',[str(tools[0]),'-c','-p','-n','--',str(device)],capture=True)
+        change=dax_acl_change(before,uid,st.st_uid)
+        fresh=os.lstat(device)
+        require((fresh.st_rdev,fresh.st_ino,fresh.st_uid,fresh.st_gid,fresh.st_mode)==
+                (st.st_rdev,st.st_ino,st.st_uid,st.st_gid,st.st_mode),
+                'DAX identity or permissions changed during authorization; no ACL written')
+        attempt.update(status='GRANTING',acl_before=before,acl_change=change,change_possible=True)
+        archive(work,'dax-access.json',attempt)
+        runner.device_access_change_possible=True
+        runner.device_access_evidence=str(Path(work)/'dax-access.json')
+        runner.call(args.action+'-dax-acl-grant',prefix+[str(tools[1]),'--no-mask','-m',change,'--',str(device)])
+        attempt['acl_after']=runner.call(args.action+'-dax-acl-after',
+            [str(tools[0]),'-c','-p','-n','--',str(device)],capture=True)
+        fd=os.open(device,os.O_RDWR|os.O_CLOEXEC)
+        os.close(fd)  # Verify caller access; never mmap or write the device here.
+        attempt['status']='GRANTED'
+    except Exception as error:
+        attempt.update(status='FAILED',error=str(error))
+    archive(work,'dax-access.json',attempt)
+    report=inspect(path,args,work,loader,live=live)
+    if attempt['status']=='FAILED':
+        report['status']='BLOCKED'
+        report['issues'].append(dict(check='dax_access_setup',error=attempt['error'],
+            next_action='Inspect dax-access.json; retry init/prepare after correcting sudo/ACL support. '
+                        'No chmod 666, owner change, root benchmark or automatic ACL removal.'))
+    report.update(scope='PREPARATION_WITH_DEVICE_ACCESS',dax_access_preparation=attempt)
+    return save_readiness(work,report,secret)
+
+
+def inspect_resources(path,args,work,loader,runner,live=False):
+    """init/prepare may grant selected DAX access and grow local HugeTLB.
+
+    Collect all prerequisites first. Do not mutate the host while an independent
+    blocker prevents the requested run. run and read-only inventory use inspect.
+    """
+    report=inspect(path,args,work,loader,live=live)
+    report=grant_dax_access(report,path,args,work,loader,runner,live=live)
+    needed=report.get('hugepages_required_for_new_buffer',0)
+    capacity=[i for i in report['issues'] if i['check']=='hugepages_capacity']
+    if not needed or not capacity or report.get('reused_huge_receiver'):
+        return report
+    if any(i['check']!='hugepages_capacity' for i in report['issues']):
+        runner.say('[HugeTLB] Automatic allocation deferred: correct the other listed prerequisites first.')
+        return report
+    require(sys.platform=='linux' and report.get('local_addresses') and report.get('numa') and report.get('hugepages'),
+            'automatic HugeTLB setup requires verified local Linux NIC/NUMA inventory')
+    require(getattr(args,'action',None) in ('init','prepare'),'automatic HugeTLB setup is limited to init/prepare')
+    node=report['numa']['node']
+    require(type(node) is int and node>=0 and type(needed) is int and needed>0,'invalid HugeTLB requirement')
+    expected=Path(f'/sys/devices/system/node/node{node}/hugepages/hugepages-2048kB/nr_hugepages')
+    require(Path(report['hugepages']['control_file'])==expected,'unexpected HugeTLB control file; no privileged write')
+    secret=loader(path,args)[5]['CALLOSUM_CONTROL_TOKEN']
+    attempt=dict(status='AUTHENTICATING',node=node,required_free_pages=needed,
+                 control_file=str(expected),change_possible=False,global_settings_changed=False)
+    archive(work,'hugepage-auto.json',attempt)
+    runner.say(f'[HugeTLB] NUMA {node}: need {needed} free 2 MiB pages; grow only the missing amount.')
+    try:
+        if os.geteuid()!=0:
+            # sudo reads its password from the terminal, never our input/log.
+            runner.call(args.action+'-hugepages-sudo',['sudo','-v'])
+        def write(control,target):
+            require(control==expected and type(target) is int and target>=0,'invalid HugeTLB write')
+            runner.hugepage_pool_change_possible=True
+            runner.hugepage_provision_evidence=str(Path(work)/'hugepage-provision.json')
+            attempt.update(status='WRITING',change_possible=True,target_total_pages=target)
+            archive(work,'hugepage-auto.json',attempt)
+            if os.geteuid()==0:
+                with control.open('w') as stream: stream.write(str(target))
+            else:
+                # No root Python, shell redirection, global sysctl, or account switch.
+                runner.call(args.action+'-hugepages-write',['sudo','-n','tee','--',str(control)],
+                            capture=True,input_text=str(target)+'\n')
+        result=provision(node,needed,work,writer=write)
+        attempt.update(status='PROVISIONED',result=result)
+    except Exception as error:
+        attempt.update(status='FAILED',error=str(error))
+    archive(work,'hugepage-auto.json',attempt)
+    # Provisioning is not readiness. Verify permissions and resources again.
+    report=inspect(path,args,work,loader,live=live)
+    if attempt['status']=='FAILED':
+        report['status']='BLOCKED'
+        report['issues'].append(dict(check='hugepages_provision',error=attempt['error'],
+            next_action='Inspect hugepage-auto.json and hugepage-provision.json. '
+                        'Resolve sudo/allocation failure and retry the same stage; no native fallback or rollback.'))
+    report.update(scope='PREPARATION_WITH_HOST_PROVISIONING',hugepage_auto_provision=attempt)
+    return save_readiness(work,report,secret)
 
 
 def inspect(path,args,work,loader,live=True):
@@ -264,7 +424,7 @@ def inspect(path,args,work,loader,live=True):
             result['reused_huge_receiver']=reused
             if pages and not reused and pages['available_pages']<needed:
                 result['issues'].append(dict(check='hugepages_capacity',error=f'NUMA {numa["node"]}: {pages["available_pages"]} unreserved/free pages; need {needed}',
-                    next_action='provision-hugepages on this node, then repeat prepare'))
+                    next_action='init/prepare automatically provisions this NUMA deficit after other prerequisites pass; then rechecks readiness'))
         def output_check():
             root.mkdir(parents=True,exist_ok=True)
             probe=root/('.prepare-'+secrets.token_hex(8))
@@ -297,15 +457,17 @@ def inspect(path,args,work,loader,live=True):
                 result['dax_inventory']=dict(path=node['path'],exists=True,
                     character_device=stat.S_ISCHR(st.st_mode),read_write_access=accessible,
                     owner_uid=getattr(st,'st_uid',None),owner_gid=getattr(st,'st_gid',None),
-                    mode=oct(stat.S_IMODE(st.st_mode)),effective_uid=os.geteuid())
+                    mode=oct(stat.S_IMODE(st.st_mode)),effective_uid=os.geteuid(),
+                    device_number=st.st_rdev,inode=getattr(st,'st_ino',None),extent_validated=False)
                 require(stat.S_ISCHR(st.st_mode),f'DAX path exists but is not a character device: {node["path"]}')
-                if not accessible:
-                    raise PermissionError(13,'DAX device exists; current account lacks read/write access',node['path'])
                 base=Path(f'/sys/dev/char/{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}')
                 size=int((base/'size').read_text().strip(),0); alignment=int((base/'align').read_text().strip(),0)
                 p=c['pools'][node['pool']]
                 require(p.get('map_offset',0)+p['capacity']<=size and p.get('map_offset',0)%alignment==0
                         and p['capacity']%alignment==0,'configured extent exceeds real device or alignment')
+                result['dax_inventory'].update(extent_validated=True,device_bytes=size,alignment_bytes=alignment)
+                if not accessible:
+                    raise PermissionError(13,'DAX device exists; current account lacks read/write access',node['path'])
                 return dict(path=node['path'],device_bytes=size,alignment_bytes=alignment,declared_owner=p['owner'])
             check('dax_access',dax_access)
             needed_destination=4096+sum(math.ceil(block_bytes(n,args.unit)/4096)*4096 for n in args.sizes)*args.repetitions*len(args.page_modes)+2**21
@@ -444,12 +606,12 @@ def matrix_configuration(path,topology,private,local,node,pair):
 
 
 def fresh_configuration(path,args,runner):
-    """Create all run inputs anew. Old matrix files are evidence, never inputs.
+    """Create run inputs anew; reuse a build only when explicitly requested.
 
     Hardware topology remains an operator-approved input. A new directory does
     not authorize a larger extent, stop an owner, or prove that DMA is drained.
     """
-    from callosum_lab import prepare, validate_launch_config
+    from callosum_lab import prepare, validate_launch_config, clean_env
     path=Path(path).resolve()
     require(args.topology,'init requires --topology: the approved hardware manifest')
     topology=Path(args.topology).resolve()
@@ -462,6 +624,23 @@ def fresh_configuration(path,args,runner):
     root=Path(__file__).resolve().parents[2]
     profile=dict(sizes=args.sizes,unit=args.unit,repetitions=args.repetitions,
         backings=args.backings,page_modes=args.page_modes,configured_qps=16,bytes_per_trial=TOTAL_BYTES)
+    reuse=None
+    if getattr(args,'skip_build',False):
+        runner.stage='reuse-build-verification'
+        require(sys.platform=='linux','--skip-build requires a host-local Linux build')
+        selected=args.setup_run
+        if not selected:
+            require(path.is_file(),
+                    '--skip-build needs an existing config or --setup-run containing a successful local setup.json; no compilation attempted')
+            previous=json.loads(path.read_text())
+            require(previous.get('workflow',{}).get('node',args.node)==args.node,
+                    'existing config belongs to another node; select a local --setup-run')
+            selected=previous.get('runtimes',{}).get(args.node,{}).get('setup_run')
+            require(selected,'existing config has no local setup_run; supply --setup-run; no compilation attempted')
+            selected=path.parent/selected
+        reuse=Path(selected).resolve()
+        receipt=runtime_receipt(reuse)
+        reuse_env=dict(clean_env(),**receipt['env'])
     machine=Path('/etc/machine-id').read_text().strip() if sys.platform=='linux' else None
     # init is strictly host-local. The peer's probe token is not a shared service
     # credential. prepare explicitly imports the controller token into a NEW file.
@@ -482,14 +661,21 @@ def fresh_configuration(path,args,runner):
     runner.say(json.dumps(pending,indent=2))
     if not args.generate_only:
         require(sys.platform=='linux','fresh build/start requires Linux; use --generate-only for portable input validation')
-        runner.stage='fresh-build'
-        prepare(root,runner.run_dir,SimpleNamespace(python=sys.executable,jobs=args.jobs,
-                skip_apt=args.skip_apt),runner)
+        if reuse is not None:
+            runner.stage='reuse-build-verification'
+            adopted=adopt_build(Path(__file__).resolve().parents[1],reuse,runner.run_dir,reuse_env)
+            runner.say(json.dumps(dict(status='BUILD_REUSED_NOT_REBUILT',
+                adopted_from=adopted['adopted_from'],build=adopted['build'],
+                adoption_scope=adopted['adoption_scope']),indent=2))
+        else:
+            runner.stage='fresh-build'
+            prepare(root,runner.run_dir,SimpleNamespace(python=sys.executable,jobs=args.jobs,
+                    skip_apt=args.skip_apt),runner)
     else:
         runner.say('[GENERATED ONLY] No setup.json, native build or service PASS is claimed')
-    # Reuse init's schema and defaults, but never read an old runtime/secret.
+    # Reuse the schema. Only --skip-build may select an old runtime, never its secret.
     generated=runner.run_dir/'matrix.json'
-    # No fabricated PASS receipt in generate-only mode. Build is the only producer.
+    # No fabricated PASS receipt: build or verified adoption must produce it.
     value=matrix_configuration(generated,snapshot,raw_token,runner.run_dir,args.node,
         dict(source=launch['source'],receiver=launch['requester']))
     value['output_root']=str(runner.run_dir/'measurements')
@@ -499,7 +685,8 @@ def fresh_configuration(path,args,runner):
     generated.write_text(json.dumps(value,indent=2))
     runner.stage='fresh-config-publication'
     archive(path.parent,path.name,value)  # Preserve an old config, even if malformed.
-    pending.update(status='GENERATED_NOT_BUILT' if args.generate_only else 'BUILT_NOT_STARTED')
+    pending.update(status='GENERATED_NOT_BUILT' if args.generate_only else
+                   ('REUSED_BUILD_NOT_STARTED' if reuse is not None else 'BUILT_NOT_STARTED'))
     (runner.run_dir/'fresh-state.json').write_text(json.dumps(pending,indent=2))
     return value
 

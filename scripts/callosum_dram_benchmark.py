@@ -125,7 +125,7 @@ def hugepage_capacity(node, capacity, sysroot=Path('/sys')):
     required=allocation_geometry(capacity,'huge2MB')//2**21
     require(free>=required,
             f'NUMA node {node} has {free} free 2 MiB HugeTLB pages; needs {required}. '
-            'Ask the lab owner to provision this node; no global hugepage settings are changed')
+            'Repeat prepare for bounded provisioning on this node; run never changes HugeTLB settings')
     return dict(free_pages_before=free,required_pages=required,page_bytes=2**21)
 
 

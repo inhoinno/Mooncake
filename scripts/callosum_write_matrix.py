@@ -420,7 +420,7 @@ def prepare_session(path,args,work,runner,ssh_options=()):
     import callosum_benchmark_prepare as preparation
     runner.stage='prepare-local-prerequisites'
     spec,c,topology,receipt,private,env,_=load(path,args)
-    cold=preparation.inspect(path,args,work,load,live=False)
+    cold=preparation.inspect_resources(path,args,work,load,runner,live=False)
     if cold['status']!='INPUTS_CHECKED_NOT_STARTED':
         error=RuntimeError(f'local prerequisites BLOCKED; evidence={work}/readiness.json')
         error.issues=cold['issues']
@@ -537,6 +537,7 @@ def main():
     parser.add_argument('--generate-only',action='store_true',help='init: input fixture only; no build or readiness claim')
     parser.add_argument('--jobs',type=int,default=4,help='init: build parallelism')
     parser.add_argument('--skip-apt',action='store_true',help='init: refuse missing OS packages instead of installing them')
+    parser.add_argument('--skip-build',action='store_true',help='init: verify and reuse --setup-run or this config’s exact local build; never compile')
     parser.add_argument('--campaign-run',help='retire: old campaign; start-cxl: fresh campaign directory')
     parser.add_argument('--ack-exclusive-campaign',action='store_true',
                         help='retire: operator stopped canonical benchmark initiators; no unrelated/direct writers')
@@ -556,9 +557,11 @@ def main():
         require(not (args.peer or args.remote_root or args.peer_config) or args.action=='prepare',
                 'SSH options belong only to prepare; init and run are host-local')
         require(args.jobs>0,'--jobs must be positive')
+        require(not args.skip_build or (args.action=='init' and not args.generate_only),
+                '--skip-build requires init and cannot accompany --generate-only')
         require(not args.generate_only or (args.action=='init' and not args.setup_run),
                 '--generate-only requires init without a historical --setup-run')
-        if args.action=='init' and not args.setup_run:
+        if args.action=='init' and (not args.setup_run or args.skip_build):
             root=Path(args.config).resolve().parent/'runs'
             root.mkdir(parents=True,exist_ok=True)
             # No old config/receipt/env is read to choose this directory.
@@ -568,7 +571,7 @@ def main():
             if args.generate_only: return 0
             spec=json.loads(Path(args.config).read_text()); work=Path(spec['preparation_dir'])
             runner.stage='init-prerequisites'
-            report=preparation.inspect(args.config,args,work,load,live=False)
+            report=preparation.inspect_resources(args.config,args,work,load,runner,live=False)
             runner.say(json.dumps(report,indent=2))
             return 0 if report['status']=='INPUTS_CHECKED_NOT_STARTED' else 1
         configured_work=None
@@ -588,7 +591,11 @@ def main():
             if args.action=='provision-hugepages':
                 require(work.is_dir(),
                         'Run prepare as the benchmark account first. Privileged provisioning must not create its preparation directory.')
-            report=preparation.inspect(args.config,args,work,load)
+            if args.action=='prepare':
+                runner=Runner(work); runner.remote_mutation_possible=False
+                report=preparation.inspect_resources(args.config,args,work,load,runner,live=True)
+            else:
+                report=preparation.inspect(args.config,args,work,load)
             if args.action=='provision-hugepages':
                 require(sys.platform=='linux' and os.geteuid()==0,'provision-hugepages needs authorized Linux root')
                 require(report.get('local_addresses') and report.get('numa') and report.get('hugepages') is not None,
@@ -702,6 +709,8 @@ def main():
         return 0
     except Exception as error:
         transition_possible=transition_possible or bool(runner and runner.services_may_be_live)
+        host_resources_changed=host_resources_changed or bool(
+            runner and getattr(runner,'hugepage_pool_change_possible',False))
         if phase=='prepare' and work:
             # Do not leave an older PASS visible after a failed refresh.
             try:
@@ -725,10 +734,15 @@ def main():
                      rdma_work_possible=bool(runner and runner.remote_mutation_possible),
                      owned_service_transition_possible=transition_possible,
                      hugepage_pool_change_possible=host_resources_changed,
+                     hugepage_provision_evidence=getattr(runner,'hugepage_provision_evidence',None),
+                     dax_permission_change_possible=bool(runner and getattr(runner,'device_access_change_possible',False)),
+                     dax_access_evidence=getattr(runner,'device_access_evidence',None),
                      action=('Retain owned processes, mappings and journals; inspect transition evidence. No automatic reclaim.'
                              if transition_possible or runner and (runner.children or runner.remote_mutation_possible) else
-                             'No service or WRITE started. A partial NUMA HugeTLB change may remain; inspect hugepage-provision.json. No rollback/shrink.'
+                             'No service or WRITE started. NUMA HugeTLB settings may have changed; inspect hugepage-auto.json and hugepage-provision.json in the preparation directory. No rollback/shrink.'
                              if host_resources_changed else
+                             'No service or WRITE started. The selected DAX ACL may have changed; inspect dax-access.json. No automatic permission revocation.'
+                             if runner and getattr(runner,'device_access_change_possible',False) else
                              'No new service or WRITE started. Correct configuration/resources and rerun.'))
         if runner: (runner.run_dir/'failure.json').write_text(json.dumps(failure,indent=2))
         print(json.dumps(failure,indent=2),file=sys.stderr)

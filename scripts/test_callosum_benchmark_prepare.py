@@ -20,6 +20,55 @@ import test_callosum_write_matrix as matrix_tests
 
 
 class PreparationTest(unittest.TestCase):
+    def test_skip_build_init_reuses_exact_local_receipt_and_creates_new_sessions(self):
+        import callosum_lab as lab
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve(); topology=self.fresh_fixture(root)
+            target=root/'benchmark.local.json'
+            target.write_text(json.dumps(dict(runtimes={'a1':dict(setup_run=str(root))})))
+            receipt=json.loads((root/'setup.json').read_text())
+            source=Path(prep.__file__).resolve().parents[1]
+            receipt['source_hashes']={f:prep.digest(source/f) for f in prep.SOURCE_FILES}
+            (root/'setup.json').write_text(json.dumps(receipt))
+            argv=['matrix','init','--config',str(target),'--node','a1',
+                  '--topology',str(topology),'--skip-build']
+            campaigns=[]; tokens=[]
+            read=Path.read_text
+            def machine(path,*a,**kw):
+                return 'machine-a1' if str(path)=='/etc/machine-id' else read(path,*a,**kw)
+            with patch.object(sys,'argv',argv),patch.object(prep.sys,'platform','linux'), \
+                 patch.object(Path,'read_text',new=machine), \
+                 patch.object(lab,'prepare') as compile_build, \
+                 patch.object(prep.subprocess,'check_output',return_value='{"engine.so":"hash"}'), \
+                 patch.object(prep,'inspect_resources',return_value=dict(status='INPUTS_CHECKED_NOT_STARTED')) as inspect, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                for attempt in range(2):
+                    # Explicit selection also enters fresh initialization, not legacy init.
+                    with patch.object(sys,'argv',argv+(['--setup-run',str(root)] if attempt==0 else [])):
+                        self.assertEqual(matrix.main(),0)
+                    spec=json.loads(target.read_text()); run=Path(spec['runtimes']['a1']['setup_run'])
+                    adopted=json.loads((run/'setup.json').read_text())
+                    self.assertEqual(adopted['build'],receipt['build'])
+                    self.assertEqual(adopted['adoption_scope'],'VERIFIED_EXISTING_ABI2_NOT_REBUILT')
+                    self.assertEqual(json.loads((run/'fresh-state.json').read_text())['status'],'REUSED_BUILD_NOT_STARTED')
+                    campaigns.append(run); tokens.append(Path(spec['token_file']).read_text())
+            compile_build.assert_not_called(); self.assertEqual(inspect.call_count,2)
+            self.assertNotEqual(campaigns[0],campaigns[1]); self.assertNotEqual(tokens[0],tokens[1])
+
+    def test_skip_build_first_run_needs_receipt_and_never_falls_back_to_compile(self):
+        import callosum_lab as lab
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve(); topology=self.fresh_fixture(root)
+            target=root/'benchmark.local.json'
+            base=['matrix','init','--config',str(target),'--node','a1',
+                  '--topology',str(topology),'--skip-build']
+            with patch.object(prep.sys,'platform','linux'),patch.object(lab,'prepare') as compile_build, \
+                 patch.object(prep,'inspect_resources') as inspect,contextlib.redirect_stdout(io.StringIO()):
+                with patch.object(sys,'argv',base): self.assertEqual(matrix.main(),1)
+                with patch.object(sys,'argv',base+['--setup-run',str(root/'missing')]):
+                    self.assertEqual(matrix.main(),1)
+            compile_build.assert_not_called(); inspect.assert_not_called(); self.assertFalse(target.exists())
+
     def fresh_fixture(self,root):
         _,args=matrix_tests.MatrixTest().fixture(root)
         raw=json.loads((root/'topology.json').read_text())
@@ -705,6 +754,304 @@ class PreparationTest(unittest.TestCase):
                 self.assertIn('device exists',issue['error'])
                 self.assertTrue(report['dax_inventory']['exists'])
                 self.assertFalse(report['dax_inventory']['read_write_access'])
+
+    def test_dax_acl_change_preserves_other_principals_and_rejects_mask_expansion(self):
+        base='user::rw-\ngroup::---\nother::---\n'
+        self.assertEqual(prep.dax_acl_change(base,1000,0),'u:1000:rw-,m::rw-')
+        self.assertEqual(prep.dax_acl_change('user::r--\ngroup::---\nother::---\n',1000,1000),'u::rw-')
+        masked='user::rw-\nuser:2000:rw-\ngroup::---\nmask::r--\nother::---\n'
+        with self.assertRaisesRegex(RuntimeError,'another principal'):
+            prep.dax_acl_change(masked,1000,0)
+        existing='user::rw-\nuser:1000:rw-\ngroup::---\nmask::rw-\nother::---\n'
+        with self.assertRaisesRegex(RuntimeError,'already allows rw'):
+            prep.dax_acl_change(existing,1000,0)
+
+    def dax_access_fixture(self,root,stack):
+        """Mock device metadata, ACL tools and opens. Never touch a real DAX."""
+        path,args=matrix_tests.MatrixTest().fixture(root); args.action='prepare'; args.node='a1'
+        device='/dev/dax1.0'; state=dict(granted=False,tools=True,extent=True,addresses=True,open_ok=True)
+        before='user::rw-\ngroup::---\nother::---\n'
+        after='user::rw-\nuser:1000:rw-\ngroup::---\nmask::rw-\nother::---\n'
+        def st(*unused,**kwargs):
+            return SimpleNamespace(st_mode=stat.S_IFCHR|(0o660 if state['granted'] else 0o600),
+                                   st_rdev=123,st_ino=42,st_uid=0,st_gid=0)
+        def report(path,args,work,loader,live=False):
+            return dict(status='INPUTS_CHECKED_NOT_STARTED' if state['granted'] else 'BLOCKED',node='a1',
+                issues=[] if state['granted'] else [dict(check='dax_access',error='fixture access denied')],
+                local_addresses=['fixture-local'] if state['addresses'] else [],
+                dax_inventory=dict(path=device,exists=True,character_device=True,device_number=123,inode=42,
+                    extent_validated=state['extent'],read_write_access=state['granted']),
+                services_started=False,devices_mapped=False)
+        real_file=Path.is_file; real_access=os.access; real_open=os.open; real_close=os.close
+        tools={'/usr/bin/getfacl','/usr/bin/setfacl'}
+        def open_device(p,*a,**kw):
+            if str(p)!=device: return real_open(p,*a,**kw)
+            if not state['open_ok']: raise PermissionError('fixture driver access denied')
+            return 999999
+        for manager in [patch.object(prep,'inspect',side_effect=report),
+            patch.object(prep.os,'lstat',side_effect=st),patch.object(prep.os,'getuid',return_value=1000),
+            patch.object(prep.os,'geteuid',return_value=1000),patch.object(prep.sys,'platform','linux'),
+            patch.object(Path,'is_file',new=lambda p:state['tools'] if str(p) in tools else real_file(p)),
+            patch.object(prep.os,'access',side_effect=lambda p,m:state['tools'] if str(p) in tools else real_access(p,m)),
+            patch.object(prep.os,'open',side_effect=open_device),
+            patch.object(prep.os,'close',side_effect=lambda fd:None if fd==999999 else real_close(fd))]:
+            stack.enter_context(manager)
+        commands=[]
+        def command(stage,argv,*a,**kw):
+            commands.append(argv)
+            if argv==['sudo','-v']: return
+            if argv==['sudo','-n','apt-get','install','-y','acl']:
+                state['tools']=True; return
+            if argv[0]=='/usr/bin/getfacl': return after if state['granted'] else before
+            self.assertEqual(argv,['sudo','-n','/usr/bin/setfacl','--no-mask','-m','u:1000:rw-,m::rw-','--',device])
+            state['granted']=True
+        return path,args,state,commands,command
+
+    def test_dax_access_sudo_grants_one_uid_and_rechecks_without_root_benchmark(self):
+        from callosum_lab import Runner
+        with tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+            root=Path(directory); path,args,state,commands,command=self.dax_access_fixture(root,stack)
+            runner=Runner(root/'work')
+            try:
+                with patch.object(runner,'call',side_effect=command):
+                    first=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                    again=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                self.assertEqual(first['status'],'INPUTS_CHECKED_NOT_STARTED')
+                self.assertEqual(again['status'],'INPUTS_CHECKED_NOT_STARTED')
+                self.assertEqual(first['dax_access_preparation']['status'],'GRANTED')
+                self.assertEqual(len(commands),4)  # sudo, ACL read, UID grant, ACL read; no duplicate grant.
+                self.assertTrue(runner.device_access_change_possible)
+                self.assertFalse(first['services_started']); self.assertFalse(first['devices_mapped'])
+                self.assertEqual(os.geteuid(),1000)
+                record=json.loads((root/'work/dax-access.json').read_text())
+                self.assertEqual((record['owner_uid'],record['owner_gid']),(0,0))
+                self.assertIn('DEVICE_WIDE',record['protection_scope'])
+            finally: runner.log.close()
+
+    def test_dax_access_installs_only_missing_acl_tools_with_existing_package_policy(self):
+        from callosum_lab import Runner
+        for skip in (False,True):
+            with self.subTest(skip_apt=skip),tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+                root=Path(directory); path,args,state,commands,command=self.dax_access_fixture(root,stack)
+                args.skip_apt=skip; state['tools']=False; runner=Runner(root/'work')
+                try:
+                    with patch.object(runner,'call',side_effect=command):
+                        report=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                    install=['sudo','-n','apt-get','install','-y','acl']
+                    if skip:
+                        self.assertEqual(report['status'],'BLOCKED')
+                        self.assertNotIn(install,commands); self.assertFalse(state['granted'])
+                    else:
+                        self.assertEqual(report['status'],'INPUTS_CHECKED_NOT_STARTED')
+                        self.assertIn(install,commands)
+                finally: runner.log.close()
+
+    def test_dax_access_does_not_repair_unverified_extent_or_wrong_local_node(self):
+        from callosum_lab import Runner
+        for field in ('extent','addresses'):
+            with self.subTest(field=field),tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+                root=Path(directory); path,args,state,commands,command=self.dax_access_fixture(root,stack)
+                state[field]=False; runner=Runner(root/'work')
+                try:
+                    with patch.object(runner,'call',side_effect=AssertionError('no privilege request')):
+                        report=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                    self.assertEqual(report['status'],'BLOCKED'); self.assertFalse(state['granted'])
+                finally: runner.log.close()
+
+    def test_dax_access_denied_sudo_or_failed_caller_open_retains_evidence_without_fallback(self):
+        from callosum_lab import Runner
+        for case in ('sudo','caller_open'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+                root=Path(directory); path,args,state,commands,command=self.dax_access_fixture(root,stack)
+                runner=Runner(root/'work'); state['open_ok']=case!='caller_open'
+                def operate(*a,**kw):
+                    if case=='sudo': raise RuntimeError('fixture sudo denied')
+                    return command(*a,**kw)
+                try:
+                    with patch.object(runner,'call',side_effect=operate):
+                        report=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                    self.assertEqual(report['status'],'BLOCKED')
+                    attempt=report['dax_access_preparation']
+                    self.assertEqual(attempt['status'],'FAILED')
+                    self.assertEqual(attempt['change_possible'],case=='caller_open')
+                    self.assertEqual(state['granted'],case=='caller_open')
+                    self.assertTrue((root/'work/dax-access.json').is_file())
+                    self.assertFalse(report['services_started']); self.assertFalse(report['devices_mapped'])
+                finally: runner.log.close()
+
+    def auto_hugepage_fixture(self,root,stack):
+        """Model sysfs/sudo only. This fixture never performs a privileged write."""
+        path,args=matrix_tests.MatrixTest().fixture(root)
+        args.action='init'; args.node='a1'; args.unit='MB'
+        state=dict(total_pages=10,free_pages=4,available_pages=4,global_free_pages=4,
+            global_reserved_pages=0,node=1,
+            control_file='/sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages')
+        extra=[]; reused=[False]; needed=[62]
+        def inspect(path,args,work,loader,live=False):
+            issues=list(extra)
+            if needed[0] and state['available_pages']<needed[0] and not reused[0]:
+                issues.append(dict(check='hugepages_capacity',error='fixture capacity shortage'))
+            return dict(status='BLOCKED' if issues else 'INPUTS_CHECKED_NOT_STARTED',node='a1',issues=issues,
+                local_addresses=['fixture-local'],numa=dict(node=1),hugepages=dict(state),
+                hugepages_required_for_new_buffer=needed[0],reused_huge_receiver=reused[0],
+                services_started=False,devices_mapped=False)
+        stack.enter_context(patch.object(prep,'inspect',side_effect=inspect))
+        stack.enter_context(patch.object(prep,'huge_snapshot',side_effect=lambda *a,**k:dict(state)))
+        stack.enter_context(patch.object(prep.sys,'platform','linux'))
+        stack.enter_context(patch.object(prep.os,'geteuid',return_value=1000))
+        return path,args,state,extra,reused,needed
+
+    def test_auto_hugepages_sudo_writes_only_numa_deficit_then_rechecks_and_reuses(self):
+        from callosum_lab import Runner
+        with tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+            root=Path(directory); path,args,state,extra,reused,needed=self.auto_hugepage_fixture(root,stack)
+            runner=Runner(root/'work')
+            def command(stage,argv,*a,**kw):
+                if argv==['sudo','-v']: return
+                self.assertEqual(argv,['sudo','-n','tee','--',state['control_file']])
+                self.assertEqual(kw['input_text'],'68\n')  # 10 total + (62 required - 4 free).
+                state.update(total_pages=68,free_pages=62,available_pages=62,global_free_pages=62)
+                return '68\n'
+            try:
+                with patch.object(runner,'call',side_effect=command) as calls,contextlib.redirect_stdout(io.StringIO()):
+                    first=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                    second=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                self.assertEqual(calls.call_count,2)  # One authentication, one bounded privileged write.
+                self.assertEqual(first['status'],'INPUTS_CHECKED_NOT_STARTED')
+                self.assertEqual(first['hugepage_auto_provision']['status'],'PROVISIONED')
+                self.assertEqual(second['status'],'INPUTS_CHECKED_NOT_STARTED')
+                self.assertFalse(first['services_started']); self.assertFalse(first['devices_mapped'])
+                self.assertTrue(runner.hugepage_pool_change_possible)
+                record=json.loads((root/'work/hugepage-provision.json').read_text())
+                self.assertEqual(record['target_total_pages'],68)
+                self.assertFalse(record['reclaimed'])
+            finally: runner.log.close()
+
+    def test_init_entry_automatically_provisions_without_extra_operator_action(self):
+        import callosum_lab as lab
+        with tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+            root=Path(directory); _,args,state,extra,reused,needed=self.auto_hugepage_fixture(root,stack)
+            raw=json.loads((root/'topology.json').read_text())
+            raw.update(evidence_class='TRANSFER_ONLY',lab_run=dict(controller='a1',source='b1',requester='a1',
+                profile='two_worker_smoke',wait_seconds=1800))
+            (root/'approved.json').write_text(json.dumps(raw))
+            template=(root/'setup.json').read_bytes(); real_read=Path.read_text; commands=[]
+            def read(path,*a,**kw):
+                return 'fixture-a1' if str(path)=='/etc/machine-id' else real_read(path,*a,**kw)
+            def build(source,run,options,runner): (run/'setup.json').write_bytes(template)
+            def call(runner,stage,argv,*a,**kw):
+                commands.append(argv)
+                if argv==['sudo','-v']: return
+                self.assertEqual(argv,['sudo','-n','tee','--',state['control_file']])
+                self.assertEqual(kw['input_text'],'68\n')
+                state.update(total_pages=68,free_pages=62,available_pages=62,global_free_pages=62)
+            config=root/'fresh-matrix.json'
+            command=['matrix','init','--config',str(config),'--node','a1',
+                     '--topology',str(root/'approved.json'),'--skip-apt']
+            with patch.object(Path,'read_text',new=read),patch.object(lab,'prepare',side_effect=build), \
+                 patch.object(lab.Runner,'call',autospec=True,side_effect=call), \
+                 patch.object(sys,'argv',command),contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(matrix.main(),0)
+            spec=json.loads(config.read_text()); work=Path(spec['preparation_dir'])
+            report=json.loads((work/'readiness.json').read_text())
+            self.assertEqual(report['status'],'INPUTS_CHECKED_NOT_STARTED')
+            self.assertEqual(report['hugepage_auto_provision']['status'],'PROVISIONED')
+            self.assertEqual(len(commands),2)
+            self.assertFalse(report['services_started']); self.assertFalse(report['devices_mapped'])
+
+    def test_auto_hugepages_skips_native_ready_reused_and_independently_blocked_cases(self):
+        from callosum_lab import Runner
+        for case in ('native','already_free','reused','permission','other_blocker'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+                root=Path(directory); path,args,state,extra,reused,needed=self.auto_hugepage_fixture(root,stack)
+                runner=Runner(root/'work')
+                if case=='native': needed[0]=0
+                if case=='already_free': state['available_pages']=62
+                if case=='reused': reused[0]=True
+                if case=='permission': extra.append(dict(check='hugetlb_permission',error='fixture permission denied'))
+                if case=='other_blocker': extra.append(dict(check='dax_access',error='fixture device access denied'))
+                try:
+                    with patch.object(runner,'call',side_effect=AssertionError('must not request sudo')) as calls, \
+                         contextlib.redirect_stdout(io.StringIO()):
+                        report=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                    calls.assert_not_called()
+                    self.assertFalse(getattr(runner,'hugepage_pool_change_possible',False))
+                    self.assertEqual(report['status'],'BLOCKED' if extra else 'INPUTS_CHECKED_NOT_STARTED')
+                finally: runner.log.close()
+
+    def test_auto_hugepages_auth_denial_does_not_claim_a_host_change_or_fallback(self):
+        from callosum_lab import Runner
+        with tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+            root=Path(directory); path,args,state,extra,reused,needed=self.auto_hugepage_fixture(root,stack)
+            runner=Runner(root/'work')
+            try:
+                with patch.object(runner,'call',side_effect=RuntimeError('sudo authorization denied')) as calls, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    report=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                self.assertEqual(calls.call_count,1)
+                self.assertEqual(report['status'],'BLOCKED')
+                self.assertEqual({i['check'] for i in report['issues']},{'hugepages_capacity','hugepages_provision'})
+                self.assertFalse(getattr(runner,'hugepage_pool_change_possible',False))
+                self.assertFalse((root/'work/hugepage-provision.json').exists())
+                self.assertFalse(report['hugepage_auto_provision']['change_possible'])
+            finally: runner.log.close()
+
+    def test_auto_hugepages_partial_allocation_retains_evidence_and_retry_adds_no_duplicate_pages(self):
+        from callosum_lab import Runner
+        with tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+            root=Path(directory); path,args,state,extra,reused,needed=self.auto_hugepage_fixture(root,stack)
+            args.action='prepare'; runner=Runner(root/'work'); writes=[]
+            def command(stage,argv,*a,**kw):
+                if argv==['sudo','-v']: return
+                writes.append(int(kw['input_text']))
+                total=20 if len(writes)==1 else 68
+                state.update(total_pages=total,free_pages=total-6,available_pages=total-6,global_free_pages=total-6)
+            try:
+                with patch.object(runner,'call',side_effect=command),contextlib.redirect_stdout(io.StringIO()):
+                    first=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                    partial=json.loads((root/'work/hugepage-provision.json').read_text())
+                    second=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                self.assertEqual(first['status'],'BLOCKED')
+                self.assertEqual(partial['status'],'PARTIAL')
+                self.assertTrue(first['hugepage_auto_provision']['change_possible'])
+                self.assertEqual(second['status'],'INPUTS_CHECKED_NOT_STARTED')
+                self.assertEqual(writes,[68,68])
+                self.assertTrue(list((root/'work').glob('hugepage-provision.json.*.previous')))
+            finally: runner.log.close()
+
+    def test_auto_hugepages_failed_privileged_write_records_possible_partial_change(self):
+        from callosum_lab import Runner
+        with tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+            root=Path(directory); path,args,state,extra,reused,needed=self.auto_hugepage_fixture(root,stack)
+            runner=Runner(root/'work')
+            def command(stage,argv,*a,**kw):
+                if argv==['sudo','-v']: return
+                state.update(total_pages=20,free_pages=14,available_pages=14,global_free_pages=14)
+                raise RuntimeError('fixture tee failed after possible partial change')
+            try:
+                with patch.object(runner,'call',side_effect=command),contextlib.redirect_stdout(io.StringIO()):
+                    report=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                record=json.loads((root/'work/hugepage-provision.json').read_text())
+                self.assertEqual(report['status'],'BLOCKED')
+                self.assertEqual(record['status'],'WRITE_FAILED')
+                self.assertTrue(record['change_possible'])
+                self.assertEqual(record['after']['total_pages'],20)
+                self.assertTrue(runner.hugepage_pool_change_possible)
+                self.assertEqual(state['total_pages'],20)  # No rollback or shrink.
+            finally: runner.log.close()
+
+    def test_auto_hugepages_rejects_unexpected_privileged_control_path(self):
+        from callosum_lab import Runner
+        with tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+            root=Path(directory); path,args,state,extra,reused,needed=self.auto_hugepage_fixture(root,stack)
+            state['control_file']='/proc/sys/vm/hugetlb_shm_group'
+            runner=Runner(root/'work')
+            try:
+                with patch.object(runner,'call') as calls:
+                    with self.assertRaisesRegex(RuntimeError,'unexpected HugeTLB control file'):
+                        prep.inspect_resources(path,args,root/'work',matrix.load,runner)
+                calls.assert_not_called()
+            finally: runner.log.close()
 
     def test_function_numa_provision_delta_partial_failure_and_idempotence(self):
         with tempfile.TemporaryDirectory() as directory:
