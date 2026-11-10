@@ -254,11 +254,12 @@ print(json.dumps({'engine':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdig
     for scenario in ('two_worker_metadata_lookup', 'four_worker_two_pool'):
         runner.call(scenario, ['bash', Path(root) / 'experiments' / scenario / 'run.sh', 'software-test'], env)
     receipt = dict(status='PASS', scope='SOFTWARE_ONLY', python=str(python), build=str(build),
+        host_identity=dict(hostname=socket.gethostname(),machine_id=Path('/etc/machine-id').read_text().strip()),
         env={k:env[k] for k in ('PYTHON_BIN', 'CALLOSUM_NATIVE_BUILD', 'PYTHONPATH', 'LD_LIBRARY_PATH')},
         source_hashes={p:digest(source / p) for p in SOURCE_FILES})
     (run / 'setup.json').write_text(json.dumps(receipt, indent=2))
     (run / 'env.sh').write_text(''.join(f'export {k}={shlex.quote(v)}\n' for k,v in receipt['env'].items()))
-    runner.say(f'[PASS] software preparation; env={run}/env.sh; no DAX/RDMA/GPU transfer performed')
+    runner.say(f'[PASS] software preparation; setup={run}/setup.json; env={run}/env.sh; no DAX/RDMA/GPU transfer performed')
 
 
 def inventory():
@@ -1285,7 +1286,10 @@ def main(argv=None):
     try:
         if args.action=='prepare':
             if (run/'setup.json').exists():
-                runner.say('[PASS] preparation receipt exists; do not rebuild under live services')
+                from callosum_benchmark_prepare import runtime_receipt
+                runtime_receipt(run)
+                runner.say(f'[REUSED] validated host-local receipt={run}/setup.json; '
+                           'no rebuild or hardware validation; run matrix prepare for live readiness')
             else:
                 prepare(root,run,args,runner)
         elif args.action=='node':

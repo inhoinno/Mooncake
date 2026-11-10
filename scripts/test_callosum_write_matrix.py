@@ -28,7 +28,7 @@ class MatrixTest(unittest.TestCase):
         topology['max_inflight_bytes']=128*1024**2
         topology['pools']['A']['capacity']=2*1024**3
         (root/'topology.json').write_text(json.dumps(topology))
-        (root/'setup.json').write_text(json.dumps(dict(status='PASS',env=dict(PYTHON_BIN=sys.executable,
+        (root/'setup.json').write_text(json.dumps(dict(status='PASS',build=str(root.resolve()),env=dict(PYTHON_BIN=sys.executable,
             CALLOSUM_NATIVE_BUILD=str(root),PYTHONPATH=str(root),LD_LIBRARY_PATH=''))))
         spec=dict(schema_version=1,topology_file='topology.json',token_file='control.token',output_root='results',
                   runtimes={n:dict(setup_run=str(root)) for n in ('a1','b1')},
@@ -135,6 +135,8 @@ class MatrixTest(unittest.TestCase):
                     'smoke-local_numa-huge2MB','smoke-cxl','local_numa-native',
                     'local_numa-huge2MB','cxl-native','cxl-huge2MB'])
                 self.assertEqual(len(result['report']['aggregates']),4)
+                self.assertEqual(result['metric_applicability'],dict(gpu_ready_latency='NOT_APPLICABLE',
+                    helper_selection='NOT_APPLICABLE',recomputation='NOT_APPLICABLE'))
                 checked=next(r for r in result['results'] if r['experiment_case']=='cxl-huge2MB')
                 self.assertEqual(checked['mr_page_mode'],'native')
                 self.assertEqual(checked['requested_page_mode'],'huge2MB')

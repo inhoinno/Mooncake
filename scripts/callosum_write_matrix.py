@@ -55,11 +55,12 @@ def load(path,args):
                 'CXL destination arena too small for all retained matrix windows; no reclaim is permitted')
         require(max(lengths)*len(args.page_modes)+4096<=c['pools'][nodes[pair['source']]['pool']]['capacity'],
                 'CXL source arena too small for the retained source windows')
-    require(set(spec['runtimes'])==set(pair.values()),'one host-local runtime receipt per pair member required')
+    require(args.node in spec['runtimes'] and set(spec['runtimes'])<=set(pair.values()),
+            'this node needs a host-local runtime receipt; exchange signed readiness for peer provenance')
     receipt=resolve(base,spec['runtimes'][args.node]['setup_run'])
     require(set(spec['runtimes'][args.node])=={'setup_run'},'runtime needs setup_run')
-    setup=json.loads((receipt/'setup.json').read_text())
-    require(setup['status']=='PASS','host-local setup receipt must be PASS')
+    from callosum_benchmark_prepare import runtime_receipt
+    setup=runtime_receipt(receipt)
     env=clean_env()
     for key in tuple(env):
         if key.startswith('MC_'): env.pop(key)
@@ -265,9 +266,12 @@ def run(spec,c,args,topology,receipt,private,env,out,runner):
         stream.write('\nMatrix note: CXL huge2MB requires observed 2 MiB DAX geometry. '
                      'CXL native may already have identical pages. This is not a forced 4 KiB/2 MiB A/B. '
                      'NUMA huge2MB uses explicit HugeTLB; NUMA native records actual residency. '
-                     'Compare matching sender-loop scopes, not unlike trial control paths.\n')
+                     'Compare matching sender-loop scopes, not unlike trial control paths. '
+                     'GPU-ready, helper-selection and recomputation metrics: NOT_APPLICABLE.\n')
     (out/'summary.json').write_text(json.dumps(dict(status='PASS',evidence_class='TRANSFER_ONLY',
         results=rows,report=report,cxl_page_modes_are_not_forced_4k_vs_2m=True,
+        metric_applicability={name:'NOT_APPLICABLE' for name in
+                              ('gpu_ready_latency','helper_selection','recomputation')},
         gpu_delivery_proven=False,serving_proven=False),indent=2))
     runner.say((out/'report.md').read_text())
 
@@ -281,8 +285,9 @@ def main():
     parser.add_argument('--peer-report',help='Signed readiness.json from the other physical host')
     parser.add_argument('--topology',help='init: existing approved topology, never generated device ownership')
     parser.add_argument('--setup-run',help='init: existing local successful build receipt')
-    parser.add_argument('--peer-setup-run',help='init: peer build receipt path as used on that host')
+    parser.add_argument('--peer-setup-run',help='Legacy optional peer path; peer identity is checked through signed readiness')
     parser.add_argument('--token-file',help='init: existing shared private token file')
+    parser.add_argument('--create-token',action='store_true',help='init: create a missing private token once on the controller; never overwrite')
     parser.add_argument('--source',help='init: explicit source ID if absent from lab_run')
     parser.add_argument('--receiver',help='init: explicit receiver ID if absent from lab_run')
     parser.add_argument('--campaign-run',help='retire: old campaign; start-cxl: fresh campaign directory')
@@ -298,6 +303,7 @@ def main():
     try:
         if args.sizes is None:
             args.sizes=[int(n) for n in os.environ.get('IO_SIZES','1 2 4 8 16 32 64 128').split()]
+        require(not args.create_token or args.action=='init','--create-token is only valid with init')
         require(len(set(args.backings))==len(args.backings) and len(set(args.page_modes))==len(args.page_modes),
                 'duplicate backing or page mode')
         import callosum_benchmark_prepare as preparation
@@ -402,6 +408,8 @@ def main():
         return 0
     except Exception as error:
         failure=dict(status='FAIL',stage=runner.stage if runner else phase,error=str(error),
+                     issues=getattr(error,'issues',[]),
+                     initialization_side_effects=getattr(error,'initialization_side_effects',None),
                      evidence=str(runner.run_dir) if runner else (str(work) if work and phase!='configuration' else None),
                      owned_children_started=list(runner.children) if runner else [],
                      rdma_work_possible=bool(runner and runner.remote_mutation_possible),

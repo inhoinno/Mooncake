@@ -124,6 +124,7 @@ def provision(node,needed,work,sysroot=Path('/sys')):
 def inspect(path,args,work,loader):
     """Collect independent failures without starting a service or mapping a device."""
     result=dict(status='BLOCKED',scope='READ_ONLY_PREPARATION',node=args.node,issues=[],
+                purpose='FORMAL_PERFORMANCE',
                 services_started=False,devices_mapped=False,created_unix_ns=time.time_ns(),software=software())
     def check(name,operation):
         try:
@@ -157,6 +158,9 @@ def inspect(path,args,work,loader):
         spec,c,topology,receipt,private,env,root=loaded
         result['plan']=plan(c,spec,args); result['fingerprint']=c['fingerprint']
         result['pair']=spec['pair']; result['role']='receiver' if args.node==spec['pair']['receiver'] else 'initiator'
+        build=runtime_receipt(receipt)
+        result['setup_receipt']=dict(path=str(receipt/'setup.json'),build=build['build'],
+            scope=build.get('scope','LEGACY_RECEIPT'),host_identity=build.get('host_identity'))
         result['effective']=dict(sizes=args.sizes,unit=args.unit,repetitions=args.repetitions,
             size_bytes=[block_bytes(n,args.unit) for n in args.sizes],bytes_per_trial=TOTAL_BYTES,
             configured_qps=16,warmup_blocks=0,concurrent_pairs=1)
@@ -395,31 +399,120 @@ def verify_peer(path,secret,c,spec,args):
     return peer
 
 
+def runtime_receipt(run):
+    """Validate host-local build inputs; native imports remain a prepare gate."""
+    run=Path(run)
+    value=json.loads((run/'setup.json').read_text())
+    require(value.get('status')=='PASS','host-local setup receipt must be PASS')
+    required=('PYTHON_BIN','PYTHONPATH','LD_LIBRARY_PATH','CALLOSUM_NATIVE_BUILD')
+    require(isinstance(value.get('env'),dict) and all(isinstance(value['env'].get(k),str) for k in required),
+            'setup.json needs env.PYTHON_BIN, PYTHONPATH, LD_LIBRARY_PATH and CALLOSUM_NATIVE_BUILD')
+    require(isinstance(value.get('build'),str) and Path(value['build']).is_absolute(),
+            'setup.json needs the absolute build directory produced by callosum_lab.sh --action prepare')
+    require(Path(value['env']['PYTHON_BIN']).is_absolute() and os.access(value['env']['PYTHON_BIN'],os.X_OK),
+            'host-local Python is inaccessible; build on this host, do not copy a peer venv')
+    host=value.get('host_identity')
+    if host:
+        require(sys.platform=='linux' and host.get('machine_id')==Path('/etc/machine-id').read_text().strip(),
+                'setup receipt belongs to a different host; build locally')
+    return value
+
+
 def initialize(path,args):
     """Create a per-host matrix configuration from an already approved topology."""
     path=Path(path).resolve()
     require(not path.exists(),'matrix config exists; preserve it and use prepare')
-    require(args.topology and args.setup_run and args.peer_setup_run and args.token_file,
-            'init requires --topology, --setup-run, --peer-setup-run and --token-file')
-    topology=Path(args.topology).resolve(); c=config(topology)
+    require(args.topology and args.setup_run and args.token_file,
+            'init requires --topology, --setup-run and --token-file')
+    topology=Path(args.topology).resolve()
+    local=Path(args.setup_run).resolve()
+    private=Path(args.token_file).resolve()
+    create_token=getattr(args,'create_token',False)
+    problems=[]
+    for label,target in [('topology',topology),('local setup receipt',local/'setup.json'),
+                         *([] if create_token and not private.exists() else [('shared token',private)])]:
+        try:
+            with target.open('rb') as stream: stream.read(1)
+        except FileNotFoundError:
+            problems.append(dict(input=label,path=str(target),reason='MISSING'))
+        except PermissionError:
+            problems.append(dict(input=label,path=str(target),reason='ACCESS_DENIED'))
+        except OSError as error:
+            problems.append(dict(input=label,path=str(target),reason=str(error)))
+    if problems:
+        error=RuntimeError('Initialization inputs unavailable: '+
+            '; '.join(f'{p["input"]}: {p["reason"]}: {p["path"]}' for p in problems)+
+            '. No configuration created. setup.json is produced by callosum_lab.sh --action prepare; '
+            'select an existing host-local receipt or create a fresh software build. '
+            'Reuse the intended campaign token, or use --create-token once on the controller for a new setup.')
+        error.issues=problems
+        raise error
+    # These inputs are independent. A bad receipt must not hide an invalid token
+    # or topology and send the operator through another correction round.
+    validated={}
+    for label,target,operation in [
+        ('topology',topology,lambda:config(topology)),
+        ('local setup receipt',local/'setup.json',lambda:runtime_receipt(local)),
+        ('shared token',private,lambda:require(not private.exists() or
+            (len(private.read_text().strip())>=32 and private.stat().st_mode & 0o077==0),
+            'shared token requires >=32 characters and mode 0600'))]:
+        try: validated[label]=operation()
+        except Exception as error: problems.append(dict(input=label,path=str(target),reason=str(error)))
+    if problems:
+        error=RuntimeError('Initialization inputs invalid: '+
+            '; '.join(f'{p["input"]}: {p["reason"]}: {p["path"]}' for p in problems)+'. No configuration or token created.')
+        error.issues=problems
+        raise error
+    c=validated['topology']
     launch=c.get('lab_run',{})
     source=args.source or launch.get('source'); receiver=args.receiver or launch.get('requester')
     pair=dict(source=source,receiver=receiver)
     require(source!=receiver and args.node in pair.values() and all(n in {p['id'] for p in c['nodes']} for n in pair.values()),
             'select --source/--receiver or supply the approved lab_run IDs')
-    local=Path(args.setup_run).resolve(); peer=Path(args.peer_setup_run).resolve()
-    require((local/'setup.json').is_file(),'local setup receipt missing')
-    private=Path(args.token_file).resolve()
-    require(private.is_file(),'existing shared private token required; do not generate one independently per host')
+    setup=validated['local setup receipt']
+    require(not create_token or args.node==launch.get('controller'),
+            '--create-token is controller-only; transfer that same token securely to the peer')
+    # A retained campaign already has an authority token. Never silently replace it.
+    retained=local/'control.token'
+    require(not (create_token and not private.exists() and retained.exists()),
+            'selected setup is a retained campaign; use its existing control.token')
+    token_created=False
+    if create_token and not private.exists():
+        fd=os.open(private,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        token_created=True
+        try:
+            with os.fdopen(fd,'w') as stream: stream.write(secrets.token_hex(32)+'\n')
+        except OSError as error:
+            error.initialization_side_effects=dict(token_created=True,token_file=str(private),
+                configuration_exists=False,services_started=False,devices_mapped=False)
+            raise
+    secret=private.read_text().strip()
+    require(len(secret)>=32 and private.stat().st_mode & 0o077==0,
+            'shared token requires >=32 characters and mode 0600; no configuration created')
+    if retained.exists():
+        require(hmac.compare_digest(retained.read_text().strip(),secret),
+                'token differs from the selected retained campaign; preserve both and select the intended setup')
+    runtimes={args.node:dict(setup_run=str(local))}
+    # Legacy manifests may retain a peer path. It is never opened on this host.
+    # Current peer provenance comes from signed readiness, not an invented path.
+    if getattr(args,'peer_setup_run',None):
+        runtimes[next(n for n in pair.values() if n!=args.node)]=dict(setup_run=str(Path(args.peer_setup_run).resolve()))
     value=dict(schema_version=1,topology_file=str(topology),token_file=str(private),
         output_root=str(path.parents[0]/'runs/write-matrix'),pair=pair,
-        runtimes={args.node:dict(setup_run=str(local)),
-                  next(n for n in pair.values() if n!=args.node):dict(setup_run=str(peer))},
+        runtimes=runtimes,
         numa_nodes={},control_ports=dict(native=19201,huge2MB=19202),te_ports=dict(native=19401,huge2MB=19402),
         transport_env={n:dict(MC_MTU=None,MC_GID_INDEX=None) for n in pair.values()})
-    path.parent.mkdir(parents=True,exist_ok=True)
-    with path.open('x') as stream: json.dump(value,stream,indent=2)
-    return dict(status='CONFIG_CREATED_NOT_VALIDATED',config=str(path),services_started=False,devices_mapped=False)
+    try:
+        path.parent.mkdir(parents=True,exist_ok=True)
+        with path.open('x') as stream: json.dump(value,stream,indent=2)
+    except OSError as error:
+        error.initialization_side_effects=dict(token_created=token_created,token_file=str(private),
+            configuration_exists=path.exists(),services_started=False,devices_mapped=False)
+        raise
+    return dict(status='CONFIG_CREATED_NOT_VALIDATED',config=str(path),node=args.node,pair=pair,
+        setup_receipt=str(local/'setup.json'),build=setup['build'],
+        token_file=str(private),peer_handoff='Transfer the same token privately; exchange signed readiness after prepare',
+        services_started=False,devices_mapped=False)
 
 
 def adopt_build(source,old_run,new_run,env):

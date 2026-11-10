@@ -1,11 +1,13 @@
 """First-run and recovery fixtures. No DAX, HugeTLB or RDMA hardware acceptance."""
 import contextlib
+import io
 import json
 import os
 from pathlib import Path
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -17,6 +19,196 @@ import test_callosum_write_matrix as matrix_tests
 
 
 class PreparationTest(unittest.TestCase):
+    def test_first_run_cli_handoff_then_repeat_without_historical_directories(self):
+        """Exercise the shipped Bash entry, real JSON/token handoff and read-only retry.
+
+        Build receipts model a successful Linux build. This is not native-build
+        or hardware evidence. No hidden checkout-local config is consumed.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve(); hosts={}
+            wrapper=Path(__file__).resolve().parents[2]/'scripts/rdma-write-matrix.sh'
+            for node in ('a1','b1'):
+                host=root/node; host.mkdir()
+                _,args=matrix_tests.MatrixTest().fixture(host)
+                topology=json.loads((host/'topology.json').read_text())
+                topology['lab_run']=dict(controller='a1',source='b1',requester='a1',
+                                         profile='two_worker_smoke',wait_seconds=1800)
+                (host/'topology.json').write_text(json.dumps(topology))
+                # Each host has a different freshly generated build receipt path.
+                build=host/'fresh-local-build'; build.mkdir()
+                (host/'setup.json').rename(build/'setup.json')
+                token=host/'new-control.token'
+                command=['bash',str(wrapper),'init','--config',str(host/'benchmark.local.json'),
+                    '--node',node,'--topology',str(host/'topology.json'),
+                    '--setup-run',str(build),'--token-file',str(token)]
+                if node=='a1': command+=['--create-token']
+                else:
+                    token.write_bytes(hosts['a1']['token'].read_bytes()); token.chmod(0o600)
+                missing=list(command); missing[missing.index('--setup-run')+1]=str(host/'missing-build')
+                failed=subprocess.run(missing,cwd=host,text=True,capture_output=True)
+                self.assertNotEqual(failed.returncode,0)
+                failure=json.loads(failed.stderr)
+                self.assertEqual(failure['issues'],[dict(input='local setup receipt',
+                    path=str(host/'missing-build/setup.json'),reason='MISSING')])
+                self.assertFalse(failure['rdma_work_possible'])
+                self.assertFalse((host/'benchmark.local.json').exists())
+                if node=='a1': self.assertFalse(token.exists())
+                run=subprocess.run(command,cwd=host,text=True,capture_output=True)
+                self.assertEqual(run.returncode,0,run.stderr)
+                result=json.loads(run.stdout)
+                self.assertEqual(result['setup_receipt'],str(build/'setup.json'))
+                config=host/'benchmark.local.json'; original=config.read_bytes()
+                self.assertEqual(set(json.loads(original)['runtimes']),{node})
+                self.assertEqual(stat.S_IMODE(token.stat().st_mode),0o600)
+                self.assertNotIn(token.read_text().strip(),run.stdout+run.stderr)
+                # Re-running init does not overwrite a valid config or token.
+                repeat=subprocess.run(command,cwd=host,text=True,capture_output=True)
+                self.assertNotEqual(repeat.returncode,0)
+                self.assertEqual(config.read_bytes(),original)
+                self.assertFalse(result['services_started']); self.assertFalse(result['devices_mapped'])
+                args.node=node; args.action='prepare'; args.unit='MB'
+                loaded=matrix.load(config,args)
+                self.assertEqual(loaded[3],build)
+                # A pre-service prepare retains a useful report, not a fake PASS.
+                # Explicitly model the inaccessible-lab boundary on every OS.
+                with patch.object(prep.sys,'platform','darwin'):
+                    report=prep.inspect(config,args,host/'work',matrix.load)
+                    again=prep.inspect(config,args,host/'work',matrix.load)
+                self.assertEqual(again['status'],'BLOCKED')
+                self.assertTrue(report['evidence_saved'])
+                self.assertIn('platform',{i['check'] for i in report['issues']})
+                self.assertEqual(report['setup_receipt']['path'],str(build/'setup.json'))
+                self.assertFalse(again['services_started']); self.assertFalse(again['devices_mapped'])
+                self.assertTrue(list((host/'work').glob('readiness.json.*.previous')))
+                hosts[node]=dict(token=token,plan=report['plan'])
+            self.assertEqual(hosts['a1']['plan'],hosts['b1']['plan'])
+
+    def test_invalid_receipt_token_node_and_retained_token_do_not_create_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); _,args=matrix_tests.MatrixTest().fixture(root)
+            args.topology=str(root/'topology.json'); args.setup_run=str(root)
+            args.peer_setup_run=None; args.token_file=str(root/'different.token')
+            args.source='b1'; args.receiver='a1'; args.node='a1'; args.create_token=False
+            private=Path(args.token_file); private.write_text('short'); private.chmod(0o600)
+            target=root/'new.json'
+            with self.assertRaisesRegex(RuntimeError,'32 characters'): prep.initialize(target,args)
+            self.assertFalse(target.exists())
+            private.write_text('different-private-token-'*3)
+            with self.assertRaisesRegex(RuntimeError,'token differs'): prep.initialize(target,args)
+            self.assertFalse(target.exists())
+            args.token_file=str(root/'control.token'); args.node='unknown'
+            with self.assertRaisesRegex(RuntimeError,'select --source'): prep.initialize(target,args)
+            args.node='a1'; receipt=root/'setup.json'; old=receipt.read_text()
+            receipt.write_text(json.dumps(dict(status='FAIL')))
+            with self.assertRaisesRegex(RuntimeError,'must be PASS'): prep.initialize(target,args)
+            self.assertFalse(target.exists()); receipt.write_text(old)
+            args.node='b1'; args.create_token=True
+            with self.assertRaisesRegex(RuntimeError,'controller-only'): prep.initialize(target,args)
+            self.assertFalse(target.exists())
+
+    def test_new_receipt_from_a_different_machine_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); matrix_tests.MatrixTest().fixture(root)
+            path=root/'setup.json'; value=json.loads(path.read_text())
+            value['host_identity']=dict(machine_id='other-machine')
+            path.write_text(json.dumps(value))
+            with patch.object(prep.sys,'platform','linux'), \
+                 patch.object(Path,'read_text',side_effect=[json.dumps(value),'this-machine']):
+                with self.assertRaisesRegex(RuntimeError,'different host'): prep.runtime_receipt(root)
+
+    def test_invalid_inputs_collected_and_created_token_survives_output_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve(); _,args=matrix_tests.MatrixTest().fixture(root)
+            topology=json.loads((root/'topology.json').read_text())
+            topology['lab_run']=dict(controller='a1',source='b1',requester='a1')
+            (root/'topology.json').write_text(json.dumps(topology))
+            args.node='a1'; args.topology=str(root/'topology.json'); args.setup_run=str(root)
+            args.token_file=str(root/'new-control.token'); args.create_token=True
+            args.source='b1'; args.receiver='a1'; args.peer_setup_run=None
+            private=Path(args.token_file); private.write_text('short'); private.chmod(0o600)
+            receipt=root/'setup.json'; original=receipt.read_bytes()
+            receipt.write_text(json.dumps(dict(status='FAIL')))
+            with self.assertRaises(RuntimeError) as caught: prep.initialize(root/'new.json',args)
+            self.assertEqual({i['input'] for i in caught.exception.issues},{'local setup receipt','shared token'})
+            self.assertEqual(private.read_text(),'short')
+            receipt.write_bytes(original)
+            # Use a separate fresh build to avoid changing the retained fixture token.
+            fresh=root/'fresh'; fresh.mkdir(); (fresh/'setup.json').write_bytes(original)
+            args.setup_run=str(fresh); args.token_file=str(root/'fresh-control.token')
+            target=root/'denied.json'; original_open=Path.open
+            def deny_output(path,*a,**kw):
+                if path==target: raise PermissionError('fixture config directory denied')
+                return original_open(path,*a,**kw)
+            with patch.object(Path,'open',new=deny_output):
+                with self.assertRaises(PermissionError) as caught: prep.initialize(target,args)
+            side=caught.exception.initialization_side_effects
+            self.assertTrue(side['token_created']); self.assertFalse(side['configuration_exists'])
+            token=Path(args.token_file).read_bytes()
+            prep.initialize(target,args)
+            self.assertEqual(Path(args.token_file).read_bytes(),token)
+
+    def test_canonical_build_rerun_rejects_failed_receipt_then_reuses_valid_receipt(self):
+        from callosum_lab import main as lab_main
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); matrix_tests.MatrixTest().fixture(root)
+            receipt=root/'setup.json'; original=receipt.read_bytes()
+            topology=(root/'topology.json').read_bytes()
+            receipt.write_text(json.dumps(dict(status='FAIL')))
+            command=['--root',str(Path(__file__).resolve().parents[2]),'--run-dir',str(root),'--action','prepare']
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(lab_main(command),1)
+            receipt.write_bytes(original)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(lab_main(command),0)
+            self.assertIn('[REUSED]',output.getvalue())
+            self.assertEqual(receipt.read_bytes(),original)
+            self.assertEqual((root/'topology.json').read_bytes(),topology)
+
+    def test_signed_ready_handoff_checks_host_plan_source_and_intended_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            with contextlib.ExitStack() as stack:
+                path,args=self.inspect_fixture(root,stack)
+                local=prep.inspect(path,args,root/'work',matrix.load)
+                self.assertEqual(local['status'],'PREPARED_NOT_TESTED',local['issues'])
+                spec,c,_,_,private,_,_=matrix.load(path,args)
+                secret=private.read_text().strip()
+                peer=dict(local,node='b1',machine=dict(machine_id='host-b1',boot_id='boot-b1'))
+                handed=root/'peer-b1.json'; handed.write_text(json.dumps(prep.signed(peer,secret)))
+                self.assertEqual(prep.verify_peer(handed,secret,c,spec,args)['node'],'b1')
+                with self.assertRaisesRegex(RuntimeError,'signature differs'):
+                    prep.verify_peer(handed,'wrong-setup-token-'*3,c,spec,args)
+                peer['machine']=local['machine']; handed.write_text(json.dumps(prep.signed(peer,secret)))
+                with self.assertRaisesRegex(RuntimeError,'same physical host'):
+                    prep.verify_peer(handed,secret,c,spec,args)
+
+    def test_init_reports_all_missing_inputs_before_creating_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); target=root/'benchmark.local.json'
+            args=SimpleNamespace(topology=str(root/'lab.json'),setup_run=str(root/'old-run'),
+                peer_setup_run=str(root/'peer-run'),token_file=str(root/'control.token'))
+            with self.assertRaises(RuntimeError) as caught: prep.initialize(target,args)
+            self.assertEqual(len(caught.exception.issues),3)
+            self.assertTrue(all(i['reason']=='MISSING' for i in caught.exception.issues))
+            self.assertIn(str(root/'old-run/setup.json'),str(caught.exception))
+            self.assertFalse(target.exists())
+
+    def test_init_distinguishes_denied_receipt_from_missing_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve(); target=root/'benchmark.local.json'
+            args=SimpleNamespace(topology=str(root/'lab.json'),setup_run=str(root/'old-run'),
+                peer_setup_run=str(root/'peer-run'),token_file=str(root/'control.token'))
+            real_open=Path.open
+            def open_input(path,*a,**kw):
+                if path==root/'old-run/setup.json': raise PermissionError(13,'fixture denied',str(path))
+                return real_open(path,*a,**kw)
+            with patch.object(Path,'open',new=open_input):
+                with self.assertRaises(RuntimeError) as caught: prep.initialize(target,args)
+            issue=next(i for i in caught.exception.issues if i['input']=='local setup receipt')
+            self.assertEqual(issue['reason'],'ACCESS_DENIED')
+            self.assertFalse(target.exists())
+
     def test_permission_failure_preserves_all_diagnostics_and_old_readiness(self):
         with tempfile.TemporaryDirectory() as directory:
             work=Path(directory); old=work/'readiness.json'
