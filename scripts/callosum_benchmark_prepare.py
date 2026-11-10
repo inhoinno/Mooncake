@@ -286,8 +286,14 @@ def inspect(path,args,work,loader):
         if 'cxl' in args.backings:
             def dax_access():
                 st=os.stat(node['path'])
-                require(stat.S_ISCHR(st.st_mode) and os.access(node['path'],os.R_OK|os.W_OK),
-                        'DAX path is not an accessible character device')
+                accessible=os.access(node['path'],os.R_OK|os.W_OK)
+                result['dax_inventory']=dict(path=node['path'],exists=True,
+                    character_device=stat.S_ISCHR(st.st_mode),read_write_access=accessible,
+                    owner_uid=getattr(st,'st_uid',None),owner_gid=getattr(st,'st_gid',None),
+                    mode=oct(stat.S_IMODE(st.st_mode)),effective_uid=os.geteuid())
+                require(stat.S_ISCHR(st.st_mode),f'DAX path exists but is not a character device: {node["path"]}')
+                if not accessible:
+                    raise PermissionError(13,'DAX device exists; current account lacks read/write access',node['path'])
                 base=Path(f'/sys/dev/char/{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}')
                 size=int((base/'size').read_text().strip(),0); alignment=int((base/'align').read_text().strip(),0)
                 p=c['pools'][node['pool']]
@@ -310,6 +316,16 @@ def inspect(path,args,work,loader):
                 if health:
                     if health.get('abi_version')!=2 or health.get('configured_qps')!='16':
                         result['issues'].append(dict(check='transport_'+member['id'],error='ABI2 and 16 configured QPs required'))
+                    fields=['transport_env','transport_request_timing_version']
+                    if 'huge2MB' in args.page_modes: fields.append('mr_pages')
+                    missing=[key for key in fields if key not in health]
+                    if missing:
+                        result['issues'].append(dict(check='live_agent_'+member['id'],
+                            error='Running agent uses an older/incompatible health schema; missing evidence is not proof of wrong MTU or page geometry',
+                            missing_fields=missing,running_runtime_sha256=health.get('runtime_sha256'),
+                            expected_runtime_sha256=RUNTIME_SHA256,
+                            next_action='Use the owned campaign retirement/startup path. Pulling source does not replace running agents.'))
+                        continue
                     options=spec.get('transport_env',{}).get(member['id'],{})
                     expected={k:str(options[k]) if options.get(k) is not None else None for k in ('MC_MTU','MC_GID_INDEX')}
                     if health.get('transport_env')!=expected:
@@ -327,21 +343,27 @@ def inspect(path,args,work,loader):
             if status:
                 if status.get('fingerprint')!=c['fingerprint']:
                     result['issues'].append(dict(check='cxl_identity',error='live campaign configuration differs'))
-                versions=status.get('benchmark_request_timing_versions',{})
-                if versions.get(spec['pair']['source'])!=1:
-                    result['issues'].append(dict(check='coordinator_timing',error='coordinator timing registry is missing/incompatible; compare direct agent health above'))
                 if not status.get('topology_verified'):
                     result['issues'].append(dict(check='topology_gate',error='existing authorized CXL topology/smoke gate not complete'))
                 if any(o.get('state') not in ('COMMITTED','DRAINED_RETAINED') for o in status.get('operations',[])):
                     result['issues'].append(dict(check='lifetime',error='nonterminal/unknown operation; retain owners; no retry/retirement'))
-                pool=next(n['pool'] for n in c['nodes'] if n['id']==spec['pair']['receiver'])
-                free=status.get('remaining_capacity_bytes',{}).get(pool)
-                if free is None or free<needed_destination:
-                    result['issues'].append(dict(check='remaining_arena',error=f'coordinator reports {free} free destination bytes; plan needs {needed_destination}; no unsafe reclaim'))
-                source_pool=next(n['pool'] for n in c['nodes'] if n['id']==spec['pair']['source'])
-                free_source=status.get('remaining_capacity_bytes',{}).get(source_pool)
-                if free_source is None or free_source<needed_source:
-                    result['issues'].append(dict(check='remaining_source_arena',error=f'coordinator reports {free_source} free source bytes; plan needs {needed_source}; no unsafe reclaim'))
+                missing=[key for key in ('benchmark_request_timing_versions','remaining_capacity_bytes') if key not in status]
+                if missing:
+                    result['issues'].append(dict(check='live_coordinator_schema',
+                        error='Running coordinator does not report required benchmark evidence; unreported capacity is unknown, not zero free space',
+                        missing_fields=missing,next_action='Safely retire the owned campaign and start matching coordinator/agents.'))
+                else:
+                    versions=status['benchmark_request_timing_versions']
+                    if versions.get(spec['pair']['source'])!=1:
+                        result['issues'].append(dict(check='coordinator_timing',error='coordinator timing registry is incompatible; compare direct agent health above'))
+                    for role,amount,label in [('receiver',needed_destination,'remaining_arena'),
+                                              ('source',needed_source,'remaining_source_arena')]:
+                        pool=next(n['pool'] for n in c['nodes'] if n['id']==spec['pair'][role])
+                        free=status['remaining_capacity_bytes'].get(pool)
+                        if type(free) is not int or free<0:
+                            result['issues'].append(dict(check=label,error=f'{role} remaining capacity is unreported/invalid, not established as exhausted'))
+                        elif free<amount:
+                            result['issues'].append(dict(check=label,error=f'coordinator reports {free} free {role} bytes; plan needs {amount}; no unsafe reclaim'))
         probe='''import json,hashlib,pathlib,os
 import mooncake.engine as e
 import callosum_relay_native as n

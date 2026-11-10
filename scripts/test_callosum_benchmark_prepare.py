@@ -138,6 +138,40 @@ class PreparationTest(unittest.TestCase):
                     self.assertEqual(second['status'],'PREPARED_NOT_TESTED')
                     self.assertTrue(list((other/'work').glob('*.previous')))
 
+    def test_old_live_schema_is_not_reported_as_wrong_settings_or_zero_capacity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            with contextlib.ExitStack() as stack:
+                path,args=self.inspect_fixture(root,stack)
+                original=prep.rpc.side_effect
+                def old(url,method,**kwargs):
+                    value=original(url,method,**kwargs)
+                    fields=(['benchmark_request_timing_versions','remaining_capacity_bytes']
+                            if method=='status' else ['transport_env','transport_request_timing_version','mr_pages'])
+                    for field in fields: value.pop(field,None)
+                    return value
+                stack.enter_context(patch.object(prep,'rpc',side_effect=old))
+                report=prep.inspect(path,args,root/'work',matrix.load)
+                checks={issue['check'] for issue in report['issues']}
+                self.assertTrue({'live_agent_a1','live_agent_b1','live_coordinator_schema'}<=checks)
+                self.assertFalse({'transport_settings_a1','dax_geometry_a1','remaining_arena',
+                                  'remaining_source_arena'}&checks)
+                self.assertEqual(report['status'],'BLOCKED')
+
+    def test_dax_permission_failure_identifies_existing_device_not_missing_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            with contextlib.ExitStack() as stack:
+                path,args=self.inspect_fixture(root,stack)
+                access=prep.os.access.side_effect
+                stack.enter_context(patch.object(prep.os,'access',side_effect=lambda p,m:
+                    False if str(p)=='/dev/not-opened' else access(p,m)))
+                report=prep.inspect(path,args,root/'work',matrix.load)
+                issue=next(i for i in report['issues'] if i['check']=='dax_access')
+                self.assertIn('device exists',issue['error'])
+                self.assertTrue(report['dax_inventory']['exists'])
+                self.assertFalse(report['dax_inventory']['read_write_access'])
+
     def test_function_numa_provision_delta_partial_failure_and_idempotence(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); control=root/'nr_hugepages'; control.write_text('10')
