@@ -343,6 +343,7 @@ class Agent:
                     runtime_sha256=RUNTIME_SHA256,
                     implementation_sha256=IMPLEMENTATION_SHA256,
                     transport_request_timing_version=1,
+                    transport_env={k:os.environ.get(k) for k in ('MC_MTU','MC_GID_INDEX')},
                     mr_pages=self.mapping.page_evidence,
                     configured_qps=os.environ.get('MC_NUM_QP_PER_EP', 'default'))
 

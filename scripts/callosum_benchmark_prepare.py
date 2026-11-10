@@ -284,6 +284,11 @@ def inspect(path,args,work,loader):
                 if health:
                     if health.get('abi_version')!=2 or health.get('configured_qps')!='16':
                         result['issues'].append(dict(check='transport_'+member['id'],error='ABI2 and 16 configured QPs required'))
+                    options=spec.get('transport_env',{}).get(member['id'],{})
+                    expected={k:str(options[k]) if options.get(k) is not None else None for k in ('MC_MTU','MC_GID_INDEX')}
+                    if health.get('transport_env')!=expected:
+                        result['issues'].append(dict(check='transport_settings_'+member['id'],
+                            error='live MTU/GID environment differs from the matrix; use reviewed settings and matching startup, not a live relabel'))
                     if health.get('transport_request_timing_version')!=1:
                         result['issues'].append(dict(check='timing_'+member['id'],error='live agent does not advertise timing v1',next_action='retire owned campaign; start current matching runtime'))
                     if health.get('runtime_sha256')!=RUNTIME_SHA256 or health.get('implementation_sha256')!=IMPLEMENTATION_SHA256:

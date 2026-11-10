@@ -105,9 +105,12 @@ def receiver_health(spec,c,args,mode):
     receiver=next(n for n in c['nodes'] if n['id']==spec['pair']['receiver'])
     url=f"http://{urlparse(receiver['url']).hostname}:{spec['control_ports'][mode]}"
     health=rpc(url,'health',timeout=5)
+    options=spec.get('transport_env',{}).get(spec['pair']['receiver'],{})
+    expected_transport={k:str(options[k]) if options.get(k) is not None else None for k in ('MC_MTU','MC_GID_INDEX')}
     require(health['node_id']==spec['pair']['receiver'] and health['peer_id']==spec['pair']['source'] and
             health['fingerprint']==c['fingerprint'] and health['state']=='IDLE' and
             not health.get('sealed',False) and
+            health.get('transport_env')==expected_transport and
             health['source_identity']==source_identity() and health['mr_pages']['mode']==mode and
             health['capacity']>=max(block_bytes(n,args.unit) for n in args.sizes),
             'receiver mode, size, source, peer or lifetime state differs; no automatic restart')

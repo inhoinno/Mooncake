@@ -187,6 +187,7 @@ class Receiver:
         self.description = dict(node_id=node_id, peer_id=peer_id, fingerprint=fingerprint,
                                 epoch=secrets.token_hex(16), segment=segment,
                                 capacity=memory.capacity, memory='dram', placement=placement,
+                                transport_env={k:os.environ.get(k) for k in ('MC_MTU','MC_GID_INDEX')},
                                 configured_qps=16, active_qps_verified=False, source_identity=source_identity())
         self.description['mr_pages']=getattr(memory,'page_evidence',dict(mode='native'))
 

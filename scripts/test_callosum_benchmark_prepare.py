@@ -64,6 +64,7 @@ class PreparationTest(unittest.TestCase):
                 remaining_capacity_bytes={'A':2*1024**3,'B':1024**3})
             member=next(n for n in c['nodes'] if n['url']==url)
             return dict(id=member['id'],abi_version=2,configured_qps='16',
+                transport_env=dict(MC_MTU=None,MC_GID_INDEX=None),
                 runtime_sha256=prep.RUNTIME_SHA256,implementation_sha256=prep.IMPLEMENTATION_SHA256,
                 transport_request_timing_version=0 if stale else 1,
                 mr_pages=dict(device_alignment_bytes=2**21,kernel_page_size_bytes=2**21,virtual_alignment_2MiB=True))
