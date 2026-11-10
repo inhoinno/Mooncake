@@ -418,10 +418,13 @@ print(json.dumps(dict(session=c['fresh_session'],workflow=c['workflow'],
 def prepare_session(path,args,work,runner,ssh_options=()):
     """One prepare stage: cold checks, canonical startup, smoke, peer proof."""
     import callosum_benchmark_prepare as preparation
+    runner.stage='prepare-local-prerequisites'
     spec,c,topology,receipt,private,env,_=load(path,args)
     cold=preparation.inspect(path,args,work,load,live=False)
-    require(cold['status']=='INPUTS_CHECKED_NOT_STARTED',
-            f'local prerequisites BLOCKED: {cold["issues"]}; evidence={work}/readiness.json')
+    if cold['status']!='INPUTS_CHECKED_NOT_STARTED':
+        error=RuntimeError(f'local prerequisites BLOCKED; evidence={work}/readiness.json')
+        error.issues=cold['issues']
+        raise error
     soft,hard=resource.getrlimit(resource.RLIMIT_MEMLOCK)
     needed=cold['memlock']['required']
     if soft!=resource.RLIM_INFINITY and soft<needed:
@@ -457,9 +460,12 @@ def prepare_session(path,args,work,runner,ssh_options=()):
             break
         require(time.monotonic()<deadline,'controller smoke is incomplete; retain services and inspect its evidence')
         time.sleep(1)
+    runner.stage='prepare-live-prerequisites'
     report=preparation.inspect(path,args,work,load)
-    require(report['status']=='PREPARED_NOT_TESTED',
-            f'live preparation BLOCKED: {report["issues"]}; evidence={work}/readiness.json')
+    if report['status']!='PREPARED_NOT_TESTED':
+        error=RuntimeError(f'live preparation BLOCKED; evidence={work}/readiness.json')
+        error.issues=report['issues']
+        raise error
     runner.stage='prepare-peer-readiness'
     peer=exchange_readiness(spec,c,args,work,env['CALLOSUM_CONTROL_TOKEN'],ssh_options)
     result=dict(status='PREPARED_NOT_TESTED',stage='prepare',node=args.node,

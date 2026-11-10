@@ -313,9 +313,20 @@ def inspect(path,args,work,loader,live=True):
             result['planned_arena_bytes']=dict(source=needed_source,destination=needed_destination)
             destination=c['pools'][next(n for n in c['nodes'] if n['id']==spec['pair']['receiver'])['pool']]
             if c.get('max_inflight_bytes',64*1024**2)<window:
-                result['issues'].append(dict(check='cxl_budget',error=f'live startup budget must cover {window} bytes; do not edit a live MR manifest'))
+                result['issues'].append(dict(check='cxl_budget',
+                    error=f'configured startup budget must cover {window} bytes; do not edit a live MR manifest',
+                    config_field='max_inflight_bytes',configured_bytes=c.get('max_inflight_bytes',64*1024**2),
+                    required_bytes=window,
+                    next_action='Approve the startup budget in both original topology files before init. '
+                                'Changing a running manifest is not a resource transition.'))
             if destination['capacity']<needed_destination:
-                result['issues'].append(dict(check='cxl_arena',error=f'destination capacity {destination["capacity"]} below planned {needed_destination}; exclusive range ownership must be established before enlargement'))
+                pool=next(n['pool'] for n in c['nodes'] if n['id']==spec['pair']['receiver'])
+                result['issues'].append(dict(check='cxl_arena',
+                    error=f'destination capacity {destination["capacity"]} below planned {needed_destination}; exclusive range ownership must be established before enlargement',
+                    config_field=f'pools.{pool}.capacity',configured_bytes=destination['capacity'],
+                    required_bytes=needed_destination,
+                    next_action='Obtain owner approval for an aligned exclusive destination extent. '
+                                'Update both original topology files and rerun init; do not enlarge the snapshot or live arena.'))
             os.environ['CALLOSUM_CONTROL_TOKEN']=secret
             status=check('cxl_status',lambda:rpc(c['master'],'status',timeout=5))
             for member in c['nodes'] if live else []:

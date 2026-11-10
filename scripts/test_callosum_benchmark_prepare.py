@@ -313,6 +313,54 @@ class PreparationTest(unittest.TestCase):
             self.assertEqual(report['status'],'INPUTS_CHECKED_NOT_STARTED',report['issues'])
             self.assertFalse(report['live_services_checked'])
 
+    def test_prepare_preserves_four_local_blockers_and_starts_no_ssh_or_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); path,args=matrix_tests.MatrixTest().fixture(root)
+            spec=json.loads(path.read_text()); work=root/'preparation'
+            profile={key:getattr(args,key) for key in ('sizes','unit','repetitions','backings','page_modes')}
+            spec.update(workflow=dict(node='a1',bound=True),fresh_session=dict(id='fixture-session',profile=profile),
+                        preparation_dir=str(work))
+            path.write_text(json.dumps(spec)); original=path.read_bytes()
+            issues=[dict(check=name,error='fixture '+name) for name in
+                    ('hugetlb_permission','dax_access','cxl_budget','cxl_arena')]
+            def blocked(*unused,**kwargs):
+                return prep.save_readiness(work,dict(status='BLOCKED',node='a1',issues=issues),
+                                           (root/'control.token').read_text().strip())
+            command=['matrix','prepare','--config',str(path),'--node','a1','--peer','operator-supplied-peer']
+            with patch.object(sys,'argv',command),patch.object(prep,'inspect',side_effect=blocked), \
+                 patch.object(matrix,'bind_peer',side_effect=AssertionError('no peer handoff')) as handoff, \
+                 patch.object(matrix,'launch_fresh',side_effect=AssertionError('no service startup')) as startup, \
+                 patch.object(prep.subprocess,'check_output',side_effect=AssertionError('no SSH')), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(matrix.main(),1)
+            failure=json.loads(errors.getvalue())
+            self.assertEqual(failure['stage'],'prepare-local-prerequisites')
+            self.assertEqual(failure['issues'],issues)
+            self.assertFalse(failure['rdma_work_possible'])
+            self.assertFalse(failure['owned_service_transition_possible'])
+            self.assertEqual(failure['owned_children_started'],[])
+            self.assertEqual(json.loads((work/'readiness.json').read_text())['issues'],issues)
+            self.assertEqual(path.read_bytes(),original)
+            handoff.assert_not_called(); startup.assert_not_called()
+
+    def test_cold_budget_and_arena_errors_identify_exact_config_fields(self):
+        with tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+            root=Path(directory); path,args=self.inspect_fixture(root,stack)
+            topology=json.loads((root/'topology.json').read_text())
+            topology['max_inflight_bytes']=64*1024**2
+            topology['pools']['A']['capacity']=1024**3
+            (root/'topology.json').write_text(json.dumps(topology))
+            report=prep.inspect(path,args,root/'work',matrix.load,live=False)
+            issues={item['check']:item for item in report['issues']}
+            budget=issues['cxl_budget']; arena=issues['cxl_arena']
+            self.assertEqual((budget['config_field'],budget['configured_bytes'],budget['required_bytes']),
+                             ('max_inflight_bytes',67108864,128000000))
+            self.assertEqual((arena['config_field'],arena['configured_bytes'],arena['required_bytes']),
+                             ('pools.A.capacity',1073741824,1532203008))
+            self.assertIn('owner approval',arena['next_action'])
+            self.assertFalse(report['services_started']); self.assertFalse(report['devices_mapped'])
+            self.assertEqual(json.loads((root/'topology.json').read_text()),topology)
+
     def test_first_run_cli_handoff_then_repeat_without_historical_directories(self):
         """Exercise the shipped Bash entry, real JSON/token handoff and read-only retry.
 
