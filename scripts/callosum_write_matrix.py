@@ -480,9 +480,12 @@ def prepare_connected(path,args,work,runner):
     """One operator SSH authorization, reused only inside this prepare call."""
     from callosum_lab import remote_command
     require(args.peer,'prepare requires --peer user@IP; init/run do not contact SSH')
+    port=getattr(args,'peer_port',None)
+    require(port is None or 1<=port<=65535,'--peer-port must be between 1 and 65535')
+    port_options=('-p',str(port)) if port is not None else ()
     with tempfile.TemporaryDirectory(prefix='callosum-ssh-') as directory:
         control=str(Path(directory)/'control')
-        options=('-o','ControlMaster=auto','-o','ControlPersist=yes','-o','ControlPath='+control)
+        options=(*port_options,'-o','ControlMaster=auto','-o','ControlPersist=yes','-o','ControlPath='+control)
         try:
             prepare_session(path,args,work,runner,options)
         finally:
@@ -490,7 +493,7 @@ def prepare_connected(path,args,work,runner):
                 # Close only this invocation's SSH control connection, not lab
                 # services or another operator's shared connection.
                 try:
-                    subprocess.run(remote_command(args.peer,[],options=('-S',control,'-O','exit')),
+                    subprocess.run(remote_command(args.peer,[],options=(*port_options,'-S',control,'-O','exit')),
                         stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
                 except (OSError,subprocess.TimeoutExpired): pass
 
@@ -532,6 +535,7 @@ def main():
     parser.add_argument('--source',help='init: explicit source ID if absent from lab_run')
     parser.add_argument('--receiver',help='init: explicit receiver ID if absent from lab_run')
     parser.add_argument('--peer',help='prepare ONLY: operator-supplied OTHER host user@IP; never inferred')
+    parser.add_argument('--peer-port',type=int,help='prepare ONLY: peer SSH port, 1–65535; omitted uses SSH config/default')
     parser.add_argument('--remote-root',help='prepare: peer checkout root; defaults to this checkout root')
     parser.add_argument('--peer-config',help='prepare: absolute peer matrix config; defaults to remote-root/config basename')
     parser.add_argument('--generate-only',action='store_true',help='init: input fixture only; no build or readiness claim')
@@ -554,8 +558,10 @@ def main():
         require(len(set(args.backings))==len(args.backings) and len(set(args.page_modes))==len(args.page_modes),
                 'duplicate backing or page mode')
         import callosum_benchmark_prepare as preparation
-        require(not (args.peer or args.remote_root or args.peer_config) or args.action=='prepare',
+        require(not (args.peer or args.remote_root or args.peer_config or args.peer_port is not None) or args.action=='prepare',
                 'SSH options belong only to prepare; init and run are host-local')
+        require(args.peer_port is None or 1<=args.peer_port<=65535,
+                '--peer-port must be between 1 and 65535')
         require(args.jobs>0,'--jobs must be positive')
         require(not args.skip_build or (args.action=='init' and not args.generate_only),
                 '--skip-build requires init and cannot accompany --generate-only')

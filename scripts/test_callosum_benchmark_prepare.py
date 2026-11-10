@@ -351,6 +351,33 @@ class PreparationTest(unittest.TestCase):
                     matrix.prepare_connected(target,args,root/'work',None)
                 start.assert_not_called()
 
+    def test_prepare_peer_port_applies_to_session_and_owned_connection_cleanup(self):
+        import callosum_lab as lab
+        for port in (None,2222):
+            with self.subTest(port=port),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory); args=SimpleNamespace(peer='labuser@192.0.2.2',peer_port=port)
+                commands=[]
+                def session(path,options,work,runner,ssh_options):
+                    commands.append(lab.remote_command(options.peer,['python3','-c','pass'],options=ssh_options))
+                    control=next(o.split('=',1)[1] for o in ssh_options if o.startswith('ControlPath='))
+                    Path(control).touch()
+                with patch.object(matrix,'prepare_session',side_effect=session), \
+                     patch.object(matrix.subprocess,'run') as cleanup:
+                    matrix.prepare_connected(root/'config.json',args,root,None)
+                commands.append(cleanup.call_args.args[0])
+                for command in commands:
+                    if port is None: self.assertNotIn('-p',command)
+                    else: self.assertEqual(command[command.index('-p')+1],str(port))
+                    self.assertIn(args.peer,command)
+
+    def test_peer_port_cli_rejects_invalid_ports_and_non_prepare_actions(self):
+        for action,port in [('prepare','0'),('prepare','65536'),('init','2222'),('run','2222')]:
+            with self.subTest(action=action,port=port), \
+                 patch.object(sys,'argv',['matrix',action,'--config','unused.json','--node','b1','--peer-port',port]), \
+                 patch.object(matrix,'prepare_connected') as start,contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(matrix.main(),1)
+                start.assert_not_called()
+
     def test_cold_preflight_does_not_query_cxl_peer_or_claim_ready(self):
         with tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
             root=Path(directory); path,args=self.inspect_fixture(root,stack)
