@@ -121,12 +121,15 @@ def provision(node,needed,work,sysroot=Path('/sys')):
     return record
 
 
-def inspect(path,args,work,loader):
+def inspect(path,args,work,loader,live=True):
     """Collect independent failures without starting a service or mapping a device."""
     result=dict(status='BLOCKED',scope='READ_ONLY_PREPARATION',node=args.node,issues=[],
                 purpose='FORMAL_PERFORMANCE',
                 services_started=False,devices_mapped=False,created_unix_ns=time.time_ns(),software=software())
+    receiver_probes=live or getattr(args,'action',None)=='prepare'
     def check(name,operation):
+        if not live and name=='cxl_status':
+            return None
         try:
             value=operation(); result[name]=value
             return value
@@ -221,7 +224,7 @@ def inspect(path,args,work,loader):
                 entries=Path(f'/sys/devices/system/node/node{numa["node"]}/meminfo').read_text().splitlines()
                 free=int(next(s for s in entries if 'MemFree:' in s).split()[-2])*1024
                 reused=False
-                if args.node==spec['pair']['receiver']:
+                if receiver_probes and args.node==spec['pair']['receiver']:
                     try:
                         from callosum_write_matrix import receiver_health
                         os.environ['CALLOSUM_CONTROL_TOKEN']=secret
@@ -252,7 +255,7 @@ def inspect(path,args,work,loader):
             pages=check('hugepages',lambda:huge_snapshot(numa['node']))
             # Existing matching receiver MRs consume pages but must not reserve them twice.
             reused=False
-            if args.node==spec['pair']['receiver']:
+            if receiver_probes and args.node==spec['pair']['receiver']:
                 try:
                     from callosum_write_matrix import receiver_health
                     os.environ['CALLOSUM_CONTROL_TOKEN']=secret
@@ -274,7 +277,7 @@ def inspect(path,args,work,loader):
             records={}
             for mode in args.page_modes:
                 compatible=False
-                if args.node==spec['pair']['receiver']:
+                if receiver_probes and args.node==spec['pair']['receiver']:
                     try:
                         os.environ['CALLOSUM_CONTROL_TOKEN']=secret
                         receiver_health(spec,c,args,mode); compatible=True
@@ -315,7 +318,7 @@ def inspect(path,args,work,loader):
                 result['issues'].append(dict(check='cxl_arena',error=f'destination capacity {destination["capacity"]} below planned {needed_destination}; exclusive range ownership must be established before enlargement'))
             os.environ['CALLOSUM_CONTROL_TOKEN']=secret
             status=check('cxl_status',lambda:rpc(c['master'],'status',timeout=5))
-            for member in c['nodes']:
+            for member in c['nodes'] if live else []:
                 health=check('agent_'+member['id'],lambda member=member:rpc(member['url'],'health',timeout=5))
                 if health:
                     if health.get('abi_version')!=2 or health.get('configured_qps')!='16':
@@ -384,7 +387,9 @@ print(json.dumps({str(pathlib.Path(m.__file__).resolve()):hashlib.sha256(pathlib
         check('module_origins',origins)
     result.pop('matrix_config',None); result.pop('configuration',None)
     # configuration is a tuple with an environment containing a secret. Never serialize it.
-    if not result['issues']: result['status']='PREPARED_NOT_TESTED'
+    if not result['issues']:
+        result['status']='PREPARED_NOT_TESTED' if live else 'INPUTS_CHECKED_NOT_STARTED'
+    result['live_services_checked']=live
     return save_readiness(work,result,secret)
 
 
@@ -415,6 +420,76 @@ def runtime_receipt(run):
     if host:
         require(sys.platform=='linux' and host.get('machine_id')==Path('/etc/machine-id').read_text().strip(),
                 'setup receipt belongs to a different host; build locally')
+    return value
+
+
+def matrix_configuration(path,topology,private,local,node,pair):
+    """One schema producer for ordinary initialization and independent sessions."""
+    return dict(schema_version=1,topology_file=str(topology),token_file=str(private),
+        output_root=str(Path(path).parent/'runs/write-matrix'),pair=pair,
+        runtimes={node:dict(setup_run=str(local))},numa_nodes={},
+        control_ports=dict(native=19201,huge2MB=19202),te_ports=dict(native=19401,huge2MB=19402),
+        transport_env={n:dict(MC_MTU=None,MC_GID_INDEX=None) for n in pair.values()})
+
+
+def fresh_configuration(path,args,runner):
+    """Create all run inputs anew. Old matrix files are evidence, never inputs.
+
+    Hardware topology remains an operator-approved input. A new directory does
+    not authorize a larger extent, stop an owner, or prove that DMA is drained.
+    """
+    from callosum_lab import prepare, validate_launch_config
+    path=Path(path).resolve()
+    require(args.topology,'init requires --topology: the approved hardware manifest')
+    topology=Path(args.topology).resolve()
+    require(path!=topology,'output matrix config must not replace the approved topology')
+    raw=json.loads(topology.read_text()); raw.pop('fingerprint',None)
+    node,launch=validate_launch_config(raw,args.node)
+    require(len(raw['nodes'])==2 and launch['profile']=='two_worker_smoke',
+            'fresh currently selects the two-worker smoke plus WRITE matrix workflow')
+    controller=launch['controller']
+    root=Path(__file__).resolve().parents[2]
+    profile=dict(sizes=args.sizes,unit=args.unit,repetitions=args.repetitions,
+        backings=args.backings,page_modes=args.page_modes,configured_qps=16,bytes_per_trial=TOTAL_BYTES)
+    machine=Path('/etc/machine-id').read_text().strip() if sys.platform=='linux' else None
+    # init is strictly host-local. The peer's probe token is not a shared service
+    # credential. prepare explicitly imports the controller token into a NEW file.
+    session=dict(id=secrets.token_hex(16),controller=controller,
+        created_unix_ns=time.time_ns(),software=software(),profile=profile,machine_id=machine)
+    secret=secrets.token_hex(32)
+    raw_token=runner.run_dir/'input.control.token'
+    with os.fdopen(os.open(raw_token,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as stream:
+        stream.write(secret+'\n')
+    snapshot=runner.run_dir/'approved-topology.json'
+    with snapshot.open('x') as stream: json.dump(raw,stream,indent=2)
+    (runner.run_dir/'fresh-session.json').write_text(json.dumps(session,indent=2))
+    # A pending descriptor is not a PASS receipt. Build produces setup.json.
+    pending=dict(status='GENERATED_NOT_BUILT',session_id=session['id'],node=args.node,
+        campaign=str(runner.run_dir),config=str(path),topology=str(snapshot),
+        token_file=str(raw_token),services_started=False,devices_mapped=False)
+    (runner.run_dir/'fresh-state.json').write_text(json.dumps(pending,indent=2))
+    runner.say(json.dumps(pending,indent=2))
+    if not args.generate_only:
+        require(sys.platform=='linux','fresh build/start requires Linux; use --generate-only for portable input validation')
+        runner.stage='fresh-build'
+        prepare(root,runner.run_dir,SimpleNamespace(python=sys.executable,jobs=args.jobs,
+                skip_apt=args.skip_apt),runner)
+    else:
+        runner.say('[GENERATED ONLY] No setup.json, native build or service PASS is claimed')
+    # Reuse init's schema and defaults, but never read an old runtime/secret.
+    generated=runner.run_dir/'matrix.json'
+    # No fabricated PASS receipt in generate-only mode. Build is the only producer.
+    value=matrix_configuration(generated,snapshot,raw_token,runner.run_dir,args.node,
+        dict(source=launch['source'],receiver=launch['requester']))
+    value['output_root']=str(runner.run_dir/'measurements')
+    value['fresh_session']=session
+    value['preparation_dir']=str(runner.run_dir/'preparation')
+    value['workflow']=dict(node=args.node,bound=args.node==controller)
+    generated.write_text(json.dumps(value,indent=2))
+    runner.stage='fresh-config-publication'
+    archive(path.parent,path.name,value)  # Preserve an old config, even if malformed.
+    pending.update(status='GENERATED_NOT_BUILT' if args.generate_only else 'BUILT_NOT_STARTED')
+    (runner.run_dir/'fresh-state.json').write_text(json.dumps(pending,indent=2))
     return value
 
 
@@ -497,11 +572,8 @@ def initialize(path,args):
     # Current peer provenance comes from signed readiness, not an invented path.
     if getattr(args,'peer_setup_run',None):
         runtimes[next(n for n in pair.values() if n!=args.node)]=dict(setup_run=str(Path(args.peer_setup_run).resolve()))
-    value=dict(schema_version=1,topology_file=str(topology),token_file=str(private),
-        output_root=str(path.parents[0]/'runs/write-matrix'),pair=pair,
-        runtimes=runtimes,
-        numa_nodes={},control_ports=dict(native=19201,huge2MB=19202),te_ports=dict(native=19401,huge2MB=19402),
-        transport_env={n:dict(MC_MTU=None,MC_GID_INDEX=None) for n in pair.values()})
+    value=matrix_configuration(path,topology,private,local,args.node,pair)
+    value['runtimes']=runtimes
     try:
         path.parent.mkdir(parents=True,exist_ok=True)
         with path.open('x') as stream: json.dump(value,stream,indent=2)

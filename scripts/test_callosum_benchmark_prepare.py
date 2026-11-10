@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -19,6 +20,261 @@ import test_callosum_write_matrix as matrix_tests
 
 
 class PreparationTest(unittest.TestCase):
+    def fresh_fixture(self,root):
+        _,args=matrix_tests.MatrixTest().fixture(root)
+        raw=json.loads((root/'topology.json').read_text())
+        raw.update(evidence_class='TRANSFER_ONLY',lab_run=dict(controller='a1',source='b1',
+            requester='a1',profile='two_worker_smoke',wait_seconds=1800))
+        (root/'approved.json').write_text(json.dumps(raw))
+        return root/'approved.json'
+
+    def test_fresh_cli_recreates_inputs_despite_existing_campaign_and_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve(); topology=self.fresh_fixture(root)
+            old=root/'old-campaign'; old.mkdir()
+            (old/'topology.json').write_text('old topology evidence')
+            (old/'control.token').write_text('old private token evidence')
+            target=root/'benchmark.local.json'
+            previous=json.dumps(dict(runtimes={'a1':dict(setup_run=str(old))},token_file=str(old/'control.token')))
+            target.write_text(previous)
+            command=['bash',str(Path(__file__).resolve().parents[2]/'scripts/rdma-write-matrix.sh'),
+                'init','--config',str(target),'--node','a1','--topology',str(topology),'--generate-only']
+            sessions=[]
+            for _ in range(2):
+                result=subprocess.run(command,cwd=root,text=True,capture_output=True)
+                self.assertEqual(result.returncode,0,result.stderr)
+                fresh=json.loads(target.read_text()); campaign=Path(fresh['runtimes']['a1']['setup_run'])
+                self.assertNotEqual(campaign,old)
+                self.assertTrue(campaign.is_dir())
+                self.assertFalse((campaign/'setup.json').exists())
+                self.assertFalse((campaign/'topology.json').exists())
+                self.assertEqual(json.loads((campaign/'fresh-state.json').read_text())['status'],'GENERATED_NOT_BUILT')
+                secret=Path(fresh['token_file']).read_text()
+                self.assertNotIn(secret.strip(),result.stdout+result.stderr)
+                self.assertEqual(stat.S_IMODE(Path(fresh['token_file']).stat().st_mode),0o600)
+                self.assertTrue(Path(fresh['topology_file']).is_file())
+                sessions.append((fresh['fresh_session']['id'],campaign,secret))
+            self.assertNotEqual(sessions[0],sessions[1])
+            self.assertNotEqual(sessions[0][2],sessions[1][2])
+            self.assertIn(previous,[p.read_text() for p in root.glob('benchmark.local.json.*.previous')])
+            self.assertEqual((old/'control.token').read_text(),'old private token evidence')
+            self.assertEqual((old/'topology.json').read_text(),'old topology evidence')
+
+    def test_fresh_build_then_canonical_launch_uses_only_new_artifacts(self):
+        import callosum_lab as lab
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve(); topology=self.fresh_fixture(root)
+            receipt=json.loads((root/'setup.json').read_text())
+            args=SimpleNamespace(node='a1',topology=str(topology),generate_only=False,jobs=4,
+                skip_apt=True,sizes=[1,2],unit='MB',repetitions=3,
+                page_modes=['native'],backings=['local_numa','cxl'],action='fresh')
+            campaign=root/'fresh-run'; runner=lab.Runner(campaign)
+            read=Path.read_text
+            def machine(path,*a,**kw):
+                return 'machine-a1' if str(path)=='/etc/machine-id' else read(path,*a,**kw)
+            def build(source,run,options,log):
+                self.assertFalse((run/'setup.json').exists())
+                (run/'setup.json').write_text(json.dumps(receipt))
+            try:
+                with patch.object(prep.sys,'platform','linux'),patch.object(Path,'read_text',new=machine), \
+                     patch.object(lab,'prepare',side_effect=build) as producer, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    spec=prep.fresh_configuration(root/'benchmark.local.json',args,runner)
+                producer.assert_called_once()
+                with patch.dict(os.environ,{'CALLOSUM_DESTRUCTIVE_ACK':'1'}), \
+                     patch.object(lab,'main',return_value=0) as start,contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(matrix.launch_fresh(root/'benchmark.local.json',args,runner),0)
+                argv=start.call_args.args[0]
+                self.assertEqual(argv[argv.index('--run-dir')+1],str(campaign))
+                self.assertEqual(argv[argv.index('--config')+1],spec['topology_file'])
+                self.assertEqual(argv[argv.index('--token-file')+1],spec['token_file'])
+                # A partial startup is not erased or restarted into the same arena.
+                (campaign/'topology.json').write_text('retained partial startup')
+                with self.assertRaisesRegex(RuntimeError,'already attempted startup'):
+                    matrix.launch_fresh(root/'benchmark.local.json',args,runner)
+            finally: runner.log.close()
+
+    def test_init_is_local_and_prepare_explicitly_binds_controller_without_overwriting_probe(self):
+        import callosum_lab as lab
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve(); topology=self.fresh_fixture(root)
+            args=SimpleNamespace(node='a1',topology=str(topology),generate_only=True,jobs=4,
+                skip_apt=True,sizes=[1,2],unit='MB',repetitions=3,peer=None,
+                remote_root=None,peer_config=None,page_modes=['native'],backings=['cxl'],action='prepare')
+            leader=lab.Runner(root/'leader'); peer=lab.Runner(root/'peer')
+            original_read=Path.read_text
+            def machine(path,*a,**kw):
+                return 'machine-'+args.node if str(path)=='/etc/machine-id' else original_read(path,*a,**kw)
+            try:
+                with patch.object(prep.sys,'platform','linux'),patch.object(Path,'read_text',new=machine), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    first=prep.fresh_configuration(root/'benchmark.local.json',args,leader)
+                    args.node='b1'
+                    with patch.object(prep.subprocess,'check_output',side_effect=AssertionError('init must not use SSH')):
+                        provisional=prep.fresh_configuration(root/'peer-matrix.json',args,peer)
+                    # A fixture for the Linux build producer; not build evidence.
+                    (peer.run_dir/'setup.json').write_bytes((root/'setup.json').read_bytes())
+                    probe=Path(provisional['token_file']).read_bytes()
+                    self.assertNotEqual(first['fresh_session']['id'],provisional['fresh_session']['id'])
+                    self.assertFalse(provisional['workflow']['bound'])
+                    # Exercise the real export program over an isolated fixture,
+                    # not SSH or a Linux host. Substitute only the machine probe.
+                    import shlex
+                    def private_handoff(argv,**kwargs):
+                        command=shlex.split(argv[-1]); self.assertEqual(command[:2],['python3','-c'])
+                        command[2]=command[2].replace("Path('/etc/machine-id').read_text().strip()",repr('machine-a1'))
+                        return subprocess.run([sys.executable,*command[1:]],check=True,text=True,
+                            capture_output=True).stdout
+                    args.peer='authorized-controller'; args.peer_config=str(root/'benchmark.local.json')
+                    with patch.object(prep.subprocess,'check_output',side_effect=private_handoff):
+                        second=matrix.bind_peer(root/'peer-matrix.json',args,())[0]
+                    # Rebinding must not repair a wrong host, topology or token
+                    # by replacing a retained credential.
+                    bundle=dict(session=first['fresh_session'],workflow=first['workflow'],
+                        topology=json.loads(Path(first['topology_file']).read_text()),
+                        machine_id='machine-a1',token=Path(first['token_file']).read_text().strip())
+                    active=(root/'peer-matrix.json').read_bytes()
+                    token=Path(second['token_file']).read_bytes()
+                    (peer.run_dir/'control.token').write_bytes(token)
+                    for mutation in ('same_host','wrong_node','topology','profile','session','token'):
+                        bad=json.loads(json.dumps(bundle))
+                        if mutation=='same_host': bad['machine_id']='machine-b1'
+                        elif mutation=='wrong_node': bad['workflow']['node']='b1'
+                        elif mutation=='topology': bad['topology']['pools']['A']['owner']='someone-else'
+                        elif mutation=='profile': bad['session']['profile']['sizes']=[999]
+                        elif mutation=='session': bad['session']['id']='different-session'
+                        elif mutation=='token': bad['token']='wrong-token-'*5
+                        with self.subTest(mutation=mutation),patch.object(matrix,'peer_inputs',return_value=bad):
+                            with self.assertRaises(RuntimeError): matrix.bind_peer(root/'peer-matrix.json',args,())
+                        self.assertEqual((root/'peer-matrix.json').read_bytes(),active)
+                        self.assertEqual(Path(second['token_file']).read_bytes(),token)
+                self.assertEqual(first['fresh_session'],second['fresh_session'])
+                self.assertEqual(Path(first['token_file']).read_bytes(),Path(second['token_file']).read_bytes())
+                self.assertEqual(Path(provisional['token_file']).read_bytes(),probe)
+                self.assertTrue(second['workflow']['bound'])
+                self.assertEqual(set(second['runtimes']),{'b1'})
+                self.assertEqual(second['runtimes']['b1']['setup_run'],str(root/'peer'))
+            finally: leader.log.close(); peer.log.close()
+
+    def test_three_manual_stages_with_real_file_handoff_and_node_selected_run(self):
+        """T0 workflow: real files/SSH export programs; mocked builds/RPC/engines.
+
+        This proves orchestration, not Linux builds, NICs or DMA semantics.
+        """
+        import callosum_lab as lab
+        import shlex
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve(); context=threading.local(); hosts={}; errors=[]
+            observed=[]; real_read=Path.read_text
+            def read(path,*a,**kw):
+                if str(path)=='/etc/machine-id': return 'machine-'+context.node
+                return real_read(path,*a,**kw)
+            def build(source,run,args,runner):
+                (run/'setup.json').write_bytes((root/context.node/'setup.json').read_bytes())
+            def inspect(path,args,work,loader,live=True):
+                spec,c,_,_,_,env,_=loader(path,args)
+                report=dict(status='PREPARED_NOT_TESTED' if live else 'INPUTS_CHECKED_NOT_STARTED',
+                    node=args.node,issues=[],plan=prep.plan(c,spec,args),software=prep.software(),
+                    machine=dict(machine_id='machine-'+args.node),created_unix_ns=prep.time.time_ns(),
+                    memlock=dict(required=0))
+                return prep.save_readiness(work,report,env['CALLOSUM_CONTROL_TOKEN'])
+            def ssh(argv,**kwargs):
+                self.assertEqual(argv[0],'ssh')
+                target='a1' if 'authorized-a' in argv else 'b1'
+                command=shlex.split(argv[-1]); self.assertEqual(command[:2],['python3','-c'])
+                command[2]=command[2].replace("Path('/etc/machine-id').read_text().strip()",repr('machine-'+target))
+                return subprocess.run([sys.executable,*command[1:]],check=True,text=True,capture_output=True).stdout
+            def startup(argv):
+                run=Path(argv[argv.index('--run-dir')+1]); node=argv[argv.index('--node-id')+1]
+                topology=Path(argv[argv.index('--config')+1]); private=Path(argv[argv.index('--token-file')+1])
+                (run/'topology.json').write_bytes(topology.read_bytes())
+                (run/'control.token').write_bytes(private.read_bytes())
+                if node=='a1': (run/'summary.json').write_text(json.dumps(dict(status='PASS',combined_trace_gate='PASS')))
+                return 0
+            with patch.object(prep.sys,'platform','linux'),patch.object(Path,'read_text',new=read), \
+                 patch.object(lab,'prepare',side_effect=build),patch.object(prep,'inspect',side_effect=inspect), \
+                 patch.object(lab,'main',side_effect=startup) as starts, \
+                 patch.object(matrix,'rpc',return_value=dict(topology_verified=True,
+                     operations=[dict(state='COMMITTED'),dict(state='COMMITTED')])), \
+                 patch.object(matrix.resource,'getrlimit',return_value=(prep.resource.RLIM_INFINITY,)*2), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                for node in ('a1','b1'):
+                    context.node=node; host=root/node; host.mkdir(); topology=self.fresh_fixture(host)
+                    raw=json.loads(topology.read_text()); raw['lab_run']['wait_seconds']=2
+                    topology.write_text(json.dumps(raw))
+                    args=SimpleNamespace(node=node,action='init',topology=str(topology),generate_only=False,
+                        jobs=1,skip_apt=True,sizes=[1,2],unit='MB',repetitions=1,
+                        backings=['local_numa','cxl'],page_modes=['native'],peer=None,remote_root=None,peer_config=None)
+                    path=host/'benchmark.local.json'
+                    command=['matrix','init','--config',str(path),'--node',node,'--topology',str(topology),
+                             '--sizes','1','2','--unit','MB','--repetitions','1','--page-modes','native','--skip-apt']
+                    with patch.object(sys,'argv',command), \
+                         patch.object(prep.subprocess,'check_output',side_effect=AssertionError('no init network')):
+                        self.assertEqual(matrix.main(),0)
+                    hosts[node]=(path,args,Path(json.loads(path.read_text())['preparation_dir']))
+                for node,(path,args,work) in hosts.items():
+                    args.action='prepare'; other='b1' if node=='a1' else 'a1'
+                    args.peer='authorized-b' if node=='a1' else 'authorized-a'
+                    args.peer_config=str(hosts[other][0])
+                def prepare(node):
+                    context.node=node; path,args,work=hosts[node]; runner=lab.Runner(work)
+                    try: matrix.prepare_session(path,args,work,runner)
+                    except Exception as error: errors.append((node,str(error)))
+                    finally: runner.log.close()
+                with patch.object(prep.subprocess,'check_output',side_effect=ssh), \
+                     patch.dict(os.environ,{'CALLOSUM_DESTRUCTIVE_ACK':'1'}):
+                    threads=[threading.Thread(target=prepare,args=(n,),name=n) for n in hosts]
+                    for thread in threads: thread.start()
+                    for thread in threads: thread.join(timeout=8)
+                    self.assertTrue(all(not t.is_alive() for t in threads),'prepare handoff did not converge')
+                    self.assertEqual(errors,[])
+                    self.assertEqual(starts.call_count,2)
+                    # Refresh uses success markers, not another service owner.
+                    context.node='a1'; prepare('a1')
+                    self.assertEqual(starts.call_count,2)
+                def selected(label):
+                    def record(spec,c,args,*unused): observed.append((label,args.node,args.sizes,args.unit,args.repetitions))
+                    return record
+                for node,(path,args,work) in hosts.items():
+                    self.assertEqual(json.loads((work/'prepare.json').read_text())['status'],'PREPARED_NOT_TESTED')
+                    context.node=node
+                    with patch.object(sys,'argv',['matrix','run','--config',str(path),'--node',node]), \
+                         patch.object(matrix,'receive',side_effect=selected('receiver')), \
+                         patch.object(matrix,'run',side_effect=selected('sender')), \
+                         patch.object(matrix,'receiver_health',return_value={}), \
+                         patch.object(prep.subprocess,'check_output',side_effect=AssertionError('no run SSH')):
+                        self.assertEqual(matrix.main(),0)
+                self.assertEqual(observed,[('receiver','a1',[1,2],'MB',1),('sender','b1',[1,2],'MB',1)])
+                for path,_,_ in hosts.values():
+                    token=Path(json.loads(path.read_text())['token_file']).read_text().strip()
+                    self.assertNotIn(token,output.getvalue())
+
+    def test_init_rejects_ssh_options_and_prepare_requires_explicit_peer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); topology=self.fresh_fixture(root); target=root/'new.json'
+            command=['matrix','init','--config',str(target),'--node','a1','--topology',str(topology),
+                     '--generate-only','--peer','not-implicitly-used']
+            with patch.object(sys,'argv',command),contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(matrix.main(),1)
+            self.assertIn('SSH options belong only to prepare',errors.getvalue())
+            self.assertFalse(target.exists())
+            args=SimpleNamespace(peer=None)
+            with patch.object(matrix,'prepare_session') as start:
+                with self.assertRaisesRegex(RuntimeError,'requires --peer'):
+                    matrix.prepare_connected(target,args,root/'work',None)
+                start.assert_not_called()
+
+    def test_cold_preflight_does_not_query_cxl_peer_or_claim_ready(self):
+        with tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
+            root=Path(directory); path,args=self.inspect_fixture(root,stack)
+            args.action='init'
+            with patch.object(prep,'rpc',side_effect=AssertionError('cold inspection must not contact CXL services')), \
+                 patch.object(matrix,'receiver_health',side_effect=AssertionError('init must not send receiver RPC')) as receiver:
+                report=prep.inspect(path,args,root/'work',matrix.load,live=False)
+            receiver.assert_not_called()
+            self.assertEqual(report['status'],'INPUTS_CHECKED_NOT_STARTED',report['issues'])
+            self.assertFalse(report['live_services_checked'])
+
     def test_first_run_cli_handoff_then_repeat_without_historical_directories(self):
         """Exercise the shipped Bash entry, real JSON/token handoff and read-only retry.
 

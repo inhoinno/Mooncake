@@ -31,7 +31,7 @@ def load(path,args):
     spec=json.loads(path.read_text())
     required_fields={'schema_version','topology_file','token_file','output_root',
                      'runtimes','pair','numa_nodes','control_ports','te_ports'}
-    require(required_fields<=set(spec) and set(spec)<=required_fields|{'transport_env'},
+    require(required_fields<=set(spec) and set(spec)<=required_fields|{'transport_env','fresh_session','preparation_dir','workflow'},
             'unknown/missing matrix fields')
     require(spec['schema_version']==1,'matrix schema_version must be 1')
     topology=resolve(base,spec['topology_file']); c=config(topology)
@@ -41,7 +41,10 @@ def load(path,args):
     require(nodes[pair['source']]['pool']!=nodes[pair['receiver']]['pool'] and
             nodes[pair['source']]['can_send'] and nodes[pair['receiver']]['can_receive'],'ineligible cross-pool pair')
     require(args.node in pair.values(),'node not in the configured pair')
-    if args.action in ('receive','run'):
+    if spec.get('workflow'):
+        require(spec['workflow'].get('node')==args.node and type(spec['workflow'].get('bound')) is bool,
+                'workflow must identify this host-local node and its binding state')
+    if args.action in ('receive','run') and not (args.action=='run' and spec.get('workflow')):
         require(args.node==pair['receiver' if args.action=='receive' else 'source'],
                 'node does not match the selected pair action; host names do not select roles')
     lengths=[block_bytes(n,args.unit) for n in args.sizes]
@@ -276,9 +279,237 @@ def run(spec,c,args,topology,receipt,private,env,out,runner):
     runner.say((out/'report.md').read_text())
 
 
+def launch_fresh(path,args,runner):
+    """Use only the new config's generated inputs; keep canonical safety gates."""
+    from callosum_lab import main as lab_main
+    spec,c,topology,receipt,private,env,_=load(path,args)
+    require(spec.get('fresh_session'),'prepare requires a config produced by init')
+    require(not (receipt/'topology.json').exists() and not (receipt/'control.token').exists(),
+            'This NEW session already attempted startup. Preserve its evidence; fresh creates a different session, '
+            'but never reclaims live or uncertain DMA resources.')
+    require(os.environ.get('CALLOSUM_DESTRUCTIVE_ACK')=='1',
+            'fresh startup requires CALLOSUM_DESTRUCTIVE_ACK=1 for the approved exclusive extent')
+    for key in tuple(os.environ):
+        if key.startswith('MC_'): os.environ.pop(key)
+    os.environ.update({k:v for k,v in env.items() if k.startswith('MC_')})
+    runner.stage='fresh-canonical-node-start'
+    # The canonical launcher validates access, limits and port ownership before
+    # mapping. No old-service kill, extent enlargement or DMA reclamation here.
+    code=lab_main(['--action','node','--root',str(Path(__file__).resolve().parents[2]),
+        '--run-dir',str(receipt),'--node-id',args.node,'--config',str(topology),
+        '--token-file',str(private),'--python',env['PYTHON_BIN'],'--skip-apt'])
+    if code==0:
+        (receipt/'cxl-started.json').write_text(json.dumps(dict(node=args.node,
+            session_id=spec['fresh_session']['id'],status='LOCAL_START_RETURNED')))
+        from callosum_benchmark_prepare import archive
+        archive(receipt,'fresh-state.json',dict(status='LOCAL_SERVICES_STARTED',node=args.node,
+            session_id=spec['fresh_session']['id'],campaign=str(receipt)))
+    runner.say(json.dumps(dict(status='PASS' if code==0 else 'BLOCKED',
+        scope='TRANSFER_ONLY',stage='fresh-startup',campaign=str(receipt),config=str(Path(path).resolve()),
+        next_action='prepare' if code==0 else 'inspect retained startup evidence; no automatic restart',
+        performance_baseline='NOT_RUN'),indent=2))
+    return code
+
+
+def peer_inputs(args,remote_config,ssh_options):
+    """Only prepare calls this function, with an operator-supplied SSH target."""
+    from callosum_lab import remote_command
+    require(args.peer,'prepare requires --peer user@IP; no address is inferred or contacted automatically')
+    code='''import json,sys
+from pathlib import Path
+p=Path(sys.argv[1]); c=json.loads(p.read_text())
+assert c.get('workflow'), 'Run init on this peer first'
+private=Path(c['token_file'])
+assert private.stat().st_mode & 0o077 == 0, 'Token is not private'
+value=dict(session=c['fresh_session'],workflow=c['workflow'],
+    topology=json.loads(Path(c['topology_file']).read_text()),
+    machine_id=Path('/etc/machine-id').read_text().strip())
+if c['workflow']['node']==c['fresh_session']['controller']:
+    value['token']=private.read_text().strip()
+print(json.dumps(value))'''
+    # This response may contain the private token. Do not use Runner.call or log it.
+    return json.loads(subprocess.check_output(remote_command(args.peer,
+        ['python3','-c',code,str(remote_config)],options=ssh_options),text=True,timeout=120))
+
+
+def bind_peer(path,args,ssh_options):
+    """Bind two fresh LOCAL initializations; never replace a live credential."""
+    import callosum_benchmark_prepare as preparation
+    spec,c,topology,receipt,private,env,_=load(path,args)
+    remote_root=Path(args.remote_root or str(Path(__file__).resolve().parents[2]))
+    remote_config=Path(args.peer_config or remote_root/Path(path).name)
+    require(remote_config.is_absolute(),'--peer-config/--remote-root must be absolute')
+    bundle=peer_inputs(args,remote_config,ssh_options)
+    peer_node=next(n for n in spec['pair'].values() if n!=args.node)
+    local_machine=Path('/etc/machine-id').read_text().strip()
+    require(bundle['workflow']['node']==peer_node and bundle['machine_id']!=local_machine,
+            'peer is not the configured OTHER physical node')
+    require(bundle['topology']==json.loads(topology.read_text()),'approved peer topology differs; no extent is changed')
+    session=bundle['session']; current=spec['fresh_session']
+    require(session['controller']==current['controller'] and session['software']==current['software'] and
+            session['software']==preparation.software() and session['profile']==current['profile'],
+            'peer source/profile/controller differs; synchronize inputs and rerun init where needed')
+    require(0<=time.time_ns()-session['created_unix_ns']<24*3600*10**9,
+            'peer init is older than 24 hours or its clock is ahead; inspect clocks before a new init')
+    started=(receipt/'topology.json').exists() or (receipt/'control.token').exists()
+    if args.node!=current['controller']:
+        require(bundle['workflow'].get('bound') is True,'controller init is not available')
+        secret=bundle.get('token')
+        require(isinstance(secret,str) and len(secret)>=32,'invalid controller token')
+        if spec['workflow'].get('bound'):
+            require(session==current and secret==env['CALLOSUM_CONTROL_TOKEN'],
+                    'controller session changed; do not rebind retained services; use init for new local inputs')
+        else:
+            require(not started,'local campaign already started; shared credential cannot be changed')
+            # Keep the local probe token intact. Only an unstarted fresh session
+            # may acquire this new shared-token file. Repeated calls compare it.
+            shared=receipt/'shared.control.token'
+            if shared.exists():
+                require(shared.stat().st_mode & 0o077==0 and shared.read_text().strip()==secret,
+                        'existing handoff token differs; no credential overwritten')
+            else:
+                with os.fdopen(os.open(shared,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as stream:
+                    stream.write(secret+'\n')
+            spec['token_file']=str(shared); spec['fresh_session']=session
+    elif bundle['workflow'].get('bound'):
+        require(session==current,'peer is already bound to a different session; initialize the peer for this experiment')
+    spec['workflow'].update(peer_ssh=args.peer,peer_config=str(remote_config),bound=True)
+    preparation.archive(Path(path).resolve().parent,Path(path).name,spec)
+    preparation.archive(receipt,'fresh-state.json',dict(status='BOUND_TO_CONTROLLER',node=args.node,
+        session_id=spec['fresh_session']['id'],campaign=str(receipt),local_campaign_started=started))
+    return load(path,args)
+
+
+def exchange_readiness(spec,c,args,work,secret,ssh_options=()):
+    """Retrieve the intended peer report over SSH; never choose a latest run."""
+    from callosum_lab import remote_command
+    import callosum_benchmark_prepare as preparation
+    require(sys.platform=='linux','readiness exchange requires the authorized Linux operator host')
+    workflow=spec['workflow']; peer=workflow['peer_ssh']
+    require(peer and workflow['node']==args.node,'prepare must record this node and authorized peer SSH target')
+    code='''import json,sys
+from pathlib import Path
+p=Path(sys.argv[1]); c=json.loads(p.read_text())
+r=Path(c['preparation_dir'])/'readiness.json'
+print(json.dumps(dict(session=c['fresh_session'],workflow=c['workflow'],
+    report=json.loads(r.read_text()) if r.exists() else None)))'''
+    deadline=time.monotonic()+c['lab_run'].get('wait_seconds',1800)
+    expected=next(n for n in spec['pair'].values() if n!=args.node)
+    while True:
+        raw=subprocess.check_output(remote_command(peer,['python3','-c',code,workflow['peer_config']],
+            options=(*ssh_options,'-o','BatchMode=yes','-o','ConnectTimeout=5')),text=True,timeout=15)
+        bundle=json.loads(raw)
+        require(bundle['workflow']['node']==expected,'wrong peer node in readiness handoff')
+        if not bundle['workflow'].get('bound'):
+            require(time.monotonic()<deadline,'peer has not run prepare for this session')
+            time.sleep(1); continue
+        require(bundle['session']==spec['fresh_session'],
+                'peer configuration is bound to another session; initialize the peer for this experiment')
+        report=bundle['report']
+        if report and report.get('status')=='PREPARED_NOT_TESTED':
+            preparation.archive(work,'peer-readiness.json',report)
+            return preparation.verify_peer(work/'peer-readiness.json',secret,c,spec,args)
+        require(not report or report.get('status')!='BLOCKED',
+                f'peer preparation is BLOCKED: {report.get("issues") if report else ""}')
+        require(time.monotonic()<deadline,'peer readiness timed out; run prepare on both hosts; services are retained')
+        time.sleep(1)
+
+
+def prepare_session(path,args,work,runner,ssh_options=()):
+    """One prepare stage: cold checks, canonical startup, smoke, peer proof."""
+    import callosum_benchmark_prepare as preparation
+    spec,c,topology,receipt,private,env,_=load(path,args)
+    cold=preparation.inspect(path,args,work,load,live=False)
+    require(cold['status']=='INPUTS_CHECKED_NOT_STARTED',
+            f'local prerequisites BLOCKED: {cold["issues"]}; evidence={work}/readiness.json')
+    soft,hard=resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    needed=cold['memlock']['required']
+    if soft!=resource.RLIM_INFINITY and soft<needed:
+        resource.setrlimit(resource.RLIMIT_MEMLOCK,(needed,hard))
+    require(sys.platform=='linux','prepare requires the Linux operator host; no remote access from this Mac')
+    require(args.peer,'prepare requires --peer user@IP; no peer IP is inferred')
+    runner.stage='prepare-explicit-peer-handoff'
+    spec,c,topology,receipt,private,env,_=bind_peer(path,args,ssh_options)
+    marker=receipt/'cxl-started.json'
+    if not marker.exists():
+        runner.services_may_be_live=True
+        runner.remote_mutation_possible=True  # Canonical startup includes RDMA correctness WRITEs.
+        require(launch_fresh(path,args,runner)==0,
+                'canonical startup failed; preserve campaign evidence; do not start a second owner')
+    else:
+        stamp=json.loads(marker.read_text())
+        require(stamp['node']==args.node and stamp['session_id']==spec['fresh_session']['id'],
+                'startup marker does not belong to this session/node')
+        runner.services_may_be_live=True  # Existing owners remain lifetime-relevant on failure.
+    os.environ['CALLOSUM_CONTROL_TOKEN']=env['CALLOSUM_CONTROL_TOKEN']
+    deadline=time.monotonic()+c['lab_run'].get('wait_seconds',1800)
+    runner.stage='prepare-bidirectional-correctness'
+    while True:
+        status=rpc(c['master'],'status',timeout=5)
+        # The controller publishes summary.json only after both directions,
+        # checksum/publication/local reuse and the trace gate pass.
+        if args.node==spec['fresh_session']['controller']:
+            summary=receipt/'summary.json'
+            require(summary.exists() and json.loads(summary.read_text()).get('status')=='PASS',
+                    'controller bidirectional smoke/trace did not pass; inspect campaign evidence')
+        if status.get('topology_verified') and len(status.get('operations',[]))>=2 and all(
+                o.get('state') in ('COMMITTED','DRAINED_RETAINED') for o in status['operations']):
+            break
+        require(time.monotonic()<deadline,'controller smoke is incomplete; retain services and inspect its evidence')
+        time.sleep(1)
+    report=preparation.inspect(path,args,work,load)
+    require(report['status']=='PREPARED_NOT_TESTED',
+            f'live preparation BLOCKED: {report["issues"]}; evidence={work}/readiness.json')
+    runner.stage='prepare-peer-readiness'
+    peer=exchange_readiness(spec,c,args,work,env['CALLOSUM_CONTROL_TOKEN'],ssh_options)
+    result=dict(status='PREPARED_NOT_TESTED',stage='prepare',node=args.node,
+                session_id=spec['fresh_session']['id'],peer_node=peer['node'],
+                evidence=str(work),next_action='run',hardware_performance='NOT_RUN')
+    preparation.archive(work,'prepare.json',result)
+    preparation.archive(receipt,'fresh-state.json',result)
+    runner.say(json.dumps(result,indent=2))
+
+
+def prepare_connected(path,args,work,runner):
+    """One operator SSH authorization, reused only inside this prepare call."""
+    from callosum_lab import remote_command
+    require(args.peer,'prepare requires --peer user@IP; init/run do not contact SSH')
+    with tempfile.TemporaryDirectory(prefix='callosum-ssh-') as directory:
+        control=str(Path(directory)/'control')
+        options=('-o','ControlMaster=auto','-o','ControlPersist=yes','-o','ControlPath='+control)
+        try:
+            prepare_session(path,args,work,runner,options)
+        finally:
+            if Path(control).exists():
+                # Close only this invocation's SSH control connection, not lab
+                # services or another operator's shared connection.
+                try:
+                    subprocess.run(remote_command(args.peer,[],options=('-S',control,'-O','exit')),
+                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+                except (OSError,subprocess.TimeoutExpired): pass
+
+
+def apply_session_profile(args):
+    """init fixes the plan; prepare/run inherit it without repeated shell vars."""
+    profile={}
+    if args.action!='init' and Path(args.config).is_file():
+        spec=json.loads(Path(args.config).read_text())
+        profile=spec.get('fresh_session',{}).get('profile',{})
+    defaults=dict(sizes=[1,2,4,8,16,32,64,128],unit='MB',repetitions=3,
+                  backings=['local_numa','cxl'],page_modes=['native','huge2MB'])
+    if args.sizes is None and 'IO_SIZES' in os.environ:
+        args.sizes=[int(n) for n in os.environ['IO_SIZES'].split()]
+    if args.unit is None and 'IO_UNIT' in os.environ: args.unit=os.environ['IO_UNIT']
+    for key,default in defaults.items():
+        value=getattr(args,key)
+        if value is not None and profile:
+            require(value==profile[key],f'{key} differs from init; use init for a new independent experiment')
+        setattr(args,key,value if value is not None else profile.get(key,default))
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['init','prepare','provision-hugepages','retire','start-cxl','stop-receivers','receive','run'])
+    parser.add_argument('action',choices=['init','prepare','run','provision-hugepages','retire','start-cxl','stop-receivers','receive'])
     parser.add_argument('--config',required=True)
     parser.add_argument('--node',required=True)
     parser.add_argument('--work-dir',help='Preparation/evidence directory; defaults to runs/benchmark-prep/<node>')
@@ -290,28 +521,60 @@ def main():
     parser.add_argument('--create-token',action='store_true',help='init: create a missing private token once on the controller; never overwrite')
     parser.add_argument('--source',help='init: explicit source ID if absent from lab_run')
     parser.add_argument('--receiver',help='init: explicit receiver ID if absent from lab_run')
+    parser.add_argument('--peer',help='prepare ONLY: operator-supplied OTHER host user@IP; never inferred')
+    parser.add_argument('--remote-root',help='prepare: peer checkout root; defaults to this checkout root')
+    parser.add_argument('--peer-config',help='prepare: absolute peer matrix config; defaults to remote-root/config basename')
+    parser.add_argument('--generate-only',action='store_true',help='init: input fixture only; no build or readiness claim')
+    parser.add_argument('--jobs',type=int,default=4,help='init: build parallelism')
+    parser.add_argument('--skip-apt',action='store_true',help='init: refuse missing OS packages instead of installing them')
     parser.add_argument('--campaign-run',help='retire: old campaign; start-cxl: fresh campaign directory')
     parser.add_argument('--ack-exclusive-campaign',action='store_true',
                         help='retire: operator stopped canonical benchmark initiators; no unrelated/direct writers')
     parser.add_argument('--sizes',nargs='+',type=int)
-    parser.add_argument('--unit',choices=['MB','MiB'],default=os.environ.get('IO_UNIT','MB'))
-    parser.add_argument('--repetitions',type=int,default=3)
-    parser.add_argument('--backings',nargs='+',choices=['cxl','local_numa'],default=['local_numa','cxl'])
-    parser.add_argument('--page-modes',nargs='+',choices=['native','huge2MB'],default=['native','huge2MB'])
+    parser.add_argument('--unit',choices=['MB','MiB'])
+    parser.add_argument('--repetitions',type=int)
+    parser.add_argument('--backings',nargs='+',choices=['cxl','local_numa'])
+    parser.add_argument('--page-modes',nargs='+',choices=['native','huge2MB'])
     args=parser.parse_args(); runner=None; phase='configuration'; work=None
     transition_possible=False; host_resources_changed=False
     try:
-        if args.sizes is None:
-            args.sizes=[int(n) for n in os.environ.get('IO_SIZES','1 2 4 8 16 32 64 128').split()]
+        apply_session_profile(args)
         require(not args.create_token or args.action=='init','--create-token is only valid with init')
         require(len(set(args.backings))==len(args.backings) and len(set(args.page_modes))==len(args.page_modes),
                 'duplicate backing or page mode')
         import callosum_benchmark_prepare as preparation
-        work=Path(args.work_dir or (Path(__file__).resolve().parents[2]/'runs/benchmark-prep'/args.node)).resolve()
+        require(not (args.peer or args.remote_root or args.peer_config) or args.action=='prepare',
+                'SSH options belong only to prepare; init and run are host-local')
+        require(args.jobs>0,'--jobs must be positive')
+        require(not args.generate_only or (args.action=='init' and not args.setup_run),
+                '--generate-only requires init without a historical --setup-run')
+        if args.action=='init' and not args.setup_run:
+            root=Path(args.config).resolve().parent/'runs'
+            root.mkdir(parents=True,exist_ok=True)
+            # No old config/receipt/env is read to choose this directory.
+            runner=Runner(Path(tempfile.mkdtemp(prefix='write-session-',dir=root)))
+            runner.remote_mutation_possible=False
+            preparation.fresh_configuration(args.config,args,runner)
+            if args.generate_only: return 0
+            spec=json.loads(Path(args.config).read_text()); work=Path(spec['preparation_dir'])
+            runner.stage='init-prerequisites'
+            report=preparation.inspect(args.config,args,work,load,live=False)
+            runner.say(json.dumps(report,indent=2))
+            return 0 if report['status']=='INPUTS_CHECKED_NOT_STARTED' else 1
+        configured_work=None
+        if not args.work_dir and Path(args.config).is_file():
+            try: configured_work=json.loads(Path(args.config).read_text()).get('preparation_dir')
+            except (ValueError,OSError): pass  # The input gate reports invalid JSON.
+        work=Path(args.work_dir or configured_work or (Path(__file__).resolve().parents[2]/'runs/benchmark-prep'/args.node)).resolve()
         if args.action=='init':
             print(json.dumps(preparation.initialize(args.config,args),indent=2)); return 0
         if args.action in ('prepare','provision-hugepages'):
             phase=args.action
+            if args.action=='prepare' and Path(args.config).is_file() and json.loads(
+                    Path(args.config).read_text()).get('workflow'):
+                runner=Runner(work); runner.remote_mutation_possible=False
+                prepare_connected(args.config,args,work,runner)
+                return 0
             if args.action=='provision-hugepages':
                 require(work.is_dir(),
                         'Run prepare as the benchmark account first. Privileged provisioning must not create its preparation directory.')
@@ -380,6 +643,13 @@ def main():
                 spec['runtimes'][args.node]={'setup_run':str(campaign)}
                 preparation.archive(Path(args.config).resolve().parent,Path(args.config).name,spec)
             return code
+        if spec.get('workflow') and args.action=='run':
+            require((work/'prepare.json').is_file(),'run prepare on both hosts before run')
+            prepared=json.loads((work/'prepare.json').read_text())
+            require(spec['workflow'].get('bound') and prepared.get('status')=='PREPARED_NOT_TESTED' and
+                    prepared.get('node')==args.node and prepared.get('session_id')==spec['fresh_session']['id'],
+                    'prepare receipt belongs to a different or failed session/node; rerun prepare')
+            args.peer_report=str(work/'peer-readiness.json')
         require(args.peer_report,'run prepare on both hosts, exchange readiness.json, then supply --peer-report; no service started')
         peer=preparation.verify_peer(args.peer_report,env['CALLOSUM_CONTROL_TOKEN'],c,spec,args)
         local=preparation.inspect(args.config,args,work,load)
@@ -404,9 +674,39 @@ def main():
             config_sha256=hashlib.sha256(Path(args.config).read_bytes()).hexdigest(),
             topology_sha256=hashlib.sha256(topology.read_bytes()).hexdigest(),
             driver_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()),indent=2))
-        (receive if args.action=='receive' else run)(spec,c,args,topology,receipt,private,env,out,runner)
+        is_receiver=args.action=='receive' or (spec.get('workflow') and args.node==spec['pair']['receiver'])
+        if spec.get('workflow') and not is_receiver and 'local_numa' in args.backings:
+            runner.stage='run-wait-receiver'
+            deadline=time.monotonic()+c['lab_run'].get('wait_seconds',1800)
+            while True:
+                try:
+                    for mode in args.page_modes: receiver_health(spec,c,args,mode)
+                    break
+                except (OSError,RuntimeError):
+                    require(time.monotonic()<deadline,'receiver not ready; run the same run command on the configured receiver')
+                    time.sleep(1)
+        if is_receiver and 'local_numa' not in args.backings:
+            runner.say('[READY] CXL-only targets already started by prepare; run on the source performs the sweep')
+        else:
+            (receive if is_receiver else run)(spec,c,args,topology,receipt,private,env,out,runner)
         return 0
     except Exception as error:
+        transition_possible=transition_possible or bool(runner and runner.services_may_be_live)
+        if phase=='prepare' and work:
+            # Do not leave an older PASS visible after a failed refresh.
+            try:
+                spec=json.loads(Path(args.config).read_text())
+                private=resolve(Path(args.config).resolve().parent,spec['token_file'])
+                latest=work/'readiness.json'
+                current=json.loads(latest.read_text()) if latest.is_file() else dict(node=args.node,issues=[])
+                if current.get('status')!='BLOCKED':
+                    current.update(status='BLOCKED',created_unix_ns=time.time_ns())
+                    current['issues'].append(dict(check='prepare',error=str(error)))
+                    preparation.save_readiness(work,current,private.read_text().strip())
+                if spec.get('workflow'):
+                    preparation.archive(work,'prepare.json',dict(status='BLOCKED',node=args.node,
+                        session_id=spec['fresh_session']['id'],error=str(error)))
+            except (OSError,ValueError,KeyError,NameError): pass
         failure=dict(status='FAIL',stage=runner.stage if runner else phase,error=str(error),
                      issues=getattr(error,'issues',[]),
                      initialization_side_effects=getattr(error,'initialization_side_effects',None),
