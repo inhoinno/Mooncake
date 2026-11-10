@@ -17,6 +17,40 @@ import test_callosum_write_matrix as matrix_tests
 
 
 class PreparationTest(unittest.TestCase):
+    def test_permission_failure_preserves_all_diagnostics_and_old_readiness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work=Path(directory); old=work/'readiness.json'
+            old.write_text('previous evidence')
+            secret='private-fixture-token-'*3
+            real_write=Path.write_bytes
+            def deny_backup(path,data):
+                if path.name.endswith('.previous'): raise PermissionError(13,'Permission denied',str(path))
+                return real_write(path,data)
+            with patch.object(Path,'write_bytes',new=deny_backup):
+                report=prep.save_readiness(work,dict(status='PREPARED_NOT_TESTED',issues=[],
+                    services_started=False,devices_mapped=False),secret)
+            self.assertEqual(report['status'],'BLOCKED')
+            self.assertFalse(report['evidence_saved'])
+            self.assertEqual(report['issues'][-1]['check'],'evidence_storage')
+            self.assertEqual(old.read_text(),'previous evidence')
+            self.assertEqual(report['signature'],prep.signed(report,secret)['signature'])
+            self.assertNotIn(secret,json.dumps(report))
+            # Correcting storage access permits repetition without deleting evidence.
+            recovered=prep.save_readiness(work,dict(status='PREPARED_NOT_TESTED',issues=[]),secret)
+            self.assertTrue(recovered['evidence_saved'])
+            self.assertEqual(json.loads(old.read_text())['status'],'PREPARED_NOT_TESTED')
+            self.assertEqual(next(work.glob('*.previous')).read_text(),'previous evidence')
+
+    def test_storage_failure_does_not_hide_independent_configuration_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work=Path(directory)
+            with patch.object(prep,'archive',side_effect=PermissionError('fixture evidence directory denied')):
+                report=prep.inspect(work/'missing.json',SimpleNamespace(node='a1',action='prepare'),work,matrix.load)
+            self.assertFalse(report['evidence_saved'])
+            checks={issue['check'] for issue in report['issues']}
+            self.assertTrue({'matrix_config','configuration','evidence_storage'}<=checks)
+            self.assertFalse(report['services_started']); self.assertFalse(report['devices_mapped'])
+
     def test_preflight_missing_files_are_collected_without_hidden_local_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)

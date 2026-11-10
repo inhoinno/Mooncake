@@ -306,6 +306,9 @@ def main():
             print(json.dumps(preparation.initialize(args.config,args),indent=2)); return 0
         if args.action in ('prepare','provision-hugepages'):
             phase=args.action
+            if args.action=='provision-hugepages':
+                require(work.is_dir(),
+                        'Run prepare as the benchmark account first. Privileged provisioning must not create its preparation directory.')
             report=preparation.inspect(args.config,args,work,load)
             if args.action=='provision-hugepages':
                 require(sys.platform=='linux' and os.geteuid()==0,'provision-hugepages needs authorized Linux root')

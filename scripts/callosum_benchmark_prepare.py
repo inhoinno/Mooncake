@@ -47,6 +47,34 @@ def archive(work,name,value):
     temporary.replace(old)
 
 
+def save_readiness(work,result,secret):
+    """Keep all diagnostic results visible if evidence storage is inaccessible.
+
+    An unsaved result is never usable peer readiness. Do not repair permissions,
+    change owners or silently move evidence (retirement uses this same work dir).
+    """
+    work=Path(work)
+    result=dict(result,evidence_directory=str(work),evidence_saved=True)
+    if secret: result=signed(result,secret)
+    try:
+        archive(work,'readiness.json',result)
+    except OSError as error:
+        result.pop('signature',None)
+        result.update(status='BLOCKED',evidence_saved=False)
+        issue=dict(check='evidence_storage',error=str(error),path=str(work),
+            next_action='Inspect permissions/ACLs on this preparation directory. '
+                        'Restore authorized benchmark-account access, then repeat prepare. '
+                        'Do not use recursive chown or run the benchmark as root to bypass this check.')
+        try:
+            info=work.stat()
+            issue.update(directory_uid=info.st_uid,directory_gid=info.st_gid,
+                         directory_mode=oct(stat.S_IMODE(info.st_mode)),effective_uid=os.geteuid())
+        except OSError: pass
+        result['issues'].append(issue)
+        if secret: result=signed(result,secret)
+    return result
+
+
 def plan(c,spec,args):
     return hashlib.sha256(json.dumps(dict(fingerprint=c['fingerprint'],pair=spec['pair'],
         sizes=args.sizes,unit=args.unit,repetitions=args.repetitions,backings=sorted(args.backings),
@@ -139,9 +167,7 @@ def inspect(path,args,work,loader):
         if sys.platform!='linux':
             result['issues'].append(dict(check='platform',error='Linux lab host required; no remote probes issued from this platform'))
             result.pop('configuration',None)
-            if secret: result=signed(result,secret)
-            archive(work,'readiness.json',result)
-            return result
+            return save_readiness(work,result,secret)
         check('platform',lambda:require(sys.platform=='linux','host preparation requires Linux') or sys.platform)
         check('machine',lambda:dict(machine_id=Path('/etc/machine-id').read_text().strip(),
                                     boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip()))
@@ -333,9 +359,7 @@ print(json.dumps({str(pathlib.Path(m.__file__).resolve()):hashlib.sha256(pathlib
     result.pop('matrix_config',None); result.pop('configuration',None)
     # configuration is a tuple with an environment containing a secret. Never serialize it.
     if not result['issues']: result['status']='PREPARED_NOT_TESTED'
-    if secret: result=signed(result,secret)
-    archive(work,'readiness.json',result)
-    return result
+    return save_readiness(work,result,secret)
 
 
 def verify_peer(path,secret,c,spec,args):
