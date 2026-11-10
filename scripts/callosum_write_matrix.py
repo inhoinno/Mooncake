@@ -378,8 +378,9 @@ def launch_fresh(path,args,runner):
 def peer_inputs(args,remote_config,ssh_options):
     """Only prepare calls this function, with an operator-supplied SSH target."""
     from callosum_lab import remote_command
+    from callosum_benchmark_prepare import software
     require(args.peer,'prepare requires --peer user@IP; no address is inferred or contacted automatically')
-    code='''import json,sys,time
+    code='''import hashlib,json,sys,time
 from pathlib import Path
 p=Path(sys.argv[1]).resolve(); c=json.loads(p.read_text())
 assert c.get('workflow'), 'Run init on this peer first'
@@ -388,12 +389,17 @@ assert private.stat().st_mode & 0o077 == 0, 'Token is not private'
 value=dict(session=c['fresh_session'],workflow=c['workflow'],host_time_unix_ns=time.time_ns(),
     topology=json.loads((p.parent/c['topology_file']).resolve().read_text()),
     machine_id=Path('/etc/machine-id').read_text().strip())
+source=Path(sys.argv[2])
+value['active_software']={name:hashlib.sha256((source/(name if '/' in name else 'scripts/'+name)).read_bytes()).hexdigest()
+                          for name in json.loads(sys.argv[3])}
 if c['workflow']['node']==c['fresh_session']['controller']:
     value['token']=private.read_text().strip()
 print(json.dumps(value))'''
     # This response may contain the private token. Do not use Runner.call or log it.
     return json.loads(subprocess.check_output(remote_command(args.peer,
-        ['python3','-c',code,str(remote_config)],options=ssh_options),text=True,timeout=120))
+        ['python3','-c',code,str(remote_config),
+         str(Path(getattr(args,'remote_root',None) or Path(__file__).resolve().parents[2])/'Mooncake-dev'),
+         json.dumps(sorted(software()))],options=ssh_options),text=True,timeout=120))
 
 
 def validate_session_age(session,peer,local_machine):
@@ -414,14 +420,19 @@ def validate_session_age(session,peer,local_machine):
     return age
 
 
-def peer_session_differences(current,peer,active_software):
+def peer_session_differences(current,peer,active_software,peer_active=None):
     """Report non-secret compatibility evidence; never mutate a live session."""
     differences={}
     for field in ('controller','profile'):
         if current.get(field)!=peer.get(field):
             differences[field]=dict(local_init=current.get(field),peer_init=peer.get(field))
     local=current.get('software',{}); remote=peer.get('software',{})
+    refreshable={'callosum_write_matrix.py','callosum_benchmark_prepare.py','callosum_dram_benchmark.py'}
     for name in sorted(set(local)|set(remote)|set(active_software)):
+        if peer_active is not None and peer_active.get(name)!=active_software.get(name):
+            differences['peer_checkout:'+name]=dict(local_checkout=active_software.get(name),peer_checkout=peer_active.get(name))
+        if peer_active is not None and name in refreshable and name in local and name in remote:
+            continue  # Actual matching scripts are revalidated by prepare; no service ABI change.
         if not (local.get(name)==remote.get(name)==active_software.get(name)):
             differences['software:'+name]=dict(local_init=local.get(name),
                 peer_init=remote.get(name),local_checkout=active_software.get(name))
@@ -442,7 +453,8 @@ def bind_peer(path,args,ssh_options):
             'peer is not the configured OTHER physical node')
     require(bundle['topology']==json.loads(topology.read_text()),'approved peer topology differs; no extent is changed')
     session=bundle['session']; current=spec['fresh_session']
-    differences=peer_session_differences(current,session,preparation.software())
+    active=preparation.software()
+    differences=peer_session_differences(current,session,active,bundle.get('active_software'))
     require(not differences,'peer source/profile/controller differs: '+json.dumps(differences,sort_keys=True)+
             '; local_config='+str(Path(path).resolve())+'; peer_config='+str(remote_config)+
             '. No handoff performed. Preserve running campaigns; inspect/drain before replacing live services. '
@@ -471,6 +483,10 @@ def bind_peer(path,args,ssh_options):
     elif bundle['workflow'].get('bound'):
         require(session==current,'peer is already bound to a different session; initialize the peer for this experiment')
     spec['workflow'].update(peer_ssh=args.peer,peer_config=str(remote_config),bound=True)
+    if active!=current['software']:
+        preparation.archive(Path(spec['preparation_dir']),'launcher-refresh.json',dict(
+            session_id=spec['fresh_session']['id'],init_software=current['software'],active_software=active,
+            scope='MATCHED_LAUNCHER_REFRESH_ONLY',native_runtime_contract_unchanged=True))
     preparation.archive(Path(path).resolve().parent,Path(path).name,spec)
     preparation.archive(receipt,'fresh-state.json',dict(status='BOUND_TO_CONTROLLER',node=args.node,
         session_id=spec['fresh_session']['id'],campaign=str(receipt),local_campaign_started=started))

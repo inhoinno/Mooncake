@@ -20,6 +20,21 @@ import test_callosum_write_matrix as matrix_tests
 
 
 class PreparationTest(unittest.TestCase):
+    def test_launcher_refresh_requires_matching_current_sources_and_stable_runtime_native(self):
+        old=dict(controller='a1',profile=dict(sizes=[1]),software={
+            'callosum_dram_benchmark.py':'old','callosum_runtime.py':'runtime',
+            'mooncake-integration/pool_relay/relay_batch.h':'native'})
+        actual=dict(old['software'],**{'callosum_dram_benchmark.py':'fixed'})
+        self.assertEqual(matrix.peer_session_differences(old,old,actual,actual),{})
+        mismatch=dict(actual,**{'callosum_dram_benchmark.py':'other-fix'})
+        self.assertIn('peer_checkout:callosum_dram_benchmark.py',
+            matrix.peer_session_differences(old,old,actual,mismatch))
+        for field in ('callosum_runtime.py','mooncake-integration/pool_relay/relay_batch.h'):
+            changed=dict(actual); changed[field]='incompatible'
+            self.assertIn('software:'+field,matrix.peer_session_differences(old,old,changed,changed))
+        # Without actual peer-source evidence, the old strict check remains.
+        self.assertIn('software:callosum_dram_benchmark.py',matrix.peer_session_differences(old,old,actual))
+
     def test_prepare_allocation_executes_real_probe_program_before_any_rdma(self):
         import callosum_lab as lab
         import callosum_dram_benchmark as dram
@@ -505,6 +520,11 @@ class PreparationTest(unittest.TestCase):
                         self.assertEqual(matrix.main(),0)
                     hosts[node]=(path,args,Path(json.loads(path.read_text())['preparation_dir']))
                 for node,(path,args,work) in hosts.items():
+                    # Model a session created before the DRAM-only mbind repair.
+                    # Real checkout hashes still come from the actual SSH export program.
+                    existing=json.loads(path.read_text())
+                    existing['fresh_session']['software']['callosum_dram_benchmark.py']='prior-dram-version'
+                    path.write_text(json.dumps(existing))
                     args.action='prepare'; other='b1' if node=='a1' else 'a1'
                     args.peer='authorized-b' if node=='a1' else 'authorized-a'
                     args.peer_config=str(hosts[other][0])
@@ -521,6 +541,10 @@ class PreparationTest(unittest.TestCase):
                     self.assertTrue(all(not t.is_alive() for t in threads),'prepare handoff did not converge')
                     self.assertEqual(errors,[])
                     self.assertEqual(starts.call_count,2)
+                    for path,args,work in hosts.values():
+                        proof=json.loads((work/'launcher-refresh.json').read_text())
+                        self.assertTrue(proof['native_runtime_contract_unchanged'])
+                        self.assertEqual(proof['session_id'],json.loads(path.read_text())['fresh_session']['id'])
                     # Refresh uses success markers, not another service owner.
                     context.node='a1'; prepare('a1')
                     self.assertEqual(starts.call_count,2)
