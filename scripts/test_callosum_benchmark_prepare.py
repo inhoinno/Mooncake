@@ -161,17 +161,29 @@ class PreparationTest(unittest.TestCase):
                  patch.object(prep.subprocess,'check_output',return_value='{"engine.so":"hash"}'), \
                  patch.object(prep,'inspect_resources',return_value=dict(status='INPUTS_CHECKED_NOT_STARTED')) as inspect, \
                  contextlib.redirect_stdout(io.StringIO()):
-                for attempt in range(2):
+                for attempt in range(3):
                     # Explicit selection also enters fresh initialization, not legacy init.
-                    with patch.object(sys,'argv',argv+(['--setup-run',str(root)] if attempt==0 else [])):
-                        self.assertEqual(matrix.main(),0)
+                    status='BLOCKED' if attempt==2 else 'INPUTS_CHECKED_NOT_STARTED'
+                    inspect.return_value=dict(status=status,issues=[dict(check='fixture-blocker')] if attempt==2 else [],
+                        software=dict(detail='full-software-evidence'),execution_account=dict(uid=1000))
+                    output=io.StringIO()
+                    with patch.object(sys,'argv',argv+(['--setup-run',str(root)] if attempt==0 else [])+
+                                      (['--verbose'] if attempt==1 else [])),contextlib.redirect_stdout(output):
+                        self.assertEqual(matrix.main(),1 if attempt==2 else 0)
+                    text=output.getvalue()
+                    final=json.loads(text[text.rfind('\n{')+1:])
+                    self.assertEqual(final['status'],'BUILD_REUSED_NOT_REBUILT')
+                    self.assertEqual(final['preparation_status'],status)
+                    self.assertEqual('full-software-evidence' in text,attempt==1)
+                    if attempt==2: self.assertIn('fixture-blocker',text)
                     spec=json.loads(target.read_text()); run=Path(spec['runtimes']['a1']['setup_run'])
                     adopted=json.loads((run/'setup.json').read_text())
+                    self.assertIn('full-software-evidence',(run/'commands.log').read_text())
                     self.assertEqual(adopted['build'],receipt['build'])
                     self.assertEqual(adopted['adoption_scope'],'VERIFIED_EXISTING_ABI2_NOT_REBUILT')
                     self.assertEqual(json.loads((run/'fresh-state.json').read_text())['status'],'REUSED_BUILD_NOT_STARTED')
                     campaigns.append(run); tokens.append(Path(spec['token_file']).read_text())
-            compile_build.assert_not_called(); self.assertEqual(inspect.call_count,2)
+            compile_build.assert_not_called(); self.assertEqual(inspect.call_count,3)
             self.assertNotEqual(campaigns[0],campaigns[1]); self.assertNotEqual(tokens[0],tokens[1])
 
     def test_skip_build_first_run_needs_receipt_and_never_falls_back_to_compile(self):

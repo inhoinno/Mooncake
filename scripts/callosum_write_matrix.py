@@ -78,6 +78,18 @@ def receiver_exit_error(child,log,mode,env):
                        f'--- receiver log tail ---\n{tail}\n--- end receiver log ---')
 
 
+def readiness_output(report,verbose=False,runner=None):
+    """Terminal detail is optional; the full signed readiness artifact is not."""
+    keys=('status','scope','node','issues','purpose','services_started','devices_mapped','created_unix_ns')
+    value=report if verbose else {k:report[k] for k in keys if k in report}
+    message=json.dumps(value,indent=2)
+    if runner:
+        if not verbose:
+            runner.log.write('[full readiness report]\n'+json.dumps(report,indent=2)+'\n')
+        runner.say(message)
+    else: print(message)
+
+
 def load(path,args):
     path=Path(path).resolve(); base=path.parent
     spec=json.loads(path.read_text())
@@ -610,6 +622,7 @@ def main():
     parser.add_argument('--jobs',type=int,default=4,help='init: build parallelism')
     parser.add_argument('--skip-apt',action='store_true',help='init: refuse missing OS packages instead of installing them')
     parser.add_argument('--skip-build',action='store_true',help='init: verify and reuse --setup-run or this config’s exact local build; never compile')
+    parser.add_argument('--verbose',action='store_true',help='print complete readiness reports; full evidence is always saved')
     parser.add_argument('--campaign-run',help='retire: old campaign; start-cxl: fresh campaign directory')
     parser.add_argument('--ack-exclusive-campaign',action='store_true',
                         help='retire: operator stopped canonical benchmark initiators; no unrelated/direct writers')
@@ -647,7 +660,12 @@ def main():
             spec=json.loads(Path(args.config).read_text()); work=Path(spec['preparation_dir'])
             runner.stage='init-prerequisites'
             report=preparation.inspect_resources(args.config,args,work,load,runner,live=False)
-            runner.say(json.dumps(report,indent=2))
+            readiness_output(report,args.verbose,runner)
+            if args.skip_build:
+                setup=json.loads((runner.run_dir/'setup.json').read_text())
+                runner.say(json.dumps(dict(status='BUILD_REUSED_NOT_REBUILT',
+                    adopted_from=setup['adopted_from'],build=setup['build'],
+                    adoption_scope=setup['adoption_scope'],preparation_status=report['status']),indent=2))
             return 0 if report['status']=='INPUTS_CHECKED_NOT_STARTED' else 1
         configured_work=None
         if not args.work_dir and Path(args.config).is_file():
@@ -680,7 +698,7 @@ def main():
                 print(json.dumps(preparation.provision(report['numa']['node'],needed,work),indent=2))
                 print('Provisioning is not benchmark readiness. Repeat prepare on both hosts.')
                 return 0
-            print(json.dumps(report,indent=2))
+            readiness_output(report,args.verbose,runner)
             return 0 if report['status']=='PREPARED_NOT_TESTED' else 1
         spec,c,topology,receipt,private,env,root=load(args.config,args)
         phase=args.action

@@ -6,6 +6,10 @@ python_bin=${PYTHON_BIN:-python3}
 native_build=${CALLOSUM_NATIVE_BUILD:-$repo_dir/build-callosum-relay}
 if [[ ${1:-} == lab ]]; then
   shift
+  if [[ ${1:-} == --serving ]]; then
+    shift
+    exec "$python_bin" "$script_dir/callosum_serving.py" "$@"
+  fi
   lab_root=${CALLOSUM_ROOT:-$repo_dir/..}
   exec "$python_bin" "$script_dir/callosum_lab.py" --action node \
     --root "$lab_root" --node-id "${NODE_ID:-}" \
