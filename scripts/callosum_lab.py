@@ -999,8 +999,31 @@ def check_delivery(root):
                 issues.append(f'Local changes not in HEAD: {repo.name}/{file}')
     return dict(status='FAIL' if issues else 'PASS',scope='SOURCE_DELIVERY_LOCAL_ONLY',
                 parent_head=git(top,'rev-parse','HEAD'),mooncake_head=head,
-                parent_gitlink=pinned[2] if len(pinned)>2 else None,issues=issues,
+                parent_gitlink=pinned[2] if len(pinned)>2 else None,
+                parent_gitlink_mode=pinned[0] if pinned else None,issues=issues,
                 pushed='UNVERIFIED',remote_deployment='UNVERIFIED')
+
+
+def check_source(root):
+    """Check the active source, without claiming parent-pin reproducibility.
+
+    The independent host commands can select a newer committed child checkout.
+    This is not a reproducible parent release. Keep that distinction explicit;
+    missing/modified required inputs still fail. No Git state is changed.
+    """
+    result=check_delivery(root)
+    mismatch='Parent committed gitlink does not select the active Mooncake commit'
+    warnings=[]
+    if result['parent_gitlink_mode']=='160000' and mismatch in result['issues']:
+        result['issues'].remove(mismatch)
+        warnings.append(dict(code='PARENT_PIN_STALE',
+            message='Active Mooncake checkout differs from the parent pin. '
+                    'Record both revisions for this experiment; the publisher must update the pin for a reproducible release.'))
+    result.update(status='FAIL' if result['issues'] else 'PASS',scope='SOURCE_CHECKOUT_LOCAL_ONLY',
+        warnings=warnings,parent_release_reproducible=not warnings and not result['issues'],
+        hardware_verified=False,
+        next_stage='benchmark-prepare' if not result['issues'] else 'resolve-required-source-inputs')
+    return result
 
 
 def node_run(root, run, args, runner):
@@ -1203,7 +1226,9 @@ def main(argv=None):
     parser.add_argument('--check-config',action='store_true',
         help='Check manifest/token and node selection only; no build, SSH, service, inventory or device access')
     parser.add_argument('--check-delivery',action='store_true',
-        help='Audit committed parent/submodule inputs; no network or changes to Git')
+        help='Strict release audit: parent pin must match. Not the benchmark preparation gate; no Git changes')
+    parser.add_argument('--check-source',action='store_true',
+        help='Check current committed source inputs; report a stale parent pin separately; no Git changes')
     parser.add_argument('--transport-sweep',action='store_true',
         help='Use a retained healthy campaign for a CXL WRITE sweep; no build or service restart')
     parser.add_argument('--setup-run',help='Existing successful campaign for --transport-sweep')
@@ -1214,12 +1239,12 @@ def main(argv=None):
     parser.add_argument('--repetitions',type=int,default=1)
     args=parser.parse_args(argv)
     root=Path(args.root).resolve()
-    require(sum((args.initialize,args.check_config,args.check_delivery,args.transport_sweep))<=1,
-            'Use only one of --initialize, --check-config, --check-delivery or --transport-sweep')
+    require(sum((args.initialize,args.check_config,args.check_delivery,args.check_source,args.transport_sweep))<=1,
+            'Use only one of --initialize, --check-config, --check-delivery, --check-source or --transport-sweep')
     require(not (args.initialize or args.check_config) or args.action=='node',
             '--initialize and --check-config require --action node; do not combine them with build/prepare actions')
-    if args.check_delivery:
-        result=check_delivery(root)
+    if args.check_delivery or args.check_source:
+        result=(check_delivery if args.check_delivery else check_source)(root)
         print(json.dumps(result,indent=2))
         return 0 if result['status']=='PASS' else 1
     if args.transport_sweep:

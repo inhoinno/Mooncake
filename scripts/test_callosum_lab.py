@@ -175,6 +175,7 @@ class CheckoutCommandTest(unittest.TestCase):
         git(root,'add','.gitmodules')
         git(root,'commit','-m','fixture submodule registration')
         self.assertEqual(lab.check_delivery(root)['status'],'PASS')
+        self.assertTrue(lab.check_source(root)['parent_release_reproducible'])
         # Reproduce Git delivery, not only copying a developer's working tree.
         # The file protocol is enabled only for this owned local fixture command.
         fresh=case/'fresh-clone'
@@ -188,9 +189,23 @@ class CheckoutCommandTest(unittest.TestCase):
         with (source/'scripts/callosum_lab.py').open('a') as stream:
             stream.write('\n# fixture change\n')
         self.assertTrue(any('Local changes' in issue for issue in lab.check_delivery(root)['issues']))
+        self.assertEqual(lab.check_source(root)['status'],'FAIL')
         git(source,'add','scripts/callosum_lab.py')
         git(source,'commit','-m','fixture new engine revision')
         self.assertTrue(any('gitlink' in issue for issue in lab.check_delivery(root)['issues']))
+        current=lab.check_source(root)
+        self.assertEqual(current['status'],'PASS')
+        self.assertFalse(current['parent_release_reproducible'])
+        self.assertEqual(current['warnings'][0]['code'],'PARENT_PIN_STALE')
+        # Exercise the actual shell -> parser boundary, not only the function.
+        before=(git(root,'rev-parse','HEAD'),git(source,'rev-parse','HEAD'),git(root,'diff','--cached'))
+        result=subprocess.run(['bash',str(root/'scripts/callosum_lab.sh'),'--check-source'],
+            cwd=root,env=dict(lab.clean_env(),PYTHON_BIN=sys.executable),text=True,capture_output=True)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(json.loads(result.stdout)['scope'],'SOURCE_CHECKOUT_LOCAL_ONLY')
+        self.assertEqual(before,(git(root,'rev-parse','HEAD'),git(source,'rev-parse','HEAD'),git(root,'diff','--cached')))
+        (root/'scripts/capture_preflight.sh').write_text('changed required input')
+        self.assertEqual(lab.check_source(root)['status'],'FAIL')
 
 
 class StartupSafetyTest(unittest.TestCase):
