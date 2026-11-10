@@ -28,6 +28,35 @@ class FakeMemory:
 
 
 class DramBenchmarkTest(unittest.TestCase):
+    def test_mbind_preserves_selected_node_with_legacy_and_current_kernel_masks(self):
+        for legacy in (False,True):
+            for node in (0,1,63,64,127,128):
+                with self.subTest(legacy=legacy,node=node):
+                    def kernel(address,length,mode,mask,maxnode,flags):
+                        word=ctypes.sizeof(ctypes.c_ulong)*8
+                        value=sum(int(v)<<(i*word) for i,v in enumerate(mask))
+                        imported=value & ((1<<(maxnode-int(legacy)))-1)
+                        self.assertEqual(imported,1<<node)
+                        self.assertEqual(maxnode,len(mask)*word)
+                        self.assertGreater(maxnode,node+1)
+                        self.assertEqual((address,length,mode,flags),(4096,128000000,2,0))
+                        return 0
+                    with patch.object(bench.ctypes.util,'find_library',return_value='fixture-numa'), \
+                         patch.object(bench.ctypes,'CDLL',return_value=SimpleNamespace(mbind=kernel)):
+                        bench.bind_memory(4096,128000000,node)
+
+    def test_mbind_failure_retains_errno_and_reports_parameters_without_fallback(self):
+        def kernel(*args):
+            ctypes.set_errno(22)
+            return -1
+        with patch.object(bench.ctypes.util,'find_library',return_value='fixture-numa'), \
+             patch.object(bench.ctypes,'CDLL',return_value=SimpleNamespace(mbind=kernel)):
+            with self.assertRaises(OSError) as failure: bench.bind_memory(4096,128000000,1)
+        self.assertEqual(failure.exception.errno,22)
+        self.assertIn('node=1',str(failure.exception))
+        self.assertIn('maxnode=',str(failure.exception))
+        self.assertIn('no NUMA fallback',str(failure.exception))
+
     def test_preflight_nic_cpu_intersection_and_unknown_node(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -20,6 +20,70 @@ import test_callosum_write_matrix as matrix_tests
 
 
 class PreparationTest(unittest.TestCase):
+    def test_prepare_allocation_executes_real_probe_program_before_any_rdma(self):
+        import callosum_lab as lab
+        import callosum_dram_benchmark as dram
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); path,args=matrix_tests.MatrixTest().fixture(root)
+            args.node='b1'; args.page_modes=['native','huge2MB']; args.unit='MB'
+            spec,c,_,_,_,env,_=matrix.load(path,args)
+            runner=lab.Runner(root/'work'); memories=[]
+            def memory(capacity,node,mode):
+                self.assertEqual((capacity,node),(128000000,0))
+                value=SimpleNamespace(placement=dict(local=True),page_evidence=dict(mode=mode),memory=MagicMock())
+                memories.append(value); return value
+            def run(stage,argv,**kw):
+                self.assertEqual(stage,'prepare-dram-allocation')
+                self.assertEqual(argv[0],env['PYTHON_BIN'])
+                with patch.object(sys,'argv',['-c',argv[-1]]),contextlib.redirect_stdout(io.StringIO()) as output:
+                    exec(argv[2],{})
+                return output.getvalue()
+            try:
+                with patch.object(dram,'nic_placement',return_value=dict(memory_numa_node=0)), \
+                     patch.object(dram,'Memory',side_effect=memory),patch.object(runner,'call',side_effect=run):
+                    matrix.check_dram_allocation(spec,c,args,env,runner,root/'work')
+                self.assertEqual(len(memories),2)
+                for value in memories: value.memory.close.assert_called_once()
+                proof=json.loads((root/'work/dram-allocation.json').read_text())
+                self.assertFalse(proof['rdma_registered'])
+                self.assertFalse(runner.children)
+            finally: runner.log.close()
+
+    def test_prepare_allocation_failure_stops_before_ssh_or_service_start(self):
+        import callosum_lab as lab
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); path,args=matrix_tests.MatrixTest().fixture(root)
+            args.action='prepare'; runner=lab.Runner(root/'work')
+            try:
+                cold=dict(status='INPUTS_CHECKED_NOT_STARTED',memlock=dict(required=0))
+                with patch.object(prep,'inspect_resources',return_value=cold), \
+                     patch.object(matrix,'check_dram_allocation',side_effect=RuntimeError('mbind EINVAL')), \
+                     patch.object(matrix,'bind_peer') as handoff,patch.object(matrix,'launch_fresh') as start, \
+                     patch.object(matrix.resource,'getrlimit',return_value=(prep.resource.RLIM_INFINITY,)*2):
+                    with self.assertRaisesRegex(RuntimeError,'mbind EINVAL'):
+                        matrix.prepare_session(path,args,root/'work',runner)
+                handoff.assert_not_called(); start.assert_not_called()
+                self.assertFalse(runner.services_may_be_live)
+            finally: runner.log.close()
+
+    def test_session_freshness_uses_origin_clock_for_initial_and_bound_peer(self):
+        session=dict(machine_id='controller',created_unix_ns=1000)
+        peer=dict(machine_id='controller',host_time_unix_ns=2000)
+        # The requester's local clock can be ahead or behind by days.
+        for other_clock in (0,10**18):
+            with patch.object(matrix.time,'time_ns',return_value=other_clock):
+                self.assertEqual(matrix.validate_session_age(session,peer,'requester'),1000)
+        # A bound peer carries the controller session; use the controller's own clock.
+        with patch.object(matrix.time,'time_ns',return_value=3000):
+            self.assertEqual(matrix.validate_session_age(session,
+                dict(machine_id='requester',host_time_unix_ns=10**18),'controller'),2000)
+        for observed in (999,1000+24*3600*10**9):
+            with self.assertRaisesRegex(RuntimeError,'origin host'):
+                matrix.validate_session_age(session,dict(peer,host_time_unix_ns=observed),'requester')
+        with self.assertRaisesRegex(RuntimeError,'origin is not either verified host'):
+            matrix.validate_session_age(dict(session,machine_id='unknown'),peer,'requester')
+
     def test_full_resource_preparation_configures_hugetlb_access_and_reuses_it(self):
         from callosum_lab import Runner
         for initial in (0,2000):
@@ -311,6 +375,7 @@ class PreparationTest(unittest.TestCase):
                     # Rebinding must not repair a wrong host, topology or token
                     # by replacing a retained credential.
                     bundle=dict(session=first['fresh_session'],workflow=first['workflow'],
+                        host_time_unix_ns=first['fresh_session']['created_unix_ns']+1,
                         topology=json.loads(Path(first['topology_file']).read_text()),
                         machine_id='machine-a1',token=Path(first['token_file']).read_text().strip())
                     active=(root/'peer-matrix.json').read_bytes()
@@ -414,9 +479,13 @@ class PreparationTest(unittest.TestCase):
                 (run/'control.token').write_bytes(private.read_bytes())
                 if node=='a1': (run/'summary.json').write_text(json.dumps(dict(status='PASS',combined_trace_gate='PASS')))
                 return 0
+            def allocation(stage,argv,**kw):
+                self.assertEqual(stage,'prepare-dram-allocation')
+                return json.dumps(dict(status='ALLOCATION_ONLY_PASS',rdma_registered=False,results=[]))
             with patch.object(prep.sys,'platform','linux'),patch.object(Path,'read_text',new=read), \
                  patch.object(lab,'prepare',side_effect=build),patch.object(prep,'inspect',side_effect=inspect), \
                  patch.object(lab,'main',side_effect=startup) as starts, \
+                 patch.object(lab.Runner,'call',side_effect=allocation), \
                  patch.object(matrix,'rpc',return_value=dict(topology_verified=True,
                      operations=[dict(state='COMMITTED'),dict(state='COMMITTED')])), \
                  patch.object(matrix.resource,'getrlimit',return_value=(prep.resource.RLIM_INFINITY,)*2), \

@@ -379,13 +379,13 @@ def peer_inputs(args,remote_config,ssh_options):
     """Only prepare calls this function, with an operator-supplied SSH target."""
     from callosum_lab import remote_command
     require(args.peer,'prepare requires --peer user@IP; no address is inferred or contacted automatically')
-    code='''import json,sys
+    code='''import json,sys,time
 from pathlib import Path
 p=Path(sys.argv[1]).resolve(); c=json.loads(p.read_text())
 assert c.get('workflow'), 'Run init on this peer first'
 private=(p.parent/c['token_file']).resolve()
 assert private.stat().st_mode & 0o077 == 0, 'Token is not private'
-value=dict(session=c['fresh_session'],workflow=c['workflow'],
+value=dict(session=c['fresh_session'],workflow=c['workflow'],host_time_unix_ns=time.time_ns(),
     topology=json.loads((p.parent/c['topology_file']).resolve().read_text()),
     machine_id=Path('/etc/machine-id').read_text().strip())
 if c['workflow']['node']==c['fresh_session']['controller']:
@@ -394,6 +394,24 @@ print(json.dumps(value))'''
     # This response may contain the private token. Do not use Runner.call or log it.
     return json.loads(subprocess.check_output(remote_command(args.peer,
         ['python3','-c',code,str(remote_config)],options=ssh_options),text=True,timeout=120))
+
+
+def validate_session_age(session,peer,local_machine):
+    """Compare creation and observation on the session's origin host only."""
+    origin=session.get('machine_id')
+    if origin==local_machine:
+        now=time.time_ns()
+    else:
+        require(origin is not None and origin==peer.get('machine_id'),
+                'session origin is not either verified host; no clock-age inference allowed')
+        now=peer.get('host_time_unix_ns')
+    created=session.get('created_unix_ns')
+    require(type(now) is int and type(created) is int,'missing origin-host session clock evidence')
+    age=now-created
+    require(0<=age<24*3600*10**9,
+            f'session age on origin host is {age} ns: expired (24 hours) or origin clock moved backwards; '
+            'cross-host clock offsets are not used')
+    return age
 
 
 def peer_session_differences(current,peer,active_software):
@@ -429,8 +447,7 @@ def bind_peer(path,args,ssh_options):
             '; local_config='+str(Path(path).resolve())+'; peer_config='+str(remote_config)+
             '. No handoff performed. Preserve running campaigns; inspect/drain before replacing live services. '
             'A source update does not refresh init snapshots or running processes.')
-    require(0<=time.time_ns()-session['created_unix_ns']<24*3600*10**9,
-            'peer init is older than 24 hours or its clock is ahead; inspect clocks before a new init')
+    validate_session_age(session,bundle,local_machine)
     started=(receipt/'topology.json').exists() or (receipt/'control.token').exists()
     if args.node!=current['controller']:
         require(bundle['workflow'].get('bound') is True,'controller init is not available')
@@ -495,6 +512,43 @@ print(json.dumps(dict(session=c['fresh_session'],workflow=c['workflow'],
         time.sleep(1)
 
 
+def check_dram_allocation(spec,c,args,env,runner,work):
+    """Probe the actual allocation path in the worker interpreter, without RDMA."""
+    if 'local_numa' not in args.backings: return
+    modes=[]
+    for mode in args.page_modes:
+        if args.node==spec['pair']['receiver']:
+            try:
+                receiver_health(spec,c,args,mode)
+                continue  # Do not allocate twice over a retained valid receiver.
+            except (OSError,RuntimeError,KeyError): pass
+        modes.append(mode)
+    if not modes: return
+    node=next(n for n in c['nodes'] if n['id']==args.node)
+    code='''import json,sys
+from callosum_dram_benchmark import Memory,nic_placement
+d=json.loads(sys.argv[1])
+p=nic_placement(d['device'],d['numa_override'])
+proof=[]
+for mode in d['modes']:
+    m=Memory(d['bytes'],p['memory_numa_node'],mode)
+    try: proof.append(dict(mode=mode,placement=m.placement,page_evidence=m.page_evidence))
+    finally: m.memory.close()
+print(json.dumps(dict(status='ALLOCATION_ONLY_PASS',placement=p,results=proof,
+                      rdma_registered=False,devices_mapped=False)))'''
+    values=dict(device=node['rdma_device'],numa_override=spec['numa_nodes'].get(args.node),
+                modes=modes,bytes=max(block_bytes(n,args.unit) for n in args.sizes))
+    probe_env=dict(env)
+    scripts=str(Path(__file__).resolve().parent)
+    probe_env['PYTHONPATH']=scripts+os.pathsep+probe_env.get('PYTHONPATH','')
+    text=runner.call('prepare-dram-allocation',[env['PYTHON_BIN'],'-c',code,json.dumps(values)],
+                     env=probe_env,capture=True)
+    proof=json.loads(text)
+    require(proof.get('status')=='ALLOCATION_ONLY_PASS' and not proof.get('rdma_registered',True),
+            'NUMA allocation probe did not pass')
+    (Path(work)/'dram-allocation.json').write_text(json.dumps(proof,indent=2))
+
+
 def prepare_session(path,args,work,runner,ssh_options=()):
     """One prepare stage: cold checks, canonical startup, smoke, peer proof."""
     import callosum_benchmark_prepare as preparation
@@ -509,6 +563,7 @@ def prepare_session(path,args,work,runner,ssh_options=()):
     needed=cold['memlock']['required']
     if soft!=resource.RLIM_INFINITY and soft<needed:
         resource.setrlimit(resource.RLIMIT_MEMLOCK,(needed,hard))
+    check_dram_allocation(spec,c,args,env,runner,work)
     require(sys.platform=='linux','prepare requires the Linux operator host; no remote access from this Mac')
     require(args.peer,'prepare requires --peer user@IP; no peer IP is inferred')
     runner.stage='prepare-explicit-peer-handoff'

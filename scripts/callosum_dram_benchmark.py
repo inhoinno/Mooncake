@@ -85,18 +85,24 @@ def nic_placement(device, override=None, sysroot=Path('/sys')):
 
 
 def bind_memory(address, length, node):
+    require(type(node) is int and node>=0,'invalid NUMA binding node')
     name = ctypes.util.find_library('numa')
     require(name, 'libnuma is required; install the lab OS libnuma package')
     lib = ctypes.CDLL(name, use_errno=True)
     word = ctypes.sizeof(ctypes.c_ulong) * 8
-    mask = (ctypes.c_ulong * (node // word + 1))()
+    # Include a zero sentinel bit above the selected node. Older kernels subtract
+    # one from maxnode before importing the mask; node+1 can drop our only bit.
+    mask = (ctypes.c_ulong * ((node + 1) // word + 1))()
     mask[node // word] = 1 << (node % word)
     lib.mbind.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
                          ctypes.POINTER(ctypes.c_ulong), ctypes.c_ulong, ctypes.c_uint]
     lib.mbind.restype = ctypes.c_long
     # MPOL_BIND, before first touch. Do not migrate unrelated process pages.
-    if lib.mbind(address, length, 2, mask, node + 1, 0) != 0:
-        raise OSError(ctypes.get_errno(), 'mbind failed; no NUMA fallback')
+    maxnode=len(mask)*word
+    if lib.mbind(address, length, 2, mask, maxnode, 0) != 0:
+        raise OSError(ctypes.get_errno(),
+            f'mbind failed; node={node}, length={length}, address_page_offset={address % mmap.PAGESIZE}, '
+            f'maxnode={maxnode}, mask_words={len(mask)}; no NUMA fallback')
 
 
 def resident_pages(address, node, length, maps=None):
