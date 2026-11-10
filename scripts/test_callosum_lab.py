@@ -203,6 +203,17 @@ class CheckoutCommandTest(unittest.TestCase):
             cwd=root,env=dict(lab.clean_env(),PYTHON_BIN=sys.executable),text=True,capture_output=True)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertEqual(json.loads(result.stdout)['scope'],'SOURCE_CHECKOUT_LOCAL_ONLY')
+        for flags,expected in [(['--check-delivery'],0),(['--check-delivery','--strict-pin'],1)]:
+            result=subprocess.run(['bash',str(root/'scripts/callosum_lab.sh'),*flags],
+                cwd=root,env=dict(lab.clean_env(),PYTHON_BIN=sys.executable),text=True,capture_output=True)
+            self.assertEqual(result.returncode,expected,result.stdout+result.stderr)
+            report=json.loads(result.stdout)
+            if expected:
+                self.assertTrue(any('gitlink' in issue for issue in report['issues']))
+            else:
+                self.assertEqual(report['warnings'][0]['code'],'PARENT_PIN_STALE')
+                self.assertFalse(report['parent_release_reproducible'])
+                self.assertFalse(report['peer_verified'])
         self.assertEqual(before,(git(root,'rev-parse','HEAD'),git(source,'rev-parse','HEAD'),git(root,'diff','--cached')))
         (root/'scripts/capture_preflight.sh').write_text('changed required input')
         self.assertEqual(lab.check_source(root)['status'],'FAIL')

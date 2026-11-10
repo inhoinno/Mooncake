@@ -1021,7 +1021,7 @@ def check_source(root):
                     'Record both revisions for this experiment; the publisher must update the pin for a reproducible release.'))
     result.update(status='FAIL' if result['issues'] else 'PASS',scope='SOURCE_CHECKOUT_LOCAL_ONLY',
         warnings=warnings,parent_release_reproducible=not warnings and not result['issues'],
-        hardware_verified=False,
+        hardware_verified=False,peer_verified=False,
         next_stage='benchmark-prepare' if not result['issues'] else 'resolve-required-source-inputs')
     return result
 
@@ -1226,9 +1226,11 @@ def main(argv=None):
     parser.add_argument('--check-config',action='store_true',
         help='Check manifest/token and node selection only; no build, SSH, service, inventory or device access')
     parser.add_argument('--check-delivery',action='store_true',
-        help='Strict release audit: parent pin must match. Not the benchmark preparation gate; no Git changes')
+        help='Check active source inputs; stale parent pin is a warning. Use --strict-pin for a release audit')
+    parser.add_argument('--strict-pin',action='store_true',
+        help='With --check-delivery, require the committed parent pin to match the active child checkout')
     parser.add_argument('--check-source',action='store_true',
-        help='Check current committed source inputs; report a stale parent pin separately; no Git changes')
+        help='Alias for the default --check-delivery source check; no Git changes')
     parser.add_argument('--transport-sweep',action='store_true',
         help='Use a retained healthy campaign for a CXL WRITE sweep; no build or service restart')
     parser.add_argument('--setup-run',help='Existing successful campaign for --transport-sweep')
@@ -1243,8 +1245,9 @@ def main(argv=None):
             'Use only one of --initialize, --check-config, --check-delivery, --check-source or --transport-sweep')
     require(not (args.initialize or args.check_config) or args.action=='node',
             '--initialize and --check-config require --action node; do not combine them with build/prepare actions')
+    require(not args.strict_pin or args.check_delivery,'--strict-pin requires --check-delivery')
     if args.check_delivery or args.check_source:
-        result=(check_delivery if args.check_delivery else check_source)(root)
+        result=(check_delivery if args.strict_pin else check_source)(root)
         print(json.dumps(result,indent=2))
         return 0 if result['status']=='PASS' else 1
     if args.transport_sweep:
