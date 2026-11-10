@@ -332,6 +332,20 @@ print(json.dumps(value))'''
         ['python3','-c',code,str(remote_config)],options=ssh_options),text=True,timeout=120))
 
 
+def peer_session_differences(current,peer,active_software):
+    """Report non-secret compatibility evidence; never mutate a live session."""
+    differences={}
+    for field in ('controller','profile'):
+        if current.get(field)!=peer.get(field):
+            differences[field]=dict(local_init=current.get(field),peer_init=peer.get(field))
+    local=current.get('software',{}); remote=peer.get('software',{})
+    for name in sorted(set(local)|set(remote)|set(active_software)):
+        if not (local.get(name)==remote.get(name)==active_software.get(name)):
+            differences['software:'+name]=dict(local_init=local.get(name),
+                peer_init=remote.get(name),local_checkout=active_software.get(name))
+    return differences
+
+
 def bind_peer(path,args,ssh_options):
     """Bind two fresh LOCAL initializations; never replace a live credential."""
     import callosum_benchmark_prepare as preparation
@@ -346,9 +360,11 @@ def bind_peer(path,args,ssh_options):
             'peer is not the configured OTHER physical node')
     require(bundle['topology']==json.loads(topology.read_text()),'approved peer topology differs; no extent is changed')
     session=bundle['session']; current=spec['fresh_session']
-    require(session['controller']==current['controller'] and session['software']==current['software'] and
-            session['software']==preparation.software() and session['profile']==current['profile'],
-            'peer source/profile/controller differs; synchronize inputs and rerun init where needed')
+    differences=peer_session_differences(current,session,preparation.software())
+    require(not differences,'peer source/profile/controller differs: '+json.dumps(differences,sort_keys=True)+
+            '; local_config='+str(Path(path).resolve())+'; peer_config='+str(remote_config)+
+            '. No handoff performed. Preserve running campaigns; inspect/drain before replacing live services. '
+            'A source update does not refresh init snapshots or running processes.')
     require(0<=time.time_ns()-session['created_unix_ns']<24*3600*10**9,
             'peer init is older than 24 hours or its clock is ahead; inspect clocks before a new init')
     started=(receipt/'topology.json').exists() or (receipt/'control.token').exists()

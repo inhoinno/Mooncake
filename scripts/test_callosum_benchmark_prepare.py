@@ -20,6 +20,17 @@ import test_callosum_write_matrix as matrix_tests
 
 
 class PreparationTest(unittest.TestCase):
+    def test_peer_session_reports_init_checkout_and_profile_differences_without_secrets(self):
+        local=dict(controller='a1',profile=dict(sizes=[1,2]),software={'launcher.py':'old'})
+        peer=dict(controller='a1',profile=dict(sizes=[1,4]),software={'launcher.py':'new'})
+        result=matrix.peer_session_differences(local,peer,{'launcher.py':'new'})
+        self.assertEqual(set(result),{'profile','software:launcher.py'})
+        self.assertEqual(result['software:launcher.py'],
+            dict(local_init='old',peer_init='new',local_checkout='new'))
+        self.assertEqual(matrix.peer_session_differences(peer,peer,peer['software']),{})
+        peer['controller']='other'
+        self.assertIn('controller',matrix.peer_session_differences(local,peer,peer['software']))
+
     def test_skip_build_init_reuses_exact_local_receipt_and_creates_new_sessions(self):
         import callosum_lab as lab
         with tempfile.TemporaryDirectory() as directory:
@@ -185,16 +196,22 @@ class PreparationTest(unittest.TestCase):
                     active=(root/'peer-matrix.json').read_bytes()
                     token=Path(second['token_file']).read_bytes()
                     (peer.run_dir/'control.token').write_bytes(token)
-                    for mutation in ('same_host','wrong_node','topology','profile','session','token'):
+                    for mutation in ('same_host','wrong_node','topology','profile','software','session','token'):
                         bad=json.loads(json.dumps(bundle))
                         if mutation=='same_host': bad['machine_id']='machine-b1'
                         elif mutation=='wrong_node': bad['workflow']['node']='b1'
                         elif mutation=='topology': bad['topology']['pools']['A']['owner']='someone-else'
                         elif mutation=='profile': bad['session']['profile']['sizes']=[999]
+                        elif mutation=='software': bad['session']['software']['callosum_write_matrix.py']='different-checkout'
                         elif mutation=='session': bad['session']['id']='different-session'
                         elif mutation=='token': bad['token']='wrong-token-'*5
                         with self.subTest(mutation=mutation),patch.object(matrix,'peer_inputs',return_value=bad):
-                            with self.assertRaises(RuntimeError): matrix.bind_peer(root/'peer-matrix.json',args,())
+                            with self.assertRaises(RuntimeError) as failure:
+                                matrix.bind_peer(root/'peer-matrix.json',args,())
+                            if mutation=='software':
+                                self.assertIn('software:callosum_write_matrix.py',str(failure.exception))
+                                self.assertIn('local_init',str(failure.exception))
+                                self.assertNotIn(token.decode().strip(),str(failure.exception))
                         self.assertEqual((root/'peer-matrix.json').read_bytes(),active)
                         self.assertEqual(Path(second['token_file']).read_bytes(),token)
                 self.assertEqual(first['fresh_session'],second['fresh_session'])
