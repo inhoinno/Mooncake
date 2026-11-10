@@ -156,6 +156,43 @@ class PreparationTest(unittest.TestCase):
                 self.assertEqual(second['runtimes']['b1']['setup_run'],str(root/'peer'))
             finally: leader.log.close(); peer.log.close()
 
+    def test_saved_profile_ignores_inherited_defaults_but_rejects_explicit_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target=Path(directory)/'matrix.json'
+            profile=dict(sizes=[1,2],unit='MB',repetitions=1,
+                         backings=['local_numa','cxl'],page_modes=['native'])
+            target.write_text(json.dumps(dict(fresh_session=dict(profile=profile))))
+            for action in ('prepare','run'):
+                for sizes,unit in [('1 2 4 8 16 32 64 128','MiB'),('not a size','invalid-unit')]:
+                    with self.subTest(action=action,sizes=sizes),patch.dict(os.environ,IO_SIZES=sizes,IO_UNIT=unit):
+                        args=SimpleNamespace(action=action,config=str(target),**{key:None for key in profile})
+                        matrix.apply_session_profile(args)
+                        self.assertEqual({key:getattr(args,key) for key in profile},profile)
+                        for field,value in [('sizes',[4]),('unit','MiB')]:
+                            changed=SimpleNamespace(action=action,config=str(target),**{key:None for key in profile})
+                            setattr(changed,field,value)
+                            with self.assertRaisesRegex(RuntimeError,field+' differs from init'):
+                                matrix.apply_session_profile(changed)
+
+    def test_init_cli_environment_and_legacy_default_precedence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target=Path(directory)/'matrix.json'
+            profile=dict(sizes=[1,2],unit='MB',repetitions=1,
+                         backings=['local_numa','cxl'],page_modes=['native'])
+            # Even an old config must not supply defaults to a new init.
+            target.write_text(json.dumps(dict(fresh_session=dict(profile=profile))))
+            with patch.dict(os.environ,IO_SIZES='4 8',IO_UNIT='MiB'):
+                args=SimpleNamespace(action='init',config=str(target),**{key:None for key in profile})
+                matrix.apply_session_profile(args)
+                self.assertEqual((args.sizes,args.unit),([4,8],'MiB'))
+                cli=SimpleNamespace(action='init',config=str(target),**dict(profile,sizes=[16],unit='MB'))
+                matrix.apply_session_profile(cli)
+                self.assertEqual((cli.sizes,cli.unit),([16],'MB'))
+                target.write_text(json.dumps(dict(schema_version=1)))
+                legacy=SimpleNamespace(action='run',config=str(target),**{key:None for key in profile})
+                matrix.apply_session_profile(legacy)
+                self.assertEqual((legacy.sizes,legacy.unit),([4,8],'MiB'))
+
     def test_three_manual_stages_with_real_file_handoff_and_node_selected_run(self):
         """T0 workflow: real files/SSH export programs; mocked builds/RPC/engines.
 
@@ -239,6 +276,7 @@ class PreparationTest(unittest.TestCase):
                     self.assertEqual(json.loads((work/'prepare.json').read_text())['status'],'PREPARED_NOT_TESTED')
                     context.node=node
                     with patch.object(sys,'argv',['matrix','run','--config',str(path),'--node',node]), \
+                         patch.dict(os.environ,IO_SIZES='1 2 4 8 16 32 64 128',IO_UNIT='MiB'), \
                          patch.object(matrix,'receive',side_effect=selected('receiver')), \
                          patch.object(matrix,'run',side_effect=selected('sender')), \
                          patch.object(matrix,'receiver_health',return_value={}), \

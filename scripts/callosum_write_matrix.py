@@ -497,9 +497,13 @@ def apply_session_profile(args):
         profile=spec.get('fresh_session',{}).get('profile',{})
     defaults=dict(sizes=[1,2,4,8,16,32,64,128],unit='MB',repetitions=3,
                   backings=['local_numa','cxl'],page_modes=['native','huge2MB'])
-    if args.sizes is None and 'IO_SIZES' in os.environ:
-        args.sizes=[int(n) for n in os.environ['IO_SIZES'].split()]
-    if args.unit is None and 'IO_UNIT' in os.environ: args.unit=os.environ['IO_UNIT']
+    # IO_* supplies initialization defaults, not a second mutable profile.
+    # Build/CTest children inherit the operator's environment too. Once a session
+    # exists, only explicit CLI options may be compared with its fixed profile.
+    if not profile:
+        if args.sizes is None and 'IO_SIZES' in os.environ:
+            args.sizes=[int(n) for n in os.environ['IO_SIZES'].split()]
+        if args.unit is None and 'IO_UNIT' in os.environ: args.unit=os.environ['IO_UNIT']
     for key,default in defaults.items():
         value=getattr(args,key)
         if value is not None and profile:
