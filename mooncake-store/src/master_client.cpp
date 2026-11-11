@@ -258,6 +258,11 @@ struct RpcNameTraits<&WrappedMasterService::CopyStart> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ValidateCopyTarget> {
+    static constexpr const char* value = "ValidateCopyTarget";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CopyEnd> {
     static constexpr const char* value = "CopyEnd";
 };
