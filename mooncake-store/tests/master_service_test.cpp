@@ -2819,11 +2819,21 @@ TEST_F(MasterServiceTest, CallosumLookupAuthorizePublishRequery) {
     EXPECT_EQ(ReplicaReferencesForTest(service,key,copy->source.id), *before_pin+1);
     const auto& target = copy->targets[0];
     const auto& buffer = target.get_memory_descriptor().buffer_descriptor;
-    EXPECT_EQ(target.status, ReplicaStatus::PROCESSING);
-    EXPECT_TRUE(service.ValidateCopyTarget(receiver, key, TenantId::Default(), dst_segment.name,
-        copy->source.id, target.id, buffer.buffer_address_, bytes).has_value());
-    EXPECT_FALSE(service.ValidateCopyTarget(receiver,key,TenantId::Default(),dst_segment.name,
-        copy->source.id,target.id,buffer.buffer_address_+1,bytes).has_value());
+    ASSERT_EQ(target.status, ReplicaStatus::PROCESSING);
+    ASSERT_EQ(buffer.protocol_, "rdma");
+    const auto authorize = [&](const UUID& client, uint64_t address) {
+        return service.ValidateCopyTarget(
+            client, key, TenantId::Default(), dst_segment.name, copy->source.id,
+            target.id, address, bytes);
+    };
+    const auto authorized = authorize(receiver, buffer.buffer_address_);
+    ASSERT_TRUE(authorized.has_value()) << toString(authorized.error());
+    const auto wrong_address = authorize(receiver, buffer.buffer_address_ + 1);
+    ASSERT_FALSE(wrong_address.has_value());
+    EXPECT_EQ(wrong_address.error(), ErrorCode::INVALID_PARAMS);
+    const auto wrong_owner = authorize(sender, buffer.buffer_address_);
+    ASSERT_FALSE(wrong_owner.has_value());
+    EXPECT_EQ(wrong_owner.error(), ErrorCode::ILLEGAL_CLIENT);
     // An allocated/authorized target is not a discoverable complete replica.
     auto pending = service.GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(pending.has_value());
@@ -2836,7 +2846,11 @@ TEST_F(MasterServiceTest, CallosumLookupAuthorizePublishRequery) {
     EXPECT_TRUE(std::all_of(published->replicas.begin(), published->replicas.end(),
         [](const auto& replica) { return replica.status == ReplicaStatus::COMPLETE; }));
     EXPECT_TRUE(std::any_of(published->replicas.begin(), published->replicas.end(),
-        [&](const auto& replica) { return replica.id == target.id; }));
+        [&](const auto& replica) {
+            return replica.id == target.id &&
+                   replica.get_memory_descriptor().buffer_descriptor.protocol_ ==
+                       "rdma";
+        }));
     EXPECT_FALSE(service.CopyEnd(sender,key,TenantId::Default()).has_value());
     const auto repeated=service.GetReplicaList(key,TenantId::Default());
     ASSERT_TRUE(repeated.has_value());

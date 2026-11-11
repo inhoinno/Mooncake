@@ -5186,6 +5186,9 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
             }
             replicas.push_back(std::move(*replica));
         }
+        // Copy targets use the mounted transport, just as PutStart replicas do.
+        // A default TCP descriptor cannot authorize a receiver's RDMA target.
+        ApplyMountedSegmentProtocols(allocator_manager, replicas);
     }
 
     CopyStartResponse response;
