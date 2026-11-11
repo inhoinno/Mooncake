@@ -21,6 +21,8 @@ import subprocess
 import secrets
 import uuid
 
+EXTENT_CONFIRMATION_REQUIRED = 'operator_confirmation_required_at_run'
+
 
 def require(condition, message):
     if not condition:
@@ -181,20 +183,21 @@ def initialize(args):
                 (Path('/sys/class/infiniband') / hca).is_dir(), f'RDMA device {hca} not found')
         _, device_size, align = dax_geometry(Path(b['path']))
         digest = native_store_hash()
-        print(f'Node {args.node}: {b["path"]} size={device_size} alignment={align} bytes', file=sys.stderr)
-        offset = int(input('Approved DAX offset (bytes): ').strip())
-        size = int(input('Approved DAX extent size (bytes): ').strip())
-        owner = input('Exclusive extent owner and approval reference: ').strip()
-        physical_id = input('Physical pool inventory ID: ').strip()
-        require(align > 0 and offset >= 0 and size >= 4 * c['block_bytes'] and
-                offset % align == 0 and size % align == 0 and offset + size <= device_size,
-                'approved DAX extent is too small, unaligned, or outside the device')
-        require(owner and physical_id, 'extent approval and physical pool ID are required')
+        offset, size = b['mapping_offset'], b['capacity']
+        owned_offset, owned_size = b['owned_offset'], b['owned_size']
+        require(all(type(v) is int for v in (offset, size, owned_offset, owned_size, b['alignment'])) and
+                align > 0 and b['alignment'] >= align and b['alignment'] % align == 0 and
+                offset >= 0 and size > 0 and owned_offset >= 0 and
+                owned_size >= 4 * c['block_bytes'] and owned_offset + owned_size <= size and
+                all(v % b['alignment'] == 0 for v in (offset, size, owned_offset, owned_size)) and
+                offset + size <= device_size,
+                f'{b["path"]}: configured range is too small, unaligned, or outside device; '
+                f'device size={device_size}, device alignment={align}')
         node.update(store_module='store', expected_store_sha256=digest,
-                    extent_authorization=owner, physical_pool_id=physical_id)
-        b.update(capacity=size, mapping_offset=offset, alignment=align, owned_offset=0, owned_size=size)
+                    extent_authorization=EXTENT_CONFIRMATION_REQUIRED)
         write_json(out, dict(node=args.node, template_sha256=template_sha, config=node))
-        return dict(status='NODE_INPUT_SAVED', node=args.node, path=str(out), devices_mapped=False)
+        return dict(status='NODE_INPUT_SAVED', node=args.node, path=str(out), device=b['path'],
+                    mapping_offset=offset, capacity=size, alignment=b['alignment'], devices_mapped=False)
 
     require(args.config and len(args.node_input) == 2, 'assembly requires --config and two --node-input files')
     out = Path(args.config).resolve()
@@ -202,11 +205,9 @@ def initialize(args):
     receipts = [json.loads(Path(p).read_text()) for p in args.node_input]
     require(all(r['template_sha256'] == template_sha for r in receipts) and
             {r['node'] for r in receipts} == set(c['nodes']), 'node inputs must match the same template and cover both nodes')
-    require(len({r['config']['physical_pool_id'] for r in receipts}) == 2 and
-            all(r['config']['physical_pool_id'] for r in receipts), 'distinct physical pool inventory IDs are required')
     c['nodes'] = {r['node']: r['config'] for r in receipts}
     c['run_id'] = uuid.uuid4().hex
-    c['master_address'] = args.master_address or input('Approved native master IPv4:port: ').strip()
+    c['master_address'] = args.master_address or c['master_address']
     validate_config(json.loads(json.dumps(c)), out)
     tokens = {node['bridge']['token_file'] for node in c['nodes'].values()}
     require(len(tokens) == 1, 'both nodes must use the same token file')
@@ -472,7 +473,9 @@ def main(argv=None):
     p.add_argument('--node')
     p.add_argument('--template', help='init: shared experiment template')
     p.add_argument('--node-input', action='append', default=[], help='init: one receipt per node')
-    p.add_argument('--master-address', help='init: approved native master IPv4:port; prompt if omitted')
+    p.add_argument('--master-address', help='init: override the template master IPv4:port')
+    p.add_argument('--confirm-exclusive-extent', action='store_true',
+                   help='run: confirm both pools are physically independent and this node owns the approved, drained test extent')
     p.add_argument('--output', help='new evidence directory; default runs/store-<run_id>/<node or action>')
     p.add_argument('--prepare-resources', action='store_true', help='check: scoped sudo DAX ACL/current-process memlock preparation')
     for name in ('source-receipt', 'requester-receipt', 'source-log', 'requester-log'):
@@ -493,6 +496,13 @@ def main(argv=None):
         require(os.geteuid() != 0, 'run as the benchmark account, not sudo; no output created')
         if args.action != 'verify':
             require(args.node in c['nodes'], 'select a configured --node')
+            if args.action == 'run':
+                if c['nodes'][args.node]['extent_authorization'] == EXTENT_CONFIRMATION_REQUIRED:
+                    require(args.confirm_exclusive_extent,
+                            'confirm the configured DAX range is approved and free of other writers or uncertain DMA with --confirm-exclusive-extent')
+                else:
+                    require(os.environ.get('CALLOSUM_DESTRUCTIVE_ACK') == '1',
+                            'CALLOSUM_DESTRUCTIVE_ACK=1 required after exclusive extent authorization')
         else:
             require(args.node is None, 'verify combines both node receipts; do not pass --node')
         leaf = args.node if args.action == 'run' else args.action + ('-'+args.node if args.node else '')
@@ -532,12 +542,10 @@ def main(argv=None):
         evidence = dict(node=args.node, run_id=c['run_id'], config_sha256=c['config_sha256'],
                         store_module=str(native), store_sha256=digest, platform=sys.platform,
                         rdma_device=node['rdma_device'],
+                        operator_extent_confirmation=args.action == 'run' and args.confirm_exclusive_extent,
                         transport_env={name:os.environ.get(name,'default') for name in
                                        ('MC_NUM_QP_PER_EP','MC_GID_INDEX','MC_MTU')})
         write_json(out / 'preflight.json', evidence)
-        if args.action == 'run':
-            require(os.environ.get('CALLOSUM_DESTRUCTIVE_ACK') == '1',
-                    'CALLOSUM_DESTRUCTIVE_ACK=1 required after exclusive extent authorization; ACK is not ownership proof')
         stage = 'local-resource-preparation'
         prepare_resources(b, c['block_bytes'], out, authorize=args.prepare_resources or args.action == 'run')
         if args.action == 'check':

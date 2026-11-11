@@ -93,7 +93,8 @@ class ProbeTest(unittest.TestCase):
         template = copy.deepcopy(self.config)
         for node in template['nodes'].values():
             node['expected_store_sha256'] = None
-            node['bridge']['token_file'] = 'store-proof.control.token'
+            node['bridge'].update(token_file='store-proof.control.token', capacity=8 << 30,
+                                  owned_size=8 << 30, mapping_offset=2 << 30)
         probe.write_json(self.root / 'template.json', template)
         base = ['init', '--template', str(self.root / 'template.json')]
         receipts = []
@@ -105,20 +106,21 @@ class ProbeTest(unittest.TestCase):
                  patch.object(Path, 'is_dir', return_value=True), \
                  patch.object(probe.subprocess, 'check_output',
                               return_value=json.dumps([{'addr_info': [{'local': address}]}])), \
-                 patch.object(probe, 'dax_geometry', return_value=(None, 128 << 20, 2 << 20)), \
+                 patch.object(probe, 'dax_geometry', return_value=(None, 128 << 30, 2 << 20)), \
                  patch.object(probe, 'native_store_hash', return_value=digest), \
-                 patch('builtins.input', side_effect=['2097152', '67108864', 'approved fixture', node_id]):
+                 patch('builtins.input', side_effect=AssertionError('init must not prompt')):
                 self.assertEqual(probe.main([*base, '--node', node_id, '--output', str(receipt)]), 0)
             receipts += ['--node-input', str(receipt)]
         output = self.root / 'generated.json'
         token = self.root / 'store-proof.control.token'
         args = [*base, *receipts, '--config', str(output)]
         with patch.object(probe.os, 'geteuid', return_value=123), \
-             patch.object(probe, 'private_token', wraps=lambda p: self.assertEqual(p, token)):
+             patch.object(probe, 'private_token', wraps=lambda p: self.assertEqual(p, token)), \
+             patch('builtins.input', side_effect=AssertionError('init must not prompt')):
             self.assertEqual(probe.main([*args, '--master-address', '192.0.2.1']), 1)
             self.assertFalse(token.exists())
             self.assertFalse(output.exists())
-            self.assertEqual(probe.main([*args, '--master-address', '192.0.2.1:50051']), 0)
+            self.assertEqual(probe.main(args), 0)
             original_token = token.read_bytes()
             original_config = output.read_bytes()
             self.assertEqual(probe.main([*args, '--master-address', '192.0.2.1:50051']), 1)
@@ -129,9 +131,17 @@ class ProbeTest(unittest.TestCase):
         c = probe.load_config(output)
         self.assertEqual(c['nodes']['receiver']['expected_store_sha256'], 'b' * 64)
         self.assertEqual(c['nodes']['sender']['expected_store_sha256'], 'c' * 64)
-        self.assertEqual(c['nodes']['sender']['bridge']['owned_size'], 64 << 20)
-        self.assertEqual(c['nodes']['sender']['bridge']['mapping_offset'], 2 << 20)
+        self.assertEqual(c['master_address'], template['master_address'])
+        self.assertEqual(c['nodes']['sender']['bridge']['owned_size'], 8 << 30)
+        self.assertEqual(c['nodes']['sender']['bridge']['mapping_offset'], 2 << 30)
+        self.assertEqual(c['nodes']['sender']['bridge']['alignment'], 2 << 20)
         self.assertEqual(token.stat().st_mode & 0o777, 0o600)
+        evidence = self.root / 'must-not-exist'
+        with patch.object(probe.os, 'geteuid', return_value=123), \
+             patch.dict(os.environ, {'CALLOSUM_DESTRUCTIVE_ACK': '1'}):
+            self.assertEqual(probe.main(['run', '--config', str(output), '--node', 'sender',
+                                         '--output', str(evidence)]), 1)
+        self.assertFalse(evidence.exists())
 
     def test_real_probe_requester_api_sequence_and_retained_backing_on_failure(self):
         store = Store(self.c)
