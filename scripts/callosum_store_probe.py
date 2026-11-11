@@ -18,6 +18,8 @@ import sys
 import time
 import resource
 import subprocess
+import secrets
+import uuid
 
 
 def require(condition, message):
@@ -27,6 +29,7 @@ def require(condition, message):
 
 def host(endpoint):
     # The bounded two-worker probe requires numeric IPv4 endpoints.
+    require(isinstance(endpoint, str) and ':' in endpoint, 'endpoint must be an IPv4:port string')
     address, port = endpoint.rsplit(':', 1)
     ipaddress.IPv4Address(address)
     require(0 < int(port) < 65536, 'endpoint port outside 1..65535')
@@ -35,7 +38,13 @@ def host(endpoint):
 
 def load_config(path):
     path = Path(path).resolve()
-    c = json.loads(path.read_text())
+    data = path.read_bytes()
+    c = validate_config(json.loads(data), path)
+    c['config_sha256'] = hashlib.sha256(data).hexdigest()
+    return c
+
+
+def validate_config(c, path):
     require(c.get('schema_version') == 1, 'schema_version must be 1')
     require(re.fullmatch(r'[A-Za-z0-9_-]{8,80}', c.get('run_id', '')),
             'run_id must be a fresh shared identifier (8..80 characters)')
@@ -77,7 +86,6 @@ def load_config(path):
                 'expected_store_sha256 must identify the built Store module')
         b['token_file'] = str((path.parent / b['token_file']).resolve())
     require(len(pools) == 2 and len(hosts) == 2, 'two independent pool IDs and physical hosts required')
-    c['config_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
     return c
 
 
@@ -123,6 +131,98 @@ def write_json(path, value):
         stream.write('\n')
 
 
+def dax_geometry(device, sysroot=Path('/sys')):
+    info = device.lstat()
+    require(device.parent == Path('/dev') and re.fullmatch(r'dax[0-9]+\.[0-9]+', device.name) and
+            stat.S_ISCHR(info.st_mode), 'expected a direct DAX character-device path')
+    geometry = sysroot / 'bus/dax/devices' / device.name
+    return info, int((geometry / 'size').read_text().strip(), 0), int((geometry / 'align').read_text().strip(), 0)
+
+
+def native_store_hash():
+    module = importlib.import_module('store')
+    require(getattr(module, 'CALLOSUM_STORE_ABI', None) == 1 and
+            getattr(module, 'CALLOSUM_STORE_MUX_ABI', None) == 1,
+            'Store binding lacks Store ABI=1 / native mux ABI=1')
+    native = Path(module.__file__).resolve()
+    build = Path(sys.executable).absolute().parent.parent.parent
+    require(native.parent == (build / 'mooncake-integration').resolve(),
+            f'expected the Store module from the interpreter\'s build tree, got {native}')
+    return hashlib.sha256(native.read_bytes()).hexdigest()
+
+
+def private_token(path):
+    info = path.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and
+            info.st_mode & 0o077 == 0 and len(path.read_bytes().strip()) >= 32,
+            'private owned shared token file (>=32 characters) required')
+
+
+def initialize(args):
+    """Collect one read-only host receipt, or assemble both receipts on M2."""
+    require(args.template, 'init requires --template')
+    require(os.geteuid() != 0, 'init must run as the benchmark account')
+    raw = Path(args.template).read_bytes()
+    c = json.loads(raw)
+    template_sha = hashlib.sha256(raw).hexdigest()
+    if args.node:
+        require(args.node in c['nodes'] and not args.node_input, 'select one template node')
+        out = Path(args.output or f'store-proof.{args.node}.json').resolve()
+        require(not os.path.lexists(out), f'{out} exists; preserve it or choose a new --output')
+        node = c['nodes'][args.node]
+        b = node['bridge']
+        require(sys.platform.startswith('linux'), 'node init requires the Linux lab host')
+        address = host(node['local_hostname'])
+        links = json.loads(subprocess.check_output(['ip', '-j', '-4', 'address', 'show'], text=True))
+        require(any(a['local'] == address for link in links for a in link.get('addr_info', [])),
+                f'{address} is not a local IPv4 address for {args.node}')
+        hca = node['rdma_device']
+        require(re.fullmatch(r'[A-Za-z0-9_.-]+', hca) and hca not in ('.', '..') and
+                (Path('/sys/class/infiniband') / hca).is_dir(), f'RDMA device {hca} not found')
+        _, device_size, align = dax_geometry(Path(b['path']))
+        digest = native_store_hash()
+        print(f'Node {args.node}: {b["path"]} size={device_size} alignment={align} bytes', file=sys.stderr)
+        offset = int(input('Approved DAX offset (bytes): ').strip())
+        size = int(input('Approved DAX extent size (bytes): ').strip())
+        owner = input('Exclusive extent owner and approval reference: ').strip()
+        physical_id = input('Physical pool inventory ID: ').strip()
+        require(align > 0 and offset >= 0 and size >= 4 * c['block_bytes'] and
+                offset % align == 0 and size % align == 0 and offset + size <= device_size,
+                'approved DAX extent is too small, unaligned, or outside the device')
+        require(owner and physical_id, 'extent approval and physical pool ID are required')
+        node.update(store_module='store', expected_store_sha256=digest,
+                    extent_authorization=owner, physical_pool_id=physical_id)
+        b.update(capacity=size, mapping_offset=offset, alignment=align, owned_offset=0, owned_size=size)
+        write_json(out, dict(node=args.node, template_sha256=template_sha, config=node))
+        return dict(status='NODE_INPUT_SAVED', node=args.node, path=str(out), devices_mapped=False)
+
+    require(args.config and len(args.node_input) == 2, 'assembly requires --config and two --node-input files')
+    out = Path(args.config).resolve()
+    require(not os.path.lexists(out), f'{out} exists; preserve it or choose a new --config path')
+    receipts = [json.loads(Path(p).read_text()) for p in args.node_input]
+    require(all(r['template_sha256'] == template_sha for r in receipts) and
+            {r['node'] for r in receipts} == set(c['nodes']), 'node inputs must match the same template and cover both nodes')
+    require(len({r['config']['physical_pool_id'] for r in receipts}) == 2 and
+            all(r['config']['physical_pool_id'] for r in receipts), 'distinct physical pool inventory IDs are required')
+    c['nodes'] = {r['node']: r['config'] for r in receipts}
+    c['run_id'] = uuid.uuid4().hex
+    c['master_address'] = args.master_address or input('Approved native master IPv4:port: ').strip()
+    validate_config(json.loads(json.dumps(c)), out)
+    tokens = {node['bridge']['token_file'] for node in c['nodes'].values()}
+    require(len(tokens) == 1, 'both nodes must use the same token file')
+    token = out.parent / tokens.pop()
+    require(token.parent == out.parent and token.name == 'store-proof.control.token',
+            'init requires the dedicated store-proof.control.token beside the config')
+    if not os.path.lexists(token):
+        fd = os.open(token, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(secrets.token_hex(32) + '\n')
+    private_token(token)
+    write_json(out, c)
+    return dict(status='CONFIG_SAVED', config=str(out), token_file=str(token),
+                run_id=c['run_id'], devices_mapped=False)
+
+
 def prepare_resources(bridge, block_bytes, output, authorize=False, sysroot=Path('/sys')):
     """Reuse the benchmark ACL policy; elevate only ACL/prlimit commands.
 
@@ -142,12 +242,7 @@ def prepare_resources(bridge, block_bytes, output, authorize=False, sysroot=Path
             subprocess.run(['sudo', '-v'], check=True)
             authenticated = True
     try:
-        info = device.lstat()
-        require(device.parent == Path('/dev') and re.fullmatch(r'dax[0-9]+\.[0-9]+', device.name) and
-                stat.S_ISCHR(info.st_mode), 'resource preparation requires a direct DAX character-device path')
-        geometry = sysroot / 'bus/dax/devices' / device.name
-        size = int((geometry / 'size').read_text().strip(), 0)
-        alignment = int((geometry / 'align').read_text().strip(), 0)
+        info, size, alignment = dax_geometry(device, sysroot)
         require(bridge['mapping_offset'] + bridge['capacity'] <= size and
                 bridge['mapping_offset'] % alignment == 0 and bridge['capacity'] % alignment == 0,
                 'approved mapping exceeds device geometry or alignment')
@@ -372,9 +467,12 @@ def verify(c, source_receipt, requester_receipt, source_log, requester_log):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action', choices=['check', 'run', 'verify'])
-    p.add_argument('--config', required=True)
+    p.add_argument('action', choices=['init', 'check', 'run', 'verify'])
+    p.add_argument('--config')
     p.add_argument('--node')
+    p.add_argument('--template', help='init: shared experiment template')
+    p.add_argument('--node-input', action='append', default=[], help='init: one receipt per node')
+    p.add_argument('--master-address', help='init: approved native master IPv4:port; prompt if omitted')
     p.add_argument('--output', help='new evidence directory; default runs/store-<run_id>/<node or action>')
     p.add_argument('--prepare-resources', action='store_true', help='check: scoped sudo DAX ACL/current-process memlock preparation')
     for name in ('source-receipt', 'requester-receipt', 'source-log', 'requester-log'):
@@ -386,6 +484,11 @@ def main(argv=None):
     created = False
     stage = 'configuration'
     try:
+        if args.action == 'init':
+            stage = 'configuration-initialization'
+            print(json.dumps(initialize(args), indent=2))
+            return 0
+        require(args.config, '--config is required')
         c = load_config(args.config)
         require(os.geteuid() != 0, 'run as the benchmark account, not sudo; no output created')
         if args.action != 'verify':
@@ -413,10 +516,7 @@ def main(argv=None):
         require(sys.platform.startswith('linux'), 'real Store/RDMA probe requires Linux; no file-mode substitution')
         b = dict(node['bridge'])
         token = Path(b['token_file'])
-        info = token.stat()
-        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and
-                info.st_mode & 0o077 == 0 and len(token.read_bytes().strip()) >= 32,
-                'private owned shared token file (>=32 characters) required')
+        private_token(token)
         require(stat.S_ISCHR(Path(b['path']).stat().st_mode), 'local DAX path is not a character device')
         require('MC_CXL_DEV_PATH' not in os.environ, 'unset incompatible MC_CXL_DEV_PATH')
         require(not any(n in os.environ for n in ('MC_USE_TENT','MC_USE_TEV1')),
@@ -468,7 +568,7 @@ def main(argv=None):
     except Exception as error:
         failure = dict(status='FAIL', stage=stage, error=str(error), store_object_created=store is not None,
                        action='No automatic reclaim. Retain native owners if setup or a WRITE may have started.'
-                       if store is not None else 'Correct inputs and rerun with a new evidence directory.')
+                       if store is not None else 'Correct inputs and rerun; preserve existing files and evidence.')
         if created and (out / 'resources.json').exists():
             failure['resource_preparation'] = json.loads((out / 'resources.json').read_text())
         if created and not (out / 'failure.json').exists():
