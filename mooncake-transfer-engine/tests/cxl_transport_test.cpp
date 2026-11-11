@@ -18,6 +18,9 @@
 #include <sys/time.h>
 
 #include <cstdlib>
+#include <algorithm>
+#include <cstring>
+#include <iostream>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -26,6 +29,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <thread>
 
 #ifdef USE_CUDA
 #include <cuda_runtime_api.h>
@@ -62,6 +67,11 @@ DEFINE_string(protocol, "cxl", "Transfer protocol: rdma|tcp|cxl");
 DEFINE_string(device_name, "tmp_dax_sim", "Device name for cxl");
 
 DEFINE_int64(device_size, 1073741824, "Device Size for cxl");
+DEFINE_bool(devdax_gpu_read_ack, false,
+            "Enable the read-only real-devdax GPU case after obtaining a stable source lease");
+DEFINE_string(devdax_gpu_read_owner, "", "Approved source extent/lease owner reference");
+DEFINE_uint64(devdax_gpu_read_offset, 0, "Source offset relative to the configured CXL mapping");
+DEFINE_uint64(devdax_gpu_read_bytes, 4096, "Read-only source bytes (1..64 MiB)");
 
 static void* allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
@@ -94,7 +104,12 @@ class CXLTransportTest : public ::testing::Test {
         google::InitGoogleLogging("CXLTransportTest");
         FLAGS_logtostderr = 1;
 
-        tmp_fd = open(FLAGS_device_name.c_str(), O_RDWR | O_CREAT, 0666);
+        struct stat backing {};
+        if (lstat(FLAGS_device_name.c_str(), &backing) == 0) {
+            ASSERT_TRUE(S_ISREG(backing.st_mode))
+                << "File fixture refuses devices/symlinks; use CXLDevDaxGpuTest for DAX";
+        }
+        tmp_fd = open(FLAGS_device_name.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW, 0666);
         ASSERT_GE(tmp_fd, 0);
         ASSERT_EQ(ftruncate(tmp_fd, FLAGS_device_size), 0);
 
@@ -295,6 +310,83 @@ TEST_F(CXLTransportTest, MultipleRead) {
 }
 
 #ifdef USE_CUDA
+// Separate fixture: the file fixture above creates, truncates and unlinks its
+// backing. Never route a DAX path through that fixture.
+TEST(CXLDevDaxGpuTest, FunctionalReadToGpu) {
+    if (!FLAGS_devdax_gpu_read_ack) {
+        GTEST_SKIP() << "Explicit devdax source read lease and acknowledgement required";
+    }
+    ASSERT_FALSE(FLAGS_devdax_gpu_read_owner.empty());
+    const char* kind = std::getenv("MC_CXL_BACKEND_KIND");
+    const char* path = std::getenv("MC_CXL_DEV_PATH");
+    ASSERT_NE(kind, nullptr);
+    ASSERT_STREQ(kind, "devdax");
+    ASSERT_NE(path, nullptr);
+    struct stat info {};
+    ASSERT_EQ(stat(path, &info), 0);
+    ASSERT_TRUE(S_ISCHR(info.st_mode));
+    ASSERT_GT(FLAGS_devdax_gpu_read_bytes, 0);
+    ASSERT_LE(FLAGS_devdax_gpu_read_bytes, 64 * 1024 * 1024);
+    int devices = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&devices), cudaSuccess);
+    ASSERT_GT(devices, 0);
+
+    TransferEngine engine(false);
+    const auto endpoint = parseHostNameWithPort(FLAGS_local_server_name);
+    ASSERT_EQ(engine.init(FLAGS_metadata_server, FLAGS_local_server_name,
+                          endpoint.first, endpoint.second), 0);
+    void* arguments[2] = {nullptr, nullptr};
+    auto* transport = engine.installTransport("cxl", arguments);
+    ASSERT_NE(transport, nullptr);
+    auto* cxl = dynamic_cast<CxlTransport*>(transport);
+    ASSERT_NE(cxl, nullptr);
+    const auto capacity = cxl->getCxlDeviceSize();
+    const auto offset = FLAGS_devdax_gpu_read_offset;
+    const auto length = FLAGS_devdax_gpu_read_bytes;
+    ASSERT_LE(offset, capacity);
+    ASSERT_LE(length, capacity - offset);
+    auto* source = static_cast<uint8_t*>(cxl->getCxlBaseAddr()) + offset;
+    std::vector<uint8_t> expected(source, source + length);
+    ASSERT_TRUE(std::any_of(expected.begin(), expected.end(),
+                            [](uint8_t byte) { return byte != 0; }))
+        << "Use a stable nonzero source; the test never seeds or writes DAX";
+    ASSERT_EQ(engine.registerLocalMemory(source, length), 0);
+    const auto segment = engine.openSegment(FLAGS_local_server_name.c_str());
+    ASSERT_NE(engine.getMetadata()->getSegmentDescByID(segment), nullptr);
+    void* gpu = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu, length), cudaSuccess);
+    ASSERT_EQ(cudaMemset(gpu, 0, length), cudaSuccess);
+    const auto batch = transport->allocateBatchID(1);
+    TransferRequest request{.opcode = TransferRequest::READ,
+                            .source = gpu,
+                            .target_id = segment,
+                            .target_offset = offset,
+                            .length = length};
+    // A submit/status error may leave a CUDA copy active. Retain this stack,
+    // engine and GPU allocation instead of freeing on an uncertain deadline.
+    bool failed = !engine.submitTransfer(batch, {request}).ok();
+    if (failed) ADD_FAILURE() << "Submission failed; retain source/GPU lifetime until completion";
+    while (true) {
+        TransferStatus status;
+        const auto result = transport->getTransferStatus(batch, 0, status);
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) break;
+        if (!failed && (!result.ok() ||
+            (status.s != TransferStatusEnum::WAITING && status.s != TransferStatusEnum::PENDING))) {
+            ADD_FAILURE() << "Completion uncertain; retain resources for operator diagnosis";
+            failed = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::vector<uint8_t> observed(length);
+    EXPECT_EQ(cudaMemcpy(observed.data(), gpu, length, cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(observed, expected);
+    EXPECT_EQ(std::memcmp(source, expected.data(), length), 0) << "Source lease changed during load";
+    EXPECT_TRUE(transport->freeBatchID(batch).ok());
+    EXPECT_EQ(cudaFree(gpu), cudaSuccess);
+    std::cout << "CXL_DEVDAX_GPU_FUNCTIONAL bytes=" << length
+              << " backend=devdax api=cudaMemcpyAsync direct_dma_proven=false\n";
+}
+
 TEST_F(CXLTransportTest, FunctionalCxlToGpuAndGpuToCxl) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {

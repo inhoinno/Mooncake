@@ -99,6 +99,10 @@ if(USE_CXL)
     set_tests_properties(
       cxl_gpu_transfer_functional_test
       PROPERTIES LABELS "cxl;gpu;multisource;t1;functional" TIMEOUT 60)
+    add_test(NAME cxl_devdax_gpu_read_functional_test
+      COMMAND cxl_transport_test --gtest_filter=CXLDevDaxGpuTest.FunctionalReadToGpu)
+    set_tests_properties(cxl_devdax_gpu_read_functional_test PROPERTIES
+      LABELS "cxl;gpu;t2;functional" TIMEOUT 0)
   endif()
 endif()
 

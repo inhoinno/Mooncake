@@ -211,6 +211,12 @@ bool RegisterCxlPoolBackendProvider(std::string_view provider_name,
                                     CxlPoolBackendProviderFactory factory,
                                     CxlPoolError* error = nullptr);
 
+// Explicit mapping-only entry point. The caller supplies the resolved config;
+// this backend never allocates or publishes objects. Store's native allocator
+// remains the only allocation authority for the mounted owned extent.
+std::shared_ptr<CxlPoolBackend> OpenMooncakeMapping(
+    CxlPoolConfig config, CxlPoolError* error = nullptr);
+
 // Opens the provider selected by MC_CXL_PROVIDER. The phase-one default is
 // "faketract" for compatibility with file/devdax testing. Selecting an
 // unavailable provider (for example "tract" before its adapter registers)

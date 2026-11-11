@@ -1164,6 +1164,11 @@ std::shared_ptr<CxlPoolBackend> OpenMooncakeMmapCxlPoolBackendFromEnvironment(
 
 }  // namespace
 
+std::shared_ptr<CxlPoolBackend> OpenMooncakeMapping(CxlPoolConfig config,
+                                                   CxlPoolError* error) {
+    return OpenMooncakeMmapCxlPoolBackend(std::move(config), error);
+}
+
 std::shared_ptr<CxlPoolBackend> OpenMmapCxlPoolBackend(CxlPoolConfig config,
                                                        CxlPoolError* error) {
     return faketract::OpenMmapCxlPoolBackend(std::move(config), error);
