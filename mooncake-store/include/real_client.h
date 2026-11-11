@@ -948,6 +948,7 @@ class RealClient : public PyClient {
     mutable std::shared_mutex registered_buffer_mutex_;
     std::unordered_map<void *, size_t> registered_buffer_sizes_;
     std::optional<WritableBufferRegion> local_buffer_region_;
+    bool callosum_enabled_{false};
 
     // KV transfer sessions (process-local; not shared with DummyClient).
     // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete

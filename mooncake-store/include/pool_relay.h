@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <stdexcept>
 
 namespace mooncake::pool_relay {
 
@@ -76,6 +77,7 @@ struct ReceiverTarget {
     std::shared_ptr<void> registration;
     std::string address_kind;
     std::string plan_id;
+    std::string generation;
 };
 
 class Receivers {
@@ -108,6 +110,10 @@ struct Plan {
     std::string source_version;
     std::vector<ReceiverTarget> targets;
     std::vector<SenderPlan> senders;
+    Extent source_extent;
+    // Mapping/backing retention is not the Store object-generation pin.
+    // Store keeps that pin until CopyEnd or a positively drained revoke.
+    std::shared_ptr<void> backing_lifetime;
 };
 
 struct Completion {
@@ -138,6 +144,38 @@ class ParallelWriters final : public Writers {
 
    private:
     Send send_;
+};
+
+class MuxFailure : public std::runtime_error {
+   public:
+    MuxFailure(const std::string& message, bool drained)
+        : std::runtime_error(message), drained(drained) {}
+    const bool drained;
+};
+
+struct MuxEvent {
+    std::string transfer_id, state;
+    uint64_t timestamp_ns = 0, queue_wait_ns = 0, dispatch_ns = 0, bytes = 0;
+};
+
+// Native FIFO admission around the existing parallel writer, not another
+// directory or allocator. The synchronous caller retains Store task ownership.
+// Unknown callbacks retain the full plan/backing until explicit recovery.
+// Not a Writers implementation: a quarantined result is not proof of drain
+// and must not enter Coordinator's release-on-return/throw contract.
+class SourceMux final {
+   public:
+    using Observer = std::function<void(const MuxEvent&)>;
+    SourceMux(ParallelWriters::Send send, size_t capacity = 2,
+              size_t queue_limit = 32, Observer observer = {});
+    ~SourceMux();
+    std::vector<Completion> executeAndDrain(const Plan& plan);
+    std::vector<MuxEvent> snapshot() const;
+    bool cancelQueued(const std::string& transfer_id);
+
+   private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 enum class Stage {

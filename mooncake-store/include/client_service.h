@@ -32,6 +32,9 @@ namespace mooncake {
 
 class PutOperation;
 class RealClient;
+class CallosumStoreBridge;
+class CxlPoolBackend;
+struct CallosumStoreConfig;
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -71,6 +74,13 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+    const std::string& GetSegmentName() const { return local_hostname_; }
+
+    void EnableCallosum(const CallosumStoreConfig& config);
+    bool ValidateCallosumTarget(const std::string& key, uint64_t source_id,
+                               uint64_t target_id, uint64_t address, uint64_t length);
+    std::vector<tl::expected<QueryResult, ErrorCode>> CallosumQuery(
+        const std::vector<std::string>& keys);
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -881,6 +891,8 @@ class Client {
 
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
+    std::unique_ptr<CallosumStoreBridge> callosum_bridge_;
+    std::shared_ptr<CxlPoolBackend> callosum_pool_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 

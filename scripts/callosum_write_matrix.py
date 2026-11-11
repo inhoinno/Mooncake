@@ -51,7 +51,7 @@ if __name__=='__main__':
 
 from callosum_lab import Runner, clean_env
 from callosum_runtime import config, require, rpc
-from callosum_transport_benchmark import block_bytes, TOTAL_BYTES
+from callosum_transport_benchmark import block_bytes, TOTAL_BYTES, ACCESS_PATTERNS, access_strategy
 from callosum_dram_benchmark import allocation_geometry, hugepage_capacity, source_identity
 from callosum_benchmark_report import write_report
 
@@ -117,10 +117,12 @@ def load(path,args):
     if 'cxl' in args.backings and args.action=='run':
         require(max(lengths)<=c.get('max_inflight_bytes',64*1024**2),
                 'CXL size exceeds live max_inflight_bytes; set the startup budget before creating the campaign')
-        required=sum(lengths)*args.repetitions*len(args.page_modes)+4096
+        rotating=getattr(args,'access_pattern','overwrite')!='overwrite' or getattr(args,'access_window_bytes',None) is not None
+        window=getattr(args,'access_window_bytes',None) or max(lengths)
+        required=(window*len(args.page_modes) if rotating else sum(lengths)*args.repetitions*len(args.page_modes))+4096
         require(required<=c['pools'][nodes[pair['receiver']]['pool']]['capacity'],
                 'CXL destination arena too small for all retained matrix windows; no reclaim is permitted')
-        require(max(lengths)*len(args.page_modes)+4096<=c['pools'][nodes[pair['source']]['pool']]['capacity'],
+        require((window if rotating else max(lengths))*len(args.page_modes)+4096<=c['pools'][nodes[pair['source']]['pool']]['capacity'],
                 'CXL source arena too small for the retained source windows')
     require(args.node in spec['runtimes'] and set(spec['runtimes'])<=set(pair.values()),
             'this node needs a host-local runtime receipt; exchange signed readiness for peer provenance')
@@ -166,6 +168,9 @@ def dram_command(spec,args,topology,receipt,private,output,mode,role,env):
         '--unit',args.unit,'--repetitions',str(args.repetitions),'--warmup-blocks','0',
         '--output',str(output),'--sizes',*[str(n) for n in args.sizes]]
     if args.node in spec['numa_nodes']: result+=['--numa-node',str(spec['numa_nodes'][args.node])]
+    if role=='sender' and (getattr(args,'access_pattern','overwrite')!='overwrite' or getattr(args,'access_window_bytes',None) is not None):
+        result+=['--access-pattern',args.access_pattern,'--random-seed',str(args.random_seed)]
+        if args.access_window_bytes is not None: result+=['--access-window-bytes',str(args.access_window_bytes)]
     return result
 
 
@@ -272,6 +277,11 @@ def run(spec,c,args,topology,receipt,private,env,out,runner):
             ['bash',relay,'status','--config',topology],env,capture=True))
         require(status.get('fingerprint')==c['fingerprint'] and status.get('topology_verified'),
                 'CXL campaign not ready or topology differs')
+        if getattr(args,'access_pattern','overwrite')!='overwrite' or getattr(args,'access_window_bytes',None) is not None:
+            require(args.access_pattern in status.get('transport_access_patterns',[]),
+                    'CXL agents/master need the access-strategy version; no silent overwrite fallback')
+            require(all(args.access_pattern in status.get('benchmark_access_patterns',{}).get(n,[])
+                        for n in spec['pair'].values()),'CXL participant lacks access-strategy support')
         if 'huge2MB' in args.page_modes:
             for member in spec['pair'].values():
                 pages=status.get('mr_pages',{}).get(member) or {}
@@ -282,7 +292,8 @@ def run(spec,c,args,topology,receipt,private,env,out,runner):
     smoke=[]
     if 'local_numa' in args.backings:
         from types import SimpleNamespace
-        small=SimpleNamespace(**dict(vars(args),sizes=[1],unit='MB',repetitions=1))
+        small=SimpleNamespace(**dict(vars(args),sizes=[1],unit='MB',repetitions=1,
+                                    access_pattern='overwrite',access_window_bytes=None))
         for mode in args.page_modes:
             destination=out/('smoke-local_numa-'+mode)
             command=dram_command(spec,small,topology,receipt,private,destination,mode,'sender',env)
@@ -311,6 +322,9 @@ def run(spec,c,args,topology,receipt,private,env,out,runner):
                     token_file=str(private),output=str(destination),pairs=[spec['pair']],schedule='serial_pairs',
                     sizes=args.sizes,unit=args.unit,repetitions=args.repetitions,
                     mr_page_mode=c.get('mr_page_mode','native'),require_dax_2m=mode=='huge2MB')
+                if getattr(args,'access_pattern','overwrite')!='overwrite' or getattr(args,'access_window_bytes',None) is not None:
+                    mini.update(access_pattern=args.access_pattern,access_window_bytes=args.access_window_bytes or
+                        max(block_bytes(n,args.unit) for n in args.sizes),random_seed=args.random_seed)
                 path=out/f'{case}-config.json'; path.write_text(json.dumps(mini,indent=2))
                 command=[env['PYTHON_BIN'],str(Path(__file__).with_name('callosum_write_mini.py')),
                          '--workers','2','--config',str(path)]
@@ -694,6 +708,9 @@ def main():
     parser.add_argument('--skip-apt',action='store_true',help='init: refuse missing OS packages instead of installing them')
     parser.add_argument('--skip-build',action='store_true',help='init: verify and reuse --setup-run or this config’s exact local build; never compile')
     parser.add_argument('--verbose',action='store_true',help='print complete readiness reports; full evidence is always saved')
+    parser.add_argument('--access-pattern',choices=ACCESS_PATTERNS,default='overwrite',help='run: WRITE offset strategy; MR/base unchanged')
+    parser.add_argument('--access-window-bytes',type=int,help='run: authorized rotating window; default maximum block size')
+    parser.add_argument('--random-seed',type=int,default=0,help='run: uniform random offset seed')
     parser.add_argument('--campaign-run',help='retire: old campaign; start-cxl: fresh campaign directory')
     parser.add_argument('--ack-exclusive-campaign',action='store_true',
                         help='retire: operator stopped canonical benchmark initiators; no unrelated/direct writers')
@@ -707,6 +724,16 @@ def main():
     try:
         benchmark_account()
         apply_session_profile(args)
+        require(args.access_window_bytes is None or args.access_window_bytes>0,'access window must be positive')
+        access_strategy('overwrite',1,1,args.random_seed)
+        require(args.action in ('run','receive') or (args.access_pattern=='overwrite' and args.access_window_bytes is None and args.random_seed==0),
+                'access-strategy options belong to run; init/prepare remain unchanged')
+        if args.access_pattern!='overwrite' or args.access_window_bytes is not None:
+            window=args.access_window_bytes or max(block_bytes(n,args.unit) for n in args.sizes)
+            for size in args.sizes: access_strategy(args.access_pattern,block_bytes(size,args.unit),window,args.random_seed)
+            if 'local_numa' in args.backings:
+                require(window<=max(block_bytes(n,args.unit) for n in args.sizes),
+                        'access window exceeds unchanged DRAM MR capacity; use a CXL-only run for larger windows')
         require(not args.create_token or args.action=='init','--create-token is only valid with init')
         require(len(set(args.backings))==len(args.backings) and len(set(args.page_modes))==len(args.page_modes),
                 'duplicate backing or page mode')
@@ -852,6 +879,7 @@ def main():
         (out/'peer-readiness.json').write_text(json.dumps(peer,indent=2))
         public=dict(spec); public['token_file']='[private file path omitted]'
         (out/'experiment.json').write_text(json.dumps(dict(action=args.action,node=args.node,
+            access_pattern=args.access_pattern,access_window_bytes=args.access_window_bytes,random_seed=args.random_seed,
             sizes=args.sizes,unit=args.unit,repetitions=args.repetitions,backings=args.backings,
             page_modes=args.page_modes,config=public,
             config_sha256=hashlib.sha256(Path(args.config).read_bytes()).hexdigest(),

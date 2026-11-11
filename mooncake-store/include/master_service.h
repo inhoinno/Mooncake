@@ -265,6 +265,11 @@ class MasterService {
     auto GetAllKeys(const TenantId& tenant_id)
         -> tl::expected<std::vector<std::string>, ErrorCode>;
 
+    tl::expected<void, ErrorCode> ValidateCopyTarget(
+        const UUID& receiver, const std::string& key, const TenantId& tenant_id,
+        const std::string& segment, uint64_t source_id, uint64_t target_id,
+        uint64_t address, uint64_t length);
+
     /**
      * @brief Fetch all segments, each node has a unique real client with fixed
      * segment name : segment name, preferred format : {ip}:{port}, bad format :
@@ -2379,6 +2384,8 @@ class MasterService {
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
     const std::chrono::seconds put_start_release_timeout_sec_;
+    // Dedicated bounded Callosum experiment: no TTL or peer loss proves drain.
+    bool callosum_copy_retention_{false};
     class DiscardedReplicas {
        public:
         DiscardedReplicas() = delete;

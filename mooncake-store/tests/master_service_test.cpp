@@ -84,6 +84,15 @@ class MasterServiceTest : public ::testing::Test {
         UUID client_id;
     };
 
+    std::optional<uint32_t> ReplicaReferencesForTest(
+        MasterService& service, const std::string& key, ReplicaID id) {
+        MasterService::MetadataAccessorRW access(
+            &service, service.MakeObjectIdentityForRequest(key, TenantId::Default()));
+        if (!access.Exists()) return std::nullopt;
+        auto* replica = access.Get().GetReplicaByID(id);
+        return replica ? std::optional<uint32_t>(replica->get_refcnt()) : std::nullopt;
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
     static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
@@ -2775,6 +2784,63 @@ TEST_F(MasterServiceTest, CopyStart) {
     // Test Case 12: Try remove the object, should success.
     remove_result = service_->Remove(key, TenantId::Default());
     EXPECT_TRUE(remove_result.has_value());
+}
+
+TEST_F(MasterServiceTest, CallosumLookupAuthorizePublishRequery) {
+    // Production metadata/allocation methods; no RPC network or DMA is mocked
+    // into a PASS. Payload completion is the caller's separate bridge contract.
+    ScopedEnvVar retained("MC_CALLOSUM_RETAIN_COPY_TASKS", "1");
+    MasterService service;
+    const auto sender = generate_uuid();
+    const auto receiver = generate_uuid();
+    auto src_segment = MakeSegment("source-pool-member", kDefaultSegmentBase);
+    auto dst_segment = MakeSegment("target-pool-member", kDefaultSegmentBase + kDefaultSegmentSize);
+    src_segment.protocol = dst_segment.protocol = "rdma";
+    ASSERT_TRUE(service.MountSegment(src_segment, sender).has_value());
+    ASSERT_TRUE(service.MountSegment(dst_segment, receiver).has_value());
+    const std::string key = "callosum-real-master-key";
+    constexpr size_t bytes = 65539;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = src_segment.name;
+    ASSERT_TRUE(service.PutStart(sender, key, TenantId::Default(), bytes, config).has_value());
+    ASSERT_TRUE(service.PutEnd(sender, key, TenantId::Default(), ReplicaType::MEMORY).has_value());
+    auto initial = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(initial.has_value());
+    ASSERT_EQ(initial->replicas.size(), 1);
+    EXPECT_EQ(initial->replicas[0].status, ReplicaStatus::COMPLETE);
+
+    const auto before_pin=ReplicaReferencesForTest(service,key,initial->replicas[0].id);
+    ASSERT_TRUE(before_pin.has_value());
+
+    auto copy = service.CopyStart(sender, key, TenantId::Default(), src_segment.name, {dst_segment.name});
+    ASSERT_TRUE(copy.has_value());
+    ASSERT_EQ(copy->targets.size(), 1);
+    EXPECT_EQ(ReplicaReferencesForTest(service,key,copy->source.id), *before_pin+1);
+    const auto& target = copy->targets[0];
+    const auto& buffer = target.get_memory_descriptor().buffer_descriptor;
+    EXPECT_EQ(target.status, ReplicaStatus::PROCESSING);
+    EXPECT_TRUE(service.ValidateCopyTarget(receiver, key, TenantId::Default(), dst_segment.name,
+        copy->source.id, target.id, buffer.buffer_address_, bytes).has_value());
+    EXPECT_FALSE(service.ValidateCopyTarget(receiver,key,TenantId::Default(),dst_segment.name,
+        copy->source.id,target.id,buffer.buffer_address_+1,bytes).has_value());
+    // An allocated/authorized target is not a discoverable complete replica.
+    auto pending = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending->replicas.size(), 1);
+    ASSERT_TRUE(service.CopyEnd(sender, key, TenantId::Default()).has_value());
+    EXPECT_EQ(ReplicaReferencesForTest(service,key,copy->source.id), before_pin);
+    auto published = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(published.has_value());
+    ASSERT_EQ(published->replicas.size(), 2);
+    EXPECT_TRUE(std::all_of(published->replicas.begin(), published->replicas.end(),
+        [](const auto& replica) { return replica.status == ReplicaStatus::COMPLETE; }));
+    EXPECT_TRUE(std::any_of(published->replicas.begin(), published->replicas.end(),
+        [&](const auto& replica) { return replica.id == target.id; }));
+    EXPECT_FALSE(service.CopyEnd(sender,key,TenantId::Default()).has_value());
+    const auto repeated=service.GetReplicaList(key,TenantId::Default());
+    ASSERT_TRUE(repeated.has_value());
+    EXPECT_EQ(repeated->replicas.size(),2);
 }
 
 TEST_F(MasterServiceTest, CopyEnd) {

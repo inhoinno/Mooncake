@@ -212,6 +212,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
               return std::make_unique<OrderedOpLogWriter>(
                   std::move(writer_config), std::move(write_batch));
           }) {
+    if (const char* mode = std::getenv("MC_CALLOSUM_RETAIN_COPY_TASKS")) {
+        if (std::string(mode) != "1")
+            throw std::invalid_argument("MC_CALLOSUM_RETAIN_COPY_TASKS must be 1 or absent");
+        callosum_copy_retention_ = true;
+        if (enable_ha_)
+            throw std::invalid_argument("Callosum retained-copy mode requires a dedicated non-HA master");
+    }
     if (default_kv_soft_pin_ttl_ > max_kv_soft_pin_ttl_) {
         LOG(ERROR) << "Invalid soft-pin TTL configuration: default="
                    << default_kv_soft_pin_ttl_
@@ -2385,6 +2392,11 @@ void MasterService::TaskCleanupThreadFunc() {
 auto MasterService::UnmountSegment(const UUID& segment_id,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    if (callosum_copy_retention_) {
+        // The dedicated campaign retires its owned master only after both
+        // journals prove drain. Keep arena allocation authority until then.
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2441,6 +2453,8 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
                                            const UUID& client_id,
                                            uint64_t grace_period_ms)
     -> tl::expected<void, ErrorCode> {
+    if (callosum_copy_retention_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
@@ -5042,6 +5056,41 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     return results;
 }
 
+tl::expected<void, ErrorCode> MasterService::ValidateCopyTarget(
+    const UUID& receiver, const std::string& key, const TenantId& tenant_id,
+    const std::string& segment, uint64_t source_id, uint64_t target_id,
+    uint64_t address, uint64_t length) {
+    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
+    if (!callosum_copy_retention_)
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    {
+        auto segments = segment_manager_.getSegmentAccess();
+        UUID owner;
+        if (segments.GetClientIdBySegmentName(segment, owner) != ErrorCode::OK ||
+            owner != receiver)
+            return tl::unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+    MetadataAccessorRW accessor(this, MakeObjectIdentityForRequest(key, tenant_id));
+    if (!accessor.Exists() || !accessor.HasReplicationTask())
+        return tl::unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
+    const auto& task = accessor.GetReplicationTask();
+    const auto* source = accessor.Get().GetReplicaByID(source_id);
+    const auto* target = accessor.Get().GetReplicaByID(target_id);
+    if (task.type != ReplicationTask::Type::COPY || task.source_id != source_id ||
+        std::find(task.replica_ids.begin(), task.replica_ids.end(), target_id) ==
+            task.replica_ids.end() || !source || !source->is_completed() ||
+        source->has_invalid_mem_handle() || !target ||
+        !target->is_memory_replica() || target->has_invalid_mem_handle() ||
+        target->status() != ReplicaStatus::PROCESSING)
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    const auto* in_segment = accessor.Get().GetReplicaBySegmentName(segment);
+    const auto descriptor = target->get_descriptor().get_memory_descriptor().buffer_descriptor;
+    if (in_segment != target || descriptor.protocol_ != "rdma" ||
+        descriptor.buffer_address_ != address || descriptor.size_ != length)
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    return {};
+}
+
 tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const std::string& src_segment,
@@ -6361,10 +6410,11 @@ MasterService::GetStorageConfig() const {
             << "Storage root directory or cluster ID is not set. persisting "
                "data is disabled.";
         return GetStorageConfigResponse("", enable_disk_eviction_,
-                                        quota_bytes_);
+                                        quota_bytes_, callosum_copy_retention_ ? 1 : 0);
     }
     std::string fsdir = root_fs_dir_ + "/" + cluster_id_;
-    return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_);
+    return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_,
+                                    callosum_copy_retention_ ? 1 : 0);
 }
 
 auto MasterService::MountLocalDiskSegment(const UUID& client_id,
@@ -7727,6 +7777,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         for (auto task_it = tenant_state.replication_tasks.begin();
              task_it != tenant_state.replication_tasks.end();) {
+            if (callosum_copy_retention_) {
+                ++task_it;
+                continue;
+            }
             auto metadata_it = tenant_state.metadata.find(task_it->first);
             if (metadata_it == tenant_state.metadata.end()) {
                 LOG(ERROR) << "Key " << task_it->first
@@ -9459,6 +9513,14 @@ void MasterService::ClientMonitorFunc() {
             } else {
                 ++it;
             }
+        }
+
+        if (callosum_copy_retention_ && !expired_clients.empty()) {
+            // Do not recycle expired endpoint allocations while DMA may be
+            // active. Readiness/transport still fail for unreachable peers.
+            LOG(ERROR) << "component=callosum_store event=expired_client_retained"
+                       << " count=" << expired_clients.size();
+            expired_clients.clear();
         }
 
         // Update the client status to NEED_REMOUNT

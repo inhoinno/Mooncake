@@ -28,6 +28,38 @@ class FakeMemory:
 
 
 class DramBenchmarkTest(unittest.TestCase):
+    def test_dram_sweep_strategies_use_fixed_mr_and_verify_random_holes_and_tail(self):
+        for pattern in ('overwrite','sequential','uniform_random'):
+            with self.subTest(pattern=pattern),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory); source=FakeMemory(2*1024**2); target=FakeMemory(2*1024**2)
+                service=bench.Receiver(target,'fixed-segment','a1','b1','fp',{},root)
+                writes=[]
+                def native(segments,sources,targets,lengths):
+                    for src,dst,n in zip(sources,targets,lengths):
+                        self.assertTrue(source.address<=src and src+n<=source.address+source.capacity)
+                        self.assertTrue(target.address<=dst and dst+n<=target.address+target.capacity)
+                        self.assertEqual(src-source.address,dst-target.address)
+                        writes.append((src-source.address,n)); ctypes.memmove(dst,src,n)
+                    return lengths
+                engine=SimpleNamespace(relay_write_batch_drained=native)
+                args=SimpleNamespace(control_port=19201,page_mode='native',sizes=[1],unit='MiB',
+                    repetitions=1,warmup_blocks=1,access_pattern=pattern,access_window_bytes=source.capacity,random_seed=17)
+                def rpc(url,method,data=None,**kw): return service.handle(method,data or {})
+                try:
+                    with patch.object(bench,'rpc',side_effect=rpc),patch.object(bench,'snapshot',return_value={}), \
+                         patch.object(bench,'resident_pages',return_value={}), \
+                         patch.object(bench,'TOTAL_BYTES',1024**2+1),contextlib.redirect_stdout(io.StringIO()):
+                        rows=bench.sweep(engine,source,dict(fingerprint='fp'),dict(id='b1'),
+                            dict(id='a1',url='http://a1'),{},args,root)
+                    self.assertEqual(rows[0]['status'],'PASS')
+                    self.assertEqual(rows[0]['window_bytes'],source.capacity)
+                    self.assertEqual(rows[0]['access_pattern'],pattern)
+                    self.assertEqual(rows[0]['bytes'],1024**2+1)
+                    self.assertEqual(service.description['epoch'],service.handle('health',{})['epoch'])
+                    self.assertEqual(service.state,'IDLE')
+                    self.assertEqual(len(writes),3)  # One warmup + two measured requests.
+                finally: source.memory.close(); target.memory.close()
+
     def test_mbind_preserves_selected_node_with_legacy_and_current_kernel_masks(self):
         for legacy in (False,True):
             for node in (0,1,63,64,127,128):

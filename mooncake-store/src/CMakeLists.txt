@@ -2,6 +2,7 @@
 add_subdirectory(cachelib_memory_allocator)
 
 set(MOONCAKE_STORE_SOURCES
+    callosum_store.cpp
     pool_relay.cpp
     allocator.cpp
     master_service.cpp

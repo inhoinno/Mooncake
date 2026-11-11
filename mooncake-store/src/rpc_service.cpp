@@ -1058,6 +1058,17 @@ WrappedMasterService::GetNoFSegmentsByName(const std::string& segment_name) {
         [] {}, [] {});
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::ValidateCopyTarget(
+    const UUID& receiver, const std::string& key, const std::string& tenant_id,
+    const std::string& segment, uint64_t source_id, uint64_t target_id,
+    uint64_t address, uint64_t length) {
+    return WithWriteTenant(tenant_id, master_service_.IsTenantQuotaEnabled(),
+        [&](const TenantId& tenant) {
+            return master_service_.ValidateCopyTarget(receiver, key, tenant,
+                segment, source_id, target_id, address, length);
+        });
+}
+
 tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment,
@@ -1745,6 +1756,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::CopyStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ValidateCopyTarget>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyRevoke>(
         &wrapped_master_service);

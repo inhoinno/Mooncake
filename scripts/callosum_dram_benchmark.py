@@ -19,7 +19,7 @@ import time
 from urllib.parse import urlparse
 
 from callosum_runtime import config, require, rpc, server
-from callosum_transport_benchmark import SIZES, TOTAL_BYTES, block_bytes, write_loop
+from callosum_transport_benchmark import SIZES, TOTAL_BYTES, block_bytes, write_loop, ACCESS_PATTERNS, access_strategy, written_ranges, final_window_digest
 from callosum_benchmark_report import write_report, write_request_csv, enrich_trial
 
 
@@ -196,6 +196,7 @@ class Receiver:
                                 transport_env={k:os.environ.get(k) for k in ('MC_MTU','MC_GID_INDEX')},
                                 configured_qps=16, active_qps_verified=False, source_identity=source_identity())
         self.description['mr_pages']=getattr(memory,'page_evidence',dict(mode='native'))
+        self.description['access_patterns']=list(ACCESS_PATTERNS)
 
     def handle(self, method, d):
         with self.lock:
@@ -216,7 +217,8 @@ class Receiver:
                 require(type(length) is int and 0 < length <= self.memory.capacity, 'target out of bounds')
                 self.seen.add(identity)
                 ctypes.memset(self.memory.address, 0, length)
-                self.attempt = dict(attempt=identity, length=length, checksum=d['checksum'])
+                self.attempt = dict(attempt=identity, length=length, checksum=d['checksum'],
+                                    deferred_checksum=d.get('deferred_checksum',False))
                 self.state = 'ACTIVE'
                 self.before = snapshot(self.description['placement'])
                 return dict(self.description, attempt=identity, address_kind='classic_va',
@@ -228,7 +230,8 @@ class Receiver:
                 # One cooperating sender uses this target; native wait completes before this RPC.
                 try:
                     checksum = self.memory.digest(self.attempt['length'])
-                    require(checksum == self.attempt['checksum'], 'final DRAM checksum mismatch')
+                    expected=d.get('checksum') if self.attempt['deferred_checksum'] else self.attempt['checksum']
+                    require(isinstance(expected,str) and checksum == expected, 'final DRAM checksum mismatch')
                     placement = resident_pages(self.memory.address, self.memory.node, self.memory.capacity)
                     result = dict(status='PASS', attempt=self.attempt['attempt'], checksum=checksum,
                                   placement=placement, before=self.before,
@@ -268,8 +271,17 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
             require(pages.get('hugetlb') is True and pages.get('kernel_page_bytes')==2**21,
                     'HugeTLB sender/receiver allocation evidence missing; no WRITE permitted')
     results = []
+    pattern=getattr(args,'access_pattern','overwrite')
+    requested_window=getattr(args,'access_window_bytes',None)
+    seed=getattr(args,'random_seed',0)
+    if pattern!='overwrite' or requested_window is not None:
+        require(pattern in health.get('access_patterns',[]),'receiver lacks access-strategy support')
     for size in args.sizes:
         length = block_bytes(size, args.unit)
+        window=requested_window or (length if pattern=='overwrite' else
+                                    max(block_bytes(n,args.unit) for n in args.sizes))
+        access_strategy(pattern,length,window,seed)
+        require(window<=min(memory.capacity,health['capacity']),'access window exceeds existing DRAM MR; no resize')
         require(length <= health['capacity'], 'receiver window is smaller than the requested block')
         expected = memory.digest(length)
         for index in range(args.repetitions):
@@ -278,9 +290,10 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
             protocol_start = time.monotonic_ns()
             # A lost prepare reply might still authorize a target. Do not auto-retry.
             safety['exposed'] = True
-            target = rpc(peer_url, 'prepare', dict(attempt=identity, length=length,
+            target = rpc(peer_url, 'prepare', dict(attempt=identity, length=window,
+                         deferred_checksum=window!=length or pattern!='overwrite',
                          checksum=expected, sender=node['id'], fingerprint=c['fingerprint']))
-            require(target['epoch'] == health['epoch'] and target['length'] == length and
+            require(target['epoch'] == health['epoch'] and target['length'] == window and
                     target['attempt'] == identity and target['node_id'] == peer['id'] and
                     target['segment'] == health['segment'] and
                     type(target['remote_base']) is int and target['remote_base'] > 0 and
@@ -296,7 +309,8 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
             samples = []
             try:
                 result = write_loop(write, memory.address, target['remote_base'], length,
-                                    getattr(args,'smoke_bytes',0) or TOTAL_BYTES, length,samples)
+                                    getattr(args,'smoke_bytes',0) or TOTAL_BYTES, length,samples,
+                                    access_pattern=pattern,window_bytes=window,random_seed=seed)
                 observed=dict(result,status='PENDING_VALIDATION',attempt=identity,path_mode='dram_rdma_write')
                 save(output/f'observed-{identity}.json',observed)
                 write_request_csv(output/f'observed-{identity}.csv',observed)
@@ -311,7 +325,11 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                 raise
             after = snapshot(placement)
             local_placement = resident_pages(memory.address, memory.node, memory.capacity)
-            verified = rpc(peer_url, 'complete', dict(attempt=identity, sender_drained=True), timeout=300)
+            coverage=written_ranges(samples,window)
+            if pattern!='overwrite' or window!=length:
+                checksum_ranges=written_ranges(samples+([dict(request_bytes=length)] if args.warmup_blocks else []),window)
+                expected=final_window_digest(memory.memory,window,checksum_ranges)
+            verified = rpc(peer_url, 'complete', dict(attempt=identity, sender_drained=True,checksum=expected), timeout=300)
             require(verified['checksum'] == expected, 'receiver validation failed')
             safety['exposed'] = False
             result['protocol_e2e_ns'] = time.monotonic_ns()-protocol_start
@@ -324,7 +342,8 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                 batch_cardinality=1, configured_qps=16, active_qps_verified=False,
                 GBps=result['bytes']/result['sender_write_loop_ns'],
                 GiBps=result['bytes']/(1024**3)/(result['sender_write_loop_ns']/1e9),
-                checksum_scope='final reused block window', receiver=verified,
+                checksum_scope='final reused block window' if pattern=='overwrite' and window==length else 'final access window with zeroed untouched ranges',
+                verified_ranges=coverage,receiver=verified,
                 sender_before=before, sender_after=after, sender_placement=local_placement,
                 store_compatible=False, gpu_delivery_proven=False, serving_proven=False)
             result.update(source=node['id'],receiver_node=peer['id'],mr_page_mode=page_mode,
@@ -368,6 +387,9 @@ def main():
     parser.add_argument('--te-port', type=int, default=19401)
     parser.add_argument('--numa-node', type=int)
     parser.add_argument('--page-mode',choices=['native','huge2MB'],default='native')
+    parser.add_argument('--access-pattern',choices=ACCESS_PATTERNS,default='overwrite')
+    parser.add_argument('--access-window-bytes',type=int)
+    parser.add_argument('--random-seed',type=int,default=0)
     parser.add_argument('--sizes', nargs='+', type=int, choices=SIZES, default=list(SIZES))
     parser.add_argument('--unit', choices=['MB', 'MiB'], default='MiB')
     parser.add_argument('--repetitions', type=int, default=3)

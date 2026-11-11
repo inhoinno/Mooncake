@@ -506,6 +506,7 @@ target_link_libraries(oplog_test_failpoint_test PRIVATE glog gtest gtest_main
                                                         pthread)
 add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
+add_subdirectory(callosum_store_standalone)
 add_ha_test(catalog_backed_snapshot_provider_test
             ha/snapshot/catalog_backed_snapshot_provider_test.cpp)
 if(STORE_USE_REDIS)

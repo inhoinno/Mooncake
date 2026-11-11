@@ -26,7 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from callosum_dispatch import SourceDispatcher, partition_source
 from callosum_initiation import CacheMiss
-from callosum_transport_benchmark import block_bytes, write_loop, TOTAL_BYTES
+from callosum_transport_benchmark import block_bytes, write_loop, TOTAL_BYTES, access_strategy, written_ranges, ACCESS_PATTERNS
 
 RUNTIME_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 IMPLEMENTATION_SHA256 = hashlib.sha256(b''.join(
@@ -315,6 +315,7 @@ class Agent:
         self.epoch = secrets.token_hex(16)
         self.lock = threading.Lock()
         self.targets, self.jobs = {}, {}
+        self.benchmark_resets = {}
         self.dispatcher = SourceDispatcher(self.send_group)
         self.engine = None
         if c['mode'] == 'rdma':
@@ -343,6 +344,7 @@ class Agent:
                     runtime_sha256=RUNTIME_SHA256,
                     implementation_sha256=IMPLEMENTATION_SHA256,
                     transport_request_timing_version=1,
+                    transport_access_patterns=list(ACCESS_PATTERNS),
                     transport_env={k:os.environ.get(k) for k in ('MC_MTU','MC_GID_INDEX')},
                     mr_pages=self.mapping.page_evidence,
                     configured_qps=os.environ.get('MC_NUM_QP_PER_EP', 'default'))
@@ -380,14 +382,18 @@ class Agent:
                     'transport baseline requires real RDMA engine')
             require(os.environ.get('MC_NUM_QP_PER_EP') == '16', 'baseline requires 16 configured QPs')
             extent, target = d['source'], d['target']
+            window=d.get('window_bytes',d['block_bytes'])
+            pattern=d.get('access_pattern','overwrite')
+            access_strategy(pattern,d['block_bytes'],window,d.get('random_seed',0))
+            plan_id=d.get('target_plan_id',d['transfer_id'])
             require(extent['pool'] == self.node['pool'], 'wrong source pool')
-            require(0 < d['block_bytes'] <= min(extent['length'],target['extent']['length']) and
-                    target['plan_id'] == d['transfer_id'], 'baseline exceeds authorized window')
-            self.mapping.bounds(extent['offset'], d['block_bytes'])
+            require(d['block_bytes']<=window<=min(extent['length'],target['extent']['length']) and
+                    target['plan_id'] == plan_id, 'baseline exceeds authorized window')
+            self.mapping.bounds(extent['offset'], window)
             peer = next(n for n in self.c['nodes'] if n['id'] == target['receiver'])
             require(peer['pool'] != self.node['pool'] and
                     target['address_kind'] == 'classic_va' and
-                    rpc(peer['url'], 'target', dict(transfer_id=d['transfer_id'])) == target,
+                    rpc(peer['url'], 'target', dict(transfer_id=plan_id)) == target,
                     'stale transport target')
             with self.lock:
                 require(d['transfer_id'] not in self.jobs, 'benchmark replay refused')
@@ -397,7 +403,8 @@ class Agent:
                 result = write_loop(lambda src,dst,n: self.engine.relay_write_batch_drained(
                     [target['segment']], [src], [dst], [n])[0],
                     self.mapping.address + extent['offset'], target['remote_base'],
-                    d['block_bytes'], TOTAL_BYTES, self.c.get('max_inflight_bytes',64*1024**2),samples)
+                    d['block_bytes'], TOTAL_BYTES, self.c.get('max_inflight_bytes',64*1024**2),samples,
+                    access_pattern=pattern,window_bytes=window,random_seed=d.get('random_seed',0))
                 from callosum_benchmark_report import write_request_csv
                 observed = dict(result,status='PENDING_VALIDATION',transfer_id=d['transfer_id'],
                                 path_mode='direct_dax_write')
@@ -459,6 +466,23 @@ class Agent:
                             b['offset'] >= a['offset']+a['length'],
                             'target aliases another retained reservation')
                 self.targets[d['transfer_id']] = target
+                if d.get('clear_for_benchmark'):
+                    trial=d.get('benchmark_trial_id')
+                    require(isinstance(trial,str) and len(trial)==32,'missing benchmark reset identity')
+                    if not hasattr(self,'benchmark_resets'): self.benchmark_resets={}
+                    resets=self.benchmark_resets.setdefault(d['transfer_id'],{})
+                    if trial in resets:
+                        require(resets[trial]=='READY','incomplete target clear; retain reservation')
+                        return target  # A duplicate/late prepare must never erase newer data.
+                    status=rpc(self.c['master'],'status',{},timeout=5)
+                    require(any(o['id']==trial and o['state']=='RESERVED' for o in status['operations']),
+                            'target clear lacks a current master reservation')
+                    resets[trial]='CLEARING'
+                    zeros=bytes(1024**2)
+                    for start in range(e['offset'],e['offset']+e['length'],len(zeros)):
+                        length=min(len(zeros),e['offset']+e['length']-start)
+                        self.mapping.memory[start:start+length]=zeros[:length]
+                    resets[trial]='READY'
             return target
         if method == 'target':
             with self.lock:
@@ -592,6 +616,7 @@ class Master:
         self.lock = threading.RLock()
         self.fetch_locks = {}
         self.seed_locks = {}
+        self.benchmark_windows = {}  # Dedicated scratch only; never published as objects.
         self.preflight_lock = threading.Lock()
         self.db = sqlite3.connect(database, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
@@ -689,6 +714,9 @@ class Master:
         if method == 'status':
             with self.lock:
                 return dict(mode=self.c['mode'], evidence_class='TRANSFER_ONLY',
+                    transport_access_patterns=list(ACCESS_PATTERNS),
+                    benchmark_access_patterns={i:json.loads(v).get('transport_access_patterns',[])
+                        for i,v in self.db.execute('SELECT id,descriptor FROM members')},
                     fingerprint=self.c['fingerprint'], startup_aborted=self.startup_aborted,
                     registered_nodes=[row[0] for row in self.db.execute('SELECT id FROM members ORDER BY id')],
                     benchmark_request_timing_versions={i:json.loads(v).get('transport_request_timing_version',0)
@@ -749,6 +777,17 @@ class Master:
 
     def transport_benchmark(self, d):
         block = block_bytes(d['block_size'], d['block_unit'])
+        pattern=d.get('access_pattern','overwrite')
+        window=block if d.get('window_bytes') is None else d['window_bytes']
+        fixed_window=pattern!='overwrite' or d.get('window_bytes') is not None
+        access_strategy(pattern,block,window,d.get('random_seed',0))
+        scratch=None
+        members=self.members()
+        require(all(m.get('configured_qps')=='16' for m in members),
+                'all endpoints must start with MC_NUM_QP_PER_EP=16')
+        if fixed_window:
+            require(all(pattern in m.get('transport_access_patterns',[]) for m in members),
+                    'running agents lack access-strategy support; no silent overwrite fallback')
         require(self.c.get('max_inflight_bytes',64*1024**2) >= block,
                 'baseline block exceeds native request budget; configure max_inflight_bytes before agent startup')
         # Allocation and journal mutation only: release the authority lock before
@@ -761,27 +800,46 @@ class Master:
                                  (d['key'],source_node['pool'])).fetchone()
             require(row, 'seed source object before baseline')
             source = json.loads(row[0])
-            require(source['length'] >= block, 'source window smaller than block')
+            require(source['length'] >= window, 'source seed smaller than access window')
             identity = secrets.token_hex(16)
-            destination = self.allocate(receiver['pool'], block)
+            if fixed_window:
+                cache_key=(d['key'],source.get('version'),receiver['id'],window)
+                scratch=self.benchmark_windows.get(cache_key)
+                if scratch is None:
+                    scratch=dict(extent=self.allocate(receiver['pool'],window),plan_id=secrets.token_hex(16),busy=False)
+                    self.benchmark_windows[cache_key]=scratch
+                require(not scratch['busy'],'scratch window active/quarantined; no reuse')
+                scratch['busy']=True
+                destination=scratch['extent']
+                plan_id=scratch['plan_id']
+            else:
+                destination = self.allocate(receiver['pool'], window)
+                plan_id=identity
             self.operation(identity, 'RESERVED', dict(source=source,destination=destination,
                                                      benchmark=True))
         try:
-            members = self.members()
-            require(all(m.get('configured_qps')=='16' for m in members),
-                    'all endpoints must start with MC_NUM_QP_PER_EP=16')
-            target = rpc(receiver['url'], 'prepare', dict(transfer_id=identity, extent=destination))
+            target = rpc(receiver['url'], 'prepare', dict(transfer_id=plan_id, extent=destination,
+                         clear_for_benchmark=fixed_window,benchmark_trial_id=identity))
             result = rpc(source_node['url'], 'transport_write_loop', dict(
-                transfer_id=identity,source=source,target=target,block_bytes=block), timeout=900)
+                transfer_id=identity,target_plan_id=plan_id,source=source,target=target,block_bytes=block,
+                access_pattern=pattern,window_bytes=window,random_seed=d.get('random_seed',0)), timeout=900)
             require(result['bytes'] == TOTAL_BYTES and result['block_bytes'] == block,
                     'baseline byte accounting mismatch')
-            source_range = dict(source, length=block)
-            expected = rpc(source_node['url'],'digest',source_range,timeout=300)
-            require(rpc(receiver['url'],'digest',destination,timeout=300)==expected,
-                    'baseline destination checksum mismatch')
+            if fixed_window:
+                require(result.get('access_pattern')==pattern and result.get('window_bytes')==window and
+                        result.get('random_seed')==d.get('random_seed',0),
+                        'sender did not execute the requested access strategy/window/seed')
+            ranges=written_ranges(result['requests'],window) if pattern!='overwrite' else [[0,block]]
+            for begin,end in ranges:
+                source_range=dict(source,offset=source['offset']+begin,length=end-begin)
+                destination_range=dict(destination,offset=destination['offset']+begin,length=end-begin)
+                expected=rpc(source_node['url'],'digest',source_range,timeout=300)
+                require(rpc(receiver['url'],'digest',destination_range,timeout=300)==expected,
+                        'baseline destination checksum mismatch')
             with self.lock:
                 self.operation(identity, 'DRAINED_RETAINED', dict(source=source,
                     destination=destination,benchmark=True,result={k:v for k,v in result.items() if k != 'requests'}))
+                if scratch is not None: scratch['busy']=False  # Only after positive drain + validation.
             return dict(result, status='PASS', transfer_id=identity,
                         evidence_class='TRANSFER_ONLY', block_unit=d['block_unit'],
                         configured_qps=16, active_qps_verified=False,
@@ -790,9 +848,11 @@ class Master:
                         mr_page_mode=self.c.get('mr_page_mode','native'),
                         mr_pages={m['id']:m.get('mr_pages') for m in members
                                   if m['id'] in (source_node['id'],receiver['id'])},
-                        checksum_scope='final block window', store_compatible=False)
+                        checksum_scope='final block window' if pattern=='overwrite' else 'final union of written ranges',
+                        verified_ranges=ranges,checksum_verified_bytes=sum(b-a for a,b in ranges),store_compatible=False)
         except BaseException:
             with self.lock:
+                if scratch is not None: scratch['busy']=True  # Unknown DMA/verification: quarantine, never recycle.
                 self.operation(identity,'QUARANTINED',dict(source=source,
                     destination=destination,benchmark=True))
             raise
@@ -970,6 +1030,9 @@ def main():
     parser.add_argument('--receiver')
     parser.add_argument('--block-size', type=int, choices=[1,2,4,8,16,32,64,128,256,512])
     parser.add_argument('--block-unit', choices=['MB','MiB'])
+    parser.add_argument('--access-pattern',choices=ACCESS_PATTERNS,default='overwrite')
+    parser.add_argument('--access-window-bytes',type=int)
+    parser.add_argument('--random-seed',type=int,default=0)
     args = parser.parse_args()
     c = config(args.config)
     import callosum_relay_native as native
@@ -1022,7 +1085,9 @@ def main():
         wall_start = time.time_ns()
         start = time.monotonic_ns()
         result = rpc(c['master'], 'transport_benchmark', dict(node=args.node,receiver=args.receiver,
-            key=args.key,block_size=args.block_size,block_unit=args.block_unit),timeout=1200)
+            key=args.key,block_size=args.block_size,block_unit=args.block_unit,
+            access_pattern=args.access_pattern,window_bytes=args.access_window_bytes,
+            random_seed=args.random_seed),timeout=1200)
         result['requester_rpc_ns'] = time.monotonic_ns()-start
         result['controller_start_unix_ns'] = wall_start
         result['controller_end_unix_ns'] = time.time_ns()

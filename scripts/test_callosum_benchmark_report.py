@@ -11,16 +11,133 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from callosum_transport_benchmark import write_loop
+from callosum_transport_benchmark import write_loop, access_strategy, written_ranges, final_window_digest
 from callosum_benchmark_report import enrich_trial, write_report
 
 
 class BenchmarkReportTest(unittest.TestCase):
+    def test_strategy_offsets_wrap_random_reproducibility_and_partial_tail(self):
+        for pattern in ('overwrite','sequential','uniform_random'):
+            sequences=[]
+            for repeat in range(2):
+                posted=[]; source=bytes(range(1,17)); target=bytearray(16)
+                def write(src,dst,n):
+                    self.assertEqual(dst-src,1000)
+                    begin=src-1000; self.assertTrue(0<=begin<16 and begin+n<=16)
+                    target[begin:begin+n]=source[begin:begin+n]; posted.append((begin,n)); return n
+                row=write_loop(write,1000,2000,4,39,2,access_pattern=pattern,window_bytes=16,random_seed=17)
+                self.assertEqual(row['bytes'],39)
+                offsets=[r['source_offset_bytes'] for r in row['requests']]
+                self.assertEqual([r['request_bytes'] for r in row['requests']], [4]*9+[3])
+                if pattern=='overwrite': self.assertEqual(offsets,[0]*10)
+                if pattern=='sequential': self.assertEqual(offsets,[0,4,8,12,0,4,8,12,0,4])
+                ranges=written_ranges(row['requests'],16)
+                import hashlib
+                self.assertEqual(hashlib.sha256(target).hexdigest(),final_window_digest(source,16,ranges))
+                sequences.append(offsets)
+            self.assertEqual(sequences[0],sequences[1])
+        strategy=access_strategy('uniform_random',4,16,42)
+        values=[strategy.offset(i) for i in range(1000)]
+        self.assertEqual(set(values),{0,4,8,12})
+        self.assertTrue(all(180<values.count(n)<320 for n in set(values)))
+        for pattern,block,window,seed in [('bad',4,16,0),('sequential',8,4,0),('uniform_random',4,16,-1)]:
+            with self.assertRaises(ValueError): access_strategy(pattern,block,window,seed)
+
+    def test_real_cxl_control_path_rotates_and_reuses_scratch_only_after_drain(self):
+        """Actual Master/Agent handlers and registered-address interface; fake DMA."""
+        import hashlib, os
+        import callosum_runtime as runtime
+        for pattern in ('overwrite','sequential','uniform_random'):
+            with self.subTest(pattern=pattern),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory); window=2*1024**2
+                nodes=[dict(id=n,pool=p,url='http://'+n,can_send=True,can_receive=True,
+                    configured_qps='16',transport_access_patterns=['overwrite','sequential','uniform_random'])
+                    for n,p in [('a1','A'),('b1','B')]]
+                c=dict(fingerprint='scratch-fixture',mode='rdma',nodes=nodes,master='http://master',
+                    pools={p:dict(capacity=4*1024**2) for p in ('A','B')})
+                master_log=runtime.Log(root/'master.jsonl','master')
+                master=runtime.Master(c,root/'master.sqlite',master_log); master.topology_ok=True
+                master.members=lambda:nodes
+                agents={}
+                for node in nodes:
+                    agent=runtime.Agent.__new__(runtime.Agent); agent.c=c; agent.node=node
+                    agent.mapping=runtime.Mapping.__new__(runtime.Mapping)
+                    agent.mapping.memory=bytearray(4*1024**2); agent.mapping.capacity=len(agent.mapping.memory)
+                    agent.mapping.address=ctypes.addressof(ctypes.c_char.from_buffer(agent.mapping.memory))
+                    agent.targets={}; agent.jobs={}; agent.lock=threading.RLock(); agent.epoch=node['id']
+                    agent.segment='registered-'+node['id']; agent.log=runtime.Log(root/(node['id']+'.jsonl'),node['id'])
+                    agents[node['url']]=agent
+                sender=agents['http://b1']; receiver=agents['http://a1']
+                sender.mapping.memory[4096:4096+window]=(bytes(range(1,252))*(window//251+1))[:window]
+                source=dict(pool='B',offset=4096,length=window,key='source',version='v1')
+                master.db.execute('INSERT INTO objects VALUES (?,?,?)',('source','B',json.dumps(source))); master.db.commit()
+                fail=dict(value=False); posted=[]
+                def native(segments,sources,destinations,lengths):
+                    if fail['value']: return [lengths[0]-1]
+                    for src,dst,n in zip(sources,destinations,lengths):
+                        self.assertTrue(sender.mapping.address+4096<=src and src+n<=sender.mapping.address+4096+window)
+                        self.assertTrue(receiver.mapping.address+4096<=dst and dst+n<=receiver.mapping.address+4096+window)
+                        posted.append((src-sender.mapping.address-4096,dst-receiver.mapping.address-4096))
+                        ctypes.memmove(dst,src,n)
+                    return lengths
+                sender.engine=SimpleNamespace(relay_write_batch_drained=native)
+                request=dict(node='b1',receiver='a1',key='source',block_size=1,block_unit='MiB',
+                             access_pattern=pattern,window_bytes=window,random_seed=7)
+                def rpc(url,method,data,**kwargs):
+                    return master.handle(method,data) if url=='http://master' else agents[url].handle(method,data)
+                try:
+                    with patch.object(runtime,'rpc',side_effect=rpc),patch.object(runtime,'TOTAL_BYTES',5*1024**2+3), \
+                         patch.dict(os.environ,MC_NUM_QP_PER_EP='16'):
+                        first=master.transport_benchmark(request); second=master.transport_benchmark(request)
+                        self.assertEqual(first['bytes'],5*1024**2+3)
+                        self.assertEqual(first['window_bytes'],window)
+                        self.assertEqual(len(receiver.targets),1)
+                        plan_id=next(iter(receiver.targets))
+                        receiver.mapping.memory[4096]=99
+                        old=receiver.targets[plan_id]
+                        receiver.handle('prepare',dict(transfer_id=plan_id,extent=old['extent'],
+                            clear_for_benchmark=True,benchmark_trial_id=first['transfer_id']))
+                        self.assertEqual(receiver.mapping.memory[4096],99)  # Late replay must not clear data.
+                        with self.assertRaisesRegex(RuntimeError,'current master reservation'):
+                            receiver.handle('prepare',dict(transfer_id=plan_id,extent=old['extent'],
+                                clear_for_benchmark=True,benchmark_trial_id='0'*32))
+                        self.assertEqual(len(master.benchmark_windows),1)
+                        self.assertTrue(all(a==b for a,b in posted))
+                        self.assertEqual(master.db.execute("SELECT next FROM pools WHERE id='A'").fetchone()[0],4096+window)
+                        self.assertEqual(master.db.execute("SELECT count(*) FROM objects WHERE pool='A'").fetchone()[0],0)
+                        fail['value']=True
+                        with self.assertRaisesRegex(RuntimeError,'short'): master.transport_benchmark(request)
+                        previous=bytes(receiver.mapping.memory)
+                        with self.assertRaisesRegex(RuntimeError,'active/quarantined'): master.transport_benchmark(request)
+                        self.assertEqual(bytes(receiver.mapping.memory),previous)
+                        self.assertEqual(master.db.execute("SELECT count(*) FROM operations WHERE state='QUARANTINED'").fetchone()[0],1)
+                finally:
+                    master.db.close(); master_log.file.close()
+                    for agent in agents.values(): agent.log.file.close()
+
     def trial(self):
         with patch('callosum_transport_benchmark.time.monotonic_ns',side_effect=[0,10,25,30,50,60]):
             row=write_loop(lambda s,d,n:n,4096,8192,4,6,2)
         return dict(row,status='PASS',actual_transport='rdma',path_mode='direct_dax_write',
                     block_unit='MiB',transfer_id='a'*32)
+
+    def test_strategy_report_groups_and_csv_keep_offsets_window_and_seed(self):
+        rows=[]
+        for pattern in ('overwrite','sequential','uniform_random'):
+            row=dict(self.trial(),**write_loop(lambda s,d,n:n,4096,8192,4,13,4,
+                access_pattern=pattern,window_bytes=16,random_seed=42))
+            rows.append(row)
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory); report=write_report(out,rows)
+            with (out/'summary.csv').open() as stream: summaries=list(csv.DictReader(stream))
+            self.assertEqual({r['access_pattern'] for r in summaries},set(('overwrite','sequential','uniform_random')))
+            with (out/'requests.csv').open() as stream: samples=list(csv.DictReader(stream))
+            self.assertTrue(all(r['window_bytes']=='16' and r['random_seed']=='42' for r in samples))
+            self.assertEqual([r['source_offset_bytes'] for r in samples if r['access_pattern']=='sequential'],['0','4','8','12'])
+            self.assertTrue(all(r['source_offset_bytes']==r['destination_offset_bytes'] for r in samples))
+        bad=dict(rows[1]); bad['requests']=[dict(s) for s in bad['requests']]
+        bad['requests'][1].update(source_offset_bytes=0,destination_offset_bytes=0)
+        with self.assertRaisesRegex(ValueError,'declared strategy'): enrich_trial(bad)
 
     def test_function_every_logical_request_tail_and_fragment_timed(self):
         row=self.trial()

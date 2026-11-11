@@ -116,6 +116,31 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
 
+    // A native RDMA segment may be backed by an explicitly owned CXL arena.
+    // Reuse the existing geometry fields without CXL's synthetic addresses.
+    // Never create two native allocators over the same pool bytes.
+    if (segment.protocol == "rdma" && segment.cxl_master_managed_allocation) {
+        if (segment.cxl_pool_id.empty() || segment.cxl_owned_capacity == 0 ||
+            segment.size != segment.cxl_owned_capacity ||
+            segment.cxl_owned_offset > segment.cxl_pool_capacity ||
+            segment.cxl_owned_capacity >
+                segment.cxl_pool_capacity - segment.cxl_owned_offset) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        for (const auto& [id, mounted] : segment_manager_->mounted_segments_) {
+            const auto& peer = mounted.segment;
+            if (peer.cxl_pool_id != segment.cxl_pool_id) continue;
+            if (!peer.cxl_master_managed_allocation ||
+                peer.protocol != "rdma" ||
+                peer.cxl_pool_capacity != segment.cxl_pool_capacity ||
+                std::max(peer.cxl_owned_offset, segment.cxl_owned_offset) <
+                    std::min(peer.cxl_owned_offset + peer.cxl_owned_capacity,
+                             segment.cxl_owned_offset + segment.cxl_owned_capacity)) {
+                return ErrorCode::INVALID_PARAMS;
+            }
+        }
+    }
+
     // Check if cxl storage is enable
     if (segment_manager_->enable_cxl_ && segment.protocol == "cxl") {
         LOG(INFO) << "Start Mounting CXL Segment.";

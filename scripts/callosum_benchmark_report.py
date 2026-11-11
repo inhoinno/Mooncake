@@ -7,8 +7,10 @@ import json
 import math
 from pathlib import Path
 import statistics
+from callosum_transport_benchmark import access_strategy
 
 REQUEST_FIELDS = ['trial_id','transfer_id','trial_status','path_mode','experiment_case','requested_page_mode','mr_page_mode','direction','block_bytes','repetition',
+                  'access_pattern','window_bytes','random_seed','source_offset_bytes','destination_offset_bytes',
                   'request_index','request_bytes','native_calls','status',
                   'sender_start_offset_ns','sender_end_offset_ns','write_request_e2e_ns',
                   'write_request_GBps','write_request_GiBps']
@@ -48,6 +50,10 @@ def percentile(values, p):
 
 def enrich_trial(row):
     row = dict(row)
+    row.setdefault('access_pattern','overwrite')
+    row.setdefault('window_bytes',row.get('block_bytes'))
+    row.setdefault('random_seed',0)
+    strategy=access_strategy(row['access_pattern'],row.get('block_bytes'),row['window_bytes'],row['random_seed'])
     if row.get('status') != 'PASS' or row.get('actual_transport') != 'rdma':
         raise ValueError('only completed RDMA trials can enter the success report')
     if any(type(row.get(k)) is not int or row[k] <= 0 for k in ('bytes','block_bytes','sender_write_loop_ns')):
@@ -61,6 +67,7 @@ def enrich_trial(row):
             raise ValueError('missing request samples')
         cursor = 0
         for index, sample in enumerate(samples):
+            expected_offset=strategy.offset(index)
             begin, end = sample['sender_start_offset_ns'], sample['sender_end_offset_ns']
             if (any(type(sample.get(k)) is not int for k in ('request_index','request_bytes',
                     'sender_start_offset_ns','sender_end_offset_ns','write_request_e2e_ns')) or
@@ -70,6 +77,14 @@ def enrich_trial(row):
                     sample['request_bytes'] != min(row['block_bytes'],row['bytes']-index*row['block_bytes']) or
                     type(sample['native_calls']) is not int or sample['native_calls'] <= 0):
                 raise ValueError('invalid, incomplete or unordered request timing')
+            if 'source_offset_bytes' in sample:
+                offset=sample['source_offset_bytes']
+                if type(offset) is not int or offset<0 or offset%row['block_bytes'] or \
+                        offset!=sample.get('destination_offset_bytes') or offset+sample['request_bytes']>row['window_bytes']:
+                    raise ValueError('request offset exceeds declared access window')
+            if sample.get('source_offset_bytes',0)!=expected_offset or \
+                    (row['access_pattern']!='overwrite' and 'source_offset_bytes' not in sample):
+                raise ValueError('request offset does not match its declared strategy/seed')
             cursor = end
         if (sum(s['request_bytes'] for s in samples) != row['bytes'] or
                 sum(s['native_calls'] for s in samples) != row['native_calls']):
@@ -113,7 +128,8 @@ def enrich_trial(row):
                          request_scope='logical WRITE start through terminal drain',
                          request_excludes=['seed','target preparation','control RPC','checksum','publication','GPU load'],
                          source_preparation_timed=False,memory_registration_timed=False,
-                         reused_window=True,window_bytes=row['block_bytes'],
+                         reused_window=True,window_bytes=row['window_bytes'],access_pattern=row['access_pattern'],
+                         random_seed=row['random_seed'],
                          warmup_blocks=row.get('warmup_blocks'),
                          registration_state='pre-registered' if row.get('request_timing_version')==1 else 'UNRECORDED'),
         byte_accounting=dict(completed_payload_bytes=row['bytes'],
@@ -135,6 +151,7 @@ def write_report(output, rows):
     if any(path.exists() for path in paths):
         raise FileExistsError('report files already exist; preserve them')
     trial_fields = ['trial_id','transfer_id','path_mode','experiment_case','requested_page_mode','mr_page_mode','direction','block_unit','block_bytes','repetition',
+                    'access_pattern','window_bytes','random_seed',
                     'bytes','logical_blocks','native_calls','loop_ms','GBps','GiBps',
                     'warmup_blocks','warmup_bytes','requester_rpc_ns','protocol_e2e_ns',
                     'request_samples','latency_available','status']
@@ -149,13 +166,16 @@ def write_report(output, rows):
     aggregates = []
     def group_key(row):
         return (row['path_mode'],row.get('experiment_case',''),row.get('requested_page_mode',''),
-                row.get('mr_page_mode','UNRECORDED'),row.get('direction',''),row['block_bytes'])
-    for path,case,requested_mode,page_mode,direction,size in sorted({group_key(r) for r in rows}):
-        group = [r for r in rows if group_key(r)==(path,case,requested_mode,page_mode,direction,size)]
+                row.get('mr_page_mode','UNRECORDED'),row.get('direction',''),row['block_bytes'],
+                row['access_pattern'],row['window_bytes'],row['random_seed'])
+    for path,case,requested_mode,page_mode,direction,size,pattern,window,seed in sorted({group_key(r) for r in rows}):
+        group = [r for r in rows if group_key(r)==(path,case,requested_mode,page_mode,direction,size,pattern,window,seed)]
         latencies = [s['write_request_e2e_ns'] for r in group for s in r.get('requests') or []]
         complete = all(r['latency_available'] for r in group)
         item = dict(path_mode=path,experiment_case=case,requested_page_mode=requested_mode,
             mr_page_mode=page_mode,direction=direction,block_bytes=size,trials=len(group),
+            access_pattern=pattern,window_bytes=window,random_seed=seed,
+            offset_slots=window//size,degenerate_one_slot=window//size==1,
             bytes=sum(r['bytes'] for r in group),loop_ms_p50=statistics.median(r['loop_ms'] for r in group),
             GBps=sum(r['bytes'] for r in group)/sum(r['sender_write_loop_ns'] for r in group),
             GiBps=sum(r['bytes'] for r in group)/2**30/(sum(r['sender_write_loop_ns'] for r in group)/1e9),
@@ -185,9 +205,9 @@ def write_report(output, rows):
         '|---|---:|---:|---:|---:|---:|---|']
     for r in aggregates:
         latency = ' / '.join(f"{r[k]:.3f}" for k in ('write_p50_us','write_p95_us','write_p99_us')) if r['latency_available'] else 'UNAVAILABLE'
-        text.append(f"| {r['experiment_case'] or r['path_mode']} / {r['mr_page_mode']} {r['direction']} | {r['block_bytes']/2**20:g} | {r['trials']} | "
+        text.append(f"| {r['experiment_case'] or r['path_mode']} / {r['mr_page_mode']} {r['direction']} [{r['access_pattern']}, W={r['window_bytes']} B, seed={r['random_seed']}] | {r['block_bytes']/2**20:g} | {r['trials']} | "
                     f"{r['loop_ms_p50']:.2f} | {r['GBps']:.2f} | {r['request_samples']} | {latency} |")
-    text.extend(['','Checksum scope: final reused block window, not every transient overwrite.',
+    text.extend(['','Checksum scope: final validated window/covered ranges, not every transient overwrite.',
                  'Per-trial rate dispersion is in summary.csv; no confidence interval is inferred from correlated requests.',
                  'Sixteen configured QPs do not prove sixteen active QPs.',
                  'Keep per-host module/NUMA/configuration evidence with these files.',''])

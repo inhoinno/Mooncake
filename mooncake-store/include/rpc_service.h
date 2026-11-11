@@ -279,6 +279,11 @@ class WrappedMasterService {
         const std::string& tenant_id, const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
 
+    tl::expected<void, ErrorCode> ValidateCopyTarget(
+        const UUID& receiver, const std::string& key, const std::string& tenant_id,
+        const std::string& segment, uint64_t source_id, uint64_t target_id,
+        uint64_t address, uint64_t length);
+
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
                                           const std::string& key,
                                           const std::string& tenant_id);

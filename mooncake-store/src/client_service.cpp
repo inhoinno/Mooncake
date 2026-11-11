@@ -1,4 +1,5 @@
 #include "client_service.h"
+#include "callosum_store.h"
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -423,6 +424,10 @@ Client::~Client() {
     task_running_ = false;
     task_thread_pool_.stop();
 
+    // All source tasks joined above. Receiver leases must also have positive
+    // drain evidence before the normal unmount path can release registration.
+    callosum_bridge_.reset();
+
     // Make copies to avoid modifying while iterating
     std::vector<Segment> mounted_segments_copy;
     std::vector<Segment> gracefully_unmounting_segments_copy;
@@ -485,8 +490,71 @@ Client::~Client() {
     hot_cache_.reset();
 }
 
+bool Client::ValidateCallosumTarget(const std::string& key, uint64_t source_id,
+                                  uint64_t target_id, uint64_t address, uint64_t length) {
+    return master_client_.ValidateCopyTarget(key, local_hostname_, source_id,
+                                             target_id, address, length).has_value();
+}
+
+void Client::EnableCallosum(const CallosumStoreConfig& config) {
+    auto capabilities = master_client_.GetStorageConfig();
+    if (protocol_ != "rdma" || !capabilities ||
+        capabilities->callosum_store_abi != 1 || callosum_bridge_) {
+        throw std::runtime_error("Callosum requires RDMA and a retained-copy Store master");
+    }
+    callosum_pool_ = config.Map();
+    callosum_bridge_ = std::make_unique<CallosumStoreBridge>(
+        *this, *transfer_engine_, config, callosum_pool_);
+    const auto& geometry = callosum_pool_->config();
+    auto mounted = MountSegment(
+        callosum_pool_->resolve(geometry.owned_offset, geometry.owned_capacity),
+        geometry.owned_capacity, "rdma");
+    if (!mounted) throw std::runtime_error("Callosum owned Store arena mount failed");
+    LOG(INFO) << "component=callosum_store event=pool_mounted pool="
+              << geometry.logical_pool_id << " segment=" << local_hostname_
+              << " owned_offset=" << geometry.owned_offset
+              << " owned_bytes=" << geometry.owned_capacity
+              << " registration_bytes=" << geometry.owned_capacity
+              << " allocator=native_mooncake backend=" << ToString(geometry.backend_kind);
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::CallosumQuery(
+    const std::vector<std::string>& keys) {
+    if (!callosum_bridge_) return BatchQuery(keys);
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (const auto& key : keys) {
+        if (!callosum_bridge_->Materialize(key)) {
+            results.emplace_back(tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+            continue;
+        }
+        auto query = Query(key);
+        std::vector<Replica::Descriptor> local;
+        if (query) for (const auto& replica : query->replicas)
+            if (callosum_bridge_->Owns(replica)) local.push_back(replica);
+        if (local.empty()) {
+            results.emplace_back(tl::unexpected(ErrorCode::REPLICA_NOT_FOUND));
+        } else {
+            results.emplace_back(QueryResult(std::move(local), query->lease_timeout,
+                                             query->object_checksum));
+        }
+    }
+    return results;
+}
+
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
+    if (callosum_bridge_) {
+        if (config.replica_num != 1 || config.nof_replica_num != 0 ||
+            (!config.preferred_segment.empty() &&
+             config.preferred_segment != local_hostname_) ||
+            (!config.preferred_segments.empty() &&
+             config.preferred_segments != std::vector<std::string>{local_hostname_})) {
+            throw std::invalid_argument("Callosum save requires one local pool replica");
+        }
+        client_cfg.preferred_segment = local_hostname_;
+        client_cfg.preferred_segments = {local_hostname_};
+    }
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
     }
@@ -3282,6 +3350,14 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             segment.cxl_owned_offset = transfer_engine_->getCxlOwnedOffset();
             segment.cxl_owned_capacity = transfer_engine_->getCxlOwnedSize();
         }
+        if (callosum_pool_) {
+            const auto& c = callosum_pool_->config();
+            segment.cxl_master_managed_allocation = true;
+            segment.cxl_pool_id = c.logical_pool_id;
+            segment.cxl_pool_capacity = c.capacity;
+            segment.cxl_owned_offset = c.owned_offset;
+            segment.cxl_owned_capacity = c.owned_capacity;
+        }
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {
@@ -3676,6 +3752,23 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
                    << ", error=source_replica_not_in_local_memory";
         revoke_lambda();
         return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
+    }
+
+    if (callosum_bridge_) {
+        const auto copied = callosum_bridge_->Copy(key, source, targets);
+        if (!copied.success) {
+            if (copied.safe_to_revoke) revoke_lambda();
+            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+        // Copy() returns success only after receiver validation. CopyEnd is
+        // still Store's sole complete-replica publication point.
+        auto result = end_fn();
+        if (!result) revoke_lambda();
+        if (result) LOG(INFO) << "component=callosum_store event=replica_published"
+                             << " key_crc=" << ComputeCrcChecksum(key.data(), key.size())
+                             << " source_generation=" << source.id
+                             << " target_generation=" << targets[0].id;
+        return result;
     }
 
     // Split the source replica into slices for transfer
@@ -4290,6 +4383,11 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
+                if (callosum_bridge_) {
+                    LOG(INFO) << "component=callosum_store event=store_task_dispatch"
+                              << " task=" << UuidToString(assignment.id)
+                              << " key_crc=" << ComputeCrcChecksum(payload.key.data(), payload.key.size());
+                }
                 auto copy_result = Copy(payload.key, payload.tenant_id,
                                         payload.source, payload.targets);
                 if (copy_result.has_value()) {

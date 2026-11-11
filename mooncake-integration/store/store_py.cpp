@@ -1915,6 +1915,8 @@ class MooncakeDistributedNoFRegisterPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
+    m.attr("CALLOSUM_STORE_ABI") = 1;
+    m.attr("CALLOSUM_STORE_MUX_ABI") = 1;
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");

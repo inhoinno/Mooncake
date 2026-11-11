@@ -74,15 +74,18 @@ struct GetStorageConfigResponse {
     std::string fsdir;
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+    uint32_t callosum_store_abi{0};
 
     GetStorageConfigResponse() : enable_disk_eviction(true), quota_bytes(0) {}
     GetStorageConfigResponse(const std::string& fsdir_param,
-                             bool enable_eviction, uint64_t quota)
+                             bool enable_eviction, uint64_t quota,
+                             uint32_t callosum_abi = 0)
         : fsdir(fsdir_param),
           enable_disk_eviction(enable_eviction),
-          quota_bytes(quota) {}
+          quota_bytes(quota), callosum_store_abi(callosum_abi) {}
 };
-YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
+YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes,
+         callosum_store_abi);
 
 struct NoFSegmentOwnerInfo {
     UUID segment_id;

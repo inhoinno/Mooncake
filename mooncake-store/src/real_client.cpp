@@ -18,6 +18,8 @@
 #include <vector>
 
 #include "real_client.h"
+#include "callosum_store.h"
+#include "crc_checksum.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
@@ -618,6 +620,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port) {
+    // Resolve once, before creating an engine, mapping or service. This mode
+    // owns notifications and mounts only the configured native Store arena.
+    auto callosum = CallosumStoreConfig::Load();
+    if (callosum && (protocol != "rdma" || global_segment_size != 0 ||
+                    transfer_engine || enable_ssd_offload ||
+                    std::getenv("MC_CXL_DEV_PATH") != nullptr)) {
+        throw std::invalid_argument(
+            "Callosum requires RDMA, zero DRAM segment, a private engine and no CXL transport/offload override");
+    }
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -763,7 +774,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // If global_segment_size is 0, skip mount segment;
     // If global_segment_size is larger than max_mr_size, split to multiple
     // mapped_shms.
-    if (protocol == "cxl") {
+    if (callosum) {
+        client_->EnableCallosum(*callosum);
+        callosum_enabled_ = true;
+    } else if (protocol == "cxl") {
         // Consume the already validated mapping configuration from Transfer
         // Engine. Re-parsing MC_CXL_DEV_SIZE here previously allowed Store and
         // CxlTransport to disagree about the usable extent.
@@ -6169,7 +6183,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         return results;
     }
     // Query metadata for all keys
-    const auto query_results = client_->BatchQuery(keys);
+    const auto query_results = client_->CallosumQuery(keys);
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
         std::string key;
@@ -6580,6 +6594,15 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
     }
 
+    if (callosum_enabled_) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            LOG(INFO) << "component=callosum_store event=connector_load_complete"
+                      << " key_crc=" << ComputeCrcChecksum(keys[i].data(), keys[i].size())
+                      << " success=" << results[i].has_value()
+                      << " bytes=" << (results[i] ? *results[i] : 0)
+                      << " tensor_extents=" << all_buffers[i].size();
+        }
+    }
     return results;
 }
 

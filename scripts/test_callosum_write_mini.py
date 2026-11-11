@@ -20,6 +20,43 @@ from callosum_transport_benchmark import write_loop, TOTAL_BYTES
 
 
 class MiniTest(unittest.TestCase):
+    def test_rotating_strategy_cli_payload_and_old_master_gate(self):
+        for supported in (False,True,'old-agent'):
+            with self.subTest(supported=supported),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory); path,spec=self.fixture(root)
+                spec.update(access_pattern='sequential',access_window_bytes=2*1024**2,random_seed=19)
+                path.write_text(json.dumps(spec))
+                spec,c,topology,env,out=mini.load_spec(path,2); out.mkdir(parents=True)
+                runner=Runner(out); runner.config_sha256='fixture'; calls=[]
+                def call(stage,argv,*a,**kw):
+                    calls.append((stage,argv))
+                    if stage=='effective-config': return json.dumps(dict(config=c))
+                    if stage=='status-before': return json.dumps(dict(fingerprint=c['fingerprint'],topology_verified=True,
+                        registered_nodes=['a1','b1'],operations=[],benchmark_request_timing_versions={'b1':1},
+                        transport_access_patterns=['sequential'] if supported else [],
+                        benchmark_access_patterns={n:[] if supported=='old-agent' and n=='b1' else ['sequential'] for n in ('a1','b1')}))
+                    if stage.startswith('seed-'):
+                        self.assertEqual(argv[argv.index('--bytes')+1],2*1024**2)
+                        return '{}'
+                    self.assertEqual(argv[argv.index('--access-pattern')+1],'sequential')
+                    self.assertEqual(argv[argv.index('--access-window-bytes')+1],str(2*1024**2))
+                    self.assertEqual(argv[argv.index('--random-seed')+1],'19')
+                    row=write_loop(lambda s,d,n:n,4096,8192,1024**2,3*1024**2,1024**2,
+                        access_pattern='sequential',window_bytes=2*1024**2,random_seed=19)
+                    return json.dumps(dict(row,status='PASS',actual_transport='rdma',path_mode='direct_dax_write',
+                        request_timing_version=1))
+                try:
+                    with patch.object(Runner,'call',side_effect=call),patch.object(mini,'TOTAL_BYTES',3*1024**2), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                        if supported is True: mini.execute(spec,c,topology,env,out,runner)
+                        else:
+                            with self.assertRaisesRegex(RuntimeError,'access-strategy'): mini.execute(spec,c,topology,env,out,runner)
+                    if supported is True:
+                        result=json.loads((out/'summary.json').read_text())
+                        self.assertEqual(result['results'][0]['access_pattern'],'sequential')
+                    else: self.assertFalse(any(stage.startswith('seed-') for stage,_ in calls))
+                finally: runner.log.close()
+
     def fixture(self,root,workers=2):
         pairs=[{'source':'b1','receiver':'a1'}]
         if workers==4: pairs.append({'source':'b2','receiver':'a2'})

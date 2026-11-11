@@ -13,7 +13,7 @@ import time
 
 from callosum_lab import Runner, clean_env
 from callosum_runtime import config as read_topology, require
-from callosum_transport_benchmark import block_bytes, TOTAL_BYTES
+from callosum_transport_benchmark import block_bytes, TOTAL_BYTES, access_strategy
 from callosum_benchmark_report import enrich_trial, write_report, write_request_csv
 
 
@@ -28,7 +28,8 @@ def load_spec(path, workers, mode_override=None):
     spec=json.loads(path.read_text())
     require(spec.get('schema_version')==1,'mini config schema_version must be 1')
     require(set(spec) <= {'schema_version','topology_file','runtime','token_file','output','output_root',
-                         'pairs','schedule','sizes','unit','repetitions','mr_page_mode','require_dax_2m'},'unknown mini config fields')
+                         'pairs','schedule','sizes','unit','repetitions','mr_page_mode','require_dax_2m',
+                         'access_pattern','access_window_bytes','random_seed'},'unknown mini config fields')
     require(type(spec.get('require_dax_2m',False)) is bool,'require_dax_2m must be boolean')
     if mode_override is not None:
         spec['mr_page_mode']=mode_override
@@ -64,6 +65,13 @@ def load_spec(path, workers, mode_override=None):
             len(sizes)==len(set(sizes)) and type(repetitions) is int and 0<repetitions<=100,
             'invalid sizes/repetitions')
     lengths=[block_bytes(n,spec['unit']) for n in sizes]
+    require(spec.get('access_window_bytes') is None or
+            (type(spec['access_window_bytes']) is int and spec['access_window_bytes']>0),'access window must be positive')
+    if spec.get('access_pattern','overwrite')!='overwrite':
+        spec.setdefault('access_window_bytes',max(lengths))
+    for length in lengths:
+        access_strategy(spec.get('access_pattern','overwrite'),length,
+                        spec.get('access_window_bytes') or length,spec.get('random_seed',0))
     require(max(lengths)<=c['max_inflight_bytes'],'size exceeds running native request budget')
     rt=spec['runtime']
     if 'setup_run' in rt:
@@ -94,8 +102,10 @@ def load_spec(path, workers, mode_override=None):
     # Static capacity bounds only. The live authority still checks all previous allocations.
     required={p:4096 for p in c['pools']}
     for pair in pairs:
-        required[nodes[pair['source']]['pool']]+=max(lengths)
-        required[nodes[pair['receiver']]['pool']]+=sum(lengths)*repetitions
+        window=spec.get('access_window_bytes') or max(lengths)
+        required[nodes[pair['source']]['pool']]+=max(max(lengths),window)
+        required[nodes[pair['receiver']]['pool']]+=(window if spec.get('access_pattern','overwrite')!='overwrite' or spec.get('access_window_bytes') is not None
+                                                   else sum(lengths)*repetitions)
     require(all(required[p]<=c['pools'][p]['capacity'] for p in required),'declared arena too small for planned retained windows')
     return spec,c,topology,env,output
 
@@ -118,6 +128,12 @@ def execute(spec,c,topology,env,output,runner):
             'live campaign is not healthy or does not match configured topology')
     require(all(status.get('benchmark_request_timing_versions',{}).get(p['source'])==1 for p in spec['pairs']),
             'running sender lacks request timing; do not hot-restart retained services')
+    if spec.get('access_pattern','overwrite')!='overwrite' or spec.get('access_window_bytes') is not None:
+        require(spec.get('access_pattern','overwrite') in status.get('transport_access_patterns',[]),
+                'running master lacks access-strategy support; no seed or WRITE sent')
+        require(all(spec.get('access_pattern','overwrite') in status.get('benchmark_access_patterns',{}).get(n,[])
+                    for p in spec['pairs'] for n in p.values()),
+                'running agents lack access-strategy support; no seed or WRITE sent')
     page_mode=spec.get('mr_page_mode','native')
     pages=status.get('mr_pages',{})
     # Older native agents remain usable, but their page geometry is unknown.
@@ -136,7 +152,7 @@ def execute(spec,c,topology,env,output,runner):
         key='mini-'+secrets.token_hex(12)
         runner.remote_mutation_possible=True
         seed=command(f'seed-{i}','seed','--node',pair['source'],'--key',key,
-                     '--bytes',max(block_bytes(n,spec['unit']) for n in spec['sizes']))
+                     '--bytes',max(spec.get('access_window_bytes') or 0,max(block_bytes(n,spec['unit']) for n in spec['sizes'])))
         (output/f'seed-{i}.json').write_text(json.dumps(seed,indent=2)+'\n')
         sources[i]=key
     def trial(i,pair,size,rep):
@@ -144,13 +160,21 @@ def execute(spec,c,topology,env,output,runner):
         begin_wall=time.time_ns(); begin=time.monotonic_ns()
         raw=runner.call(name,['bash',relay,'transport-benchmark','--node',pair['source'],
                     '--receiver',pair['receiver'],'--key',sources[i],'--block-size',size,
-                    '--block-unit',spec['unit'],'--config',topology],env,capture=True,log_stdout=False)
+                 '--block-unit',spec['unit'],'--config',topology,
+                 *(['--access-pattern',spec.get('access_pattern','overwrite'),'--access-window-bytes',str(spec['access_window_bytes']),
+                    '--random-seed',str(spec.get('random_seed',0))] if spec.get('access_pattern','overwrite')!='overwrite' or spec.get('access_window_bytes') is not None else [])],
+                 env,capture=True,log_stdout=False)
         end=time.monotonic_ns(); end_wall=time.time_ns()
         # Preserve the exact response outside the controller timer, even if validation fails.
         # Do not match block*.json: offline reports must not count a trial twice.
         with (output/f'observed-{name}.json').open('x') as stream:
             stream.write(raw)
         row=json.loads(raw)
+        if spec.get('access_pattern','overwrite')!='overwrite' or spec.get('access_window_bytes') is not None:
+            require(row.get('access_pattern')==spec.get('access_pattern','overwrite') and
+                    row.get('window_bytes')==spec['access_window_bytes'] and
+                    row.get('random_seed')==spec.get('random_seed',0),
+                    'benchmark result does not match requested strategy/window/seed')
         require(row.get('bytes')==TOTAL_BYTES and row.get('request_timing_version')==1,
                 'missing byte accounting or request timings')
         row.update(direction=f'{pair["source"]}->{pair["receiver"]}',repetition=rep,

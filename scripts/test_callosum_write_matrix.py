@@ -24,6 +24,20 @@ import test_callosum_dram_benchmark as dram_tests
 
 
 class MatrixTest(unittest.TestCase):
+    def test_run_strategy_knobs_reach_sender_without_changing_receiver_mr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); path,args=self.fixture(root)
+            spec,c,topology,receipt,private,env,_=matrix.load(path,args)
+            for pattern in ('overwrite','sequential','uniform_random'):
+                args.access_pattern=pattern; args.access_window_bytes=128000000; args.random_seed=123
+                sender=matrix.dram_command(spec,args,topology,receipt,private,root/'send','native','sender',env)
+                self.assertEqual(sender[sender.index('--access-pattern')+1],pattern)
+                self.assertEqual(sender[sender.index('--access-window-bytes')+1],'128000000')
+                self.assertEqual(sender[sender.index('--random-seed')+1],'123')
+                receiver=matrix.dram_command(spec,args,topology,receipt,private,root/'receive','native','receiver',env)
+                self.assertNotIn('--access-pattern',receiver)
+                self.assertNotIn('--access-window-bytes',receiver)
+
     def test_script_drops_sudo_before_any_project_import_or_argparse(self):
         state=dict(uid=0); imports=[]; original=builtins.__import__
         def importer(name,*a,**kw):
