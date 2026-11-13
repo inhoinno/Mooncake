@@ -111,8 +111,11 @@ def config(path):
             'unsupported path_mode; staged WRITE is not implemented; no fallback')
     require(c.get('evidence_class', 'TRANSFER_ONLY') == 'TRANSFER_ONLY',
             'this runtime cannot serve as Store or GlobalMaster authority')
-    require(len(c['nodes']) in (2, 4) and len(c['pools']) == 2,
-            'require two or four workers and two pools')
+    colocated = c.get('experiment_layout') == 'colocated_pairs'
+    require(c.get('experiment_layout') in (None, 'colocated_pairs'), 'unknown experiment layout')
+    require((len(c['nodes']) == 4 and len(c['pools']) == 3 and c['mode'] == 'rdma')
+            if colocated else (len(c['nodes']) in (2, 4) and len(c['pools']) == 2),
+            'require two/four workers in two pools, or four colocated endpoints in three RDMA pools')
     require(len({n['id'] for n in c['nodes']}) == len(c['nodes']), 'duplicate node')
     urls = [c['master']] + [n['url'] for n in c['nodes']]
     require(len(urls) == len(set(urls)), 'duplicate service endpoint')
@@ -130,8 +133,9 @@ def config(path):
                 type(p.get('map_offset', 0)) is int and p.get('map_offset', 0) >= 0 and
                 p.get('map_offset', 0) + p['capacity'] < 2**63 and
                 p.get('map_offset', 0) % 4096 == 0, 'invalid pool geometry')
-        require(sum(n['pool'] == pool for n in c['nodes']) == len(c['nodes']) // 2,
-                'each pool needs half the configured workers')
+        if not colocated:
+            require(sum(n['pool'] == pool for n in c['nodes']) == len(c['nodes']) // 2,
+                    'each pool needs half the configured workers')
     for n in c['nodes']:
         require(n['pool'] in c['pools'], 'unknown pool')
         require(Path(n['path']).is_absolute(), 'mapping path must be absolute')
@@ -155,11 +159,20 @@ def config(path):
                     'invalid device mapping alignment')
             if page_mode == 'huge2MB':
                 require(alignment == 2**21, 'huge2MB requires 2097152-byte DAX alignment')
-        require(len(set(identities)) == 2, 'physical pools must be independent')
+        require(len(set(identities)) == len(c['pools']), 'physical pools must be independent')
         require(all(n.get('te_endpoint') and n.get('rdma_device') for n in c['nodes']),
                 'explicit TE endpoint and RDMA device required per worker')
         require(len({n['te_endpoint'] for n in c['nodes']}) == len(c['nodes']),
                 'duplicate TE endpoint')
+        if colocated:
+            from collections import Counter
+            senders = [n for n in c['nodes'] if n['can_send'] and not n['can_receive']]
+            receivers = [n for n in c['nodes'] if n['can_receive'] and not n['can_send']]
+            require(len(senders) == len(receivers) == 2 and
+                    sorted(Counter(n['pool'] for n in c['nodes']).values()) == [1, 1, 2] and
+                    len({n['pool'] for n in senders}) == 1 and len({n['pool'] for n in receivers}) == 2 and
+                    len({n['path'] for n in senders}) == 1 and len({n['path'] for n in receivers}) == 2,
+                    'colocated pairs require a shared source device and two separate destination pools/devices')
     require(type(c.get('batch_cap', 32)) is int and 1 <= c.get('batch_cap', 32) <= 256,
             'batch_cap must be 1..256')
     require(type(c.get('max_inflight_bytes', 64*1024**2)) is int and
@@ -310,7 +323,13 @@ class Cuda:
 class Agent:
     def __init__(self, c, node_id, log):
         self.c, self.log = c, log
+        self.dax_numa = None
         self.node = next(n for n in c['nodes'] if n['id'] == node_id)
+        if c.get('experiment_layout') == 'colocated_pairs' and self.node['can_send']:
+            from callosum_transport_benchmark import dax_numa_evidence
+            self.dax_numa = dax_numa_evidence(self.node['path'], self.node['rdma_device'])
+            self.dax_numa.update(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                                 time_namespace=os.readlink('/proc/self/ns/time'))
         self.mapping = Mapping(c, self.node)
         self.epoch = secrets.token_hex(16)
         self.lock = threading.Lock()
@@ -347,7 +366,8 @@ class Agent:
                     transport_access_patterns=list(ACCESS_PATTERNS),
                     transport_env={k:os.environ.get(k) for k in ('MC_MTU','MC_GID_INDEX')},
                     mr_pages=self.mapping.page_evidence,
-                    configured_qps=os.environ.get('MC_NUM_QP_PER_EP', 'default'))
+                    configured_qps=os.environ.get('MC_NUM_QP_PER_EP', 'default'),
+                    **({'dax_numa': self.dax_numa} if self.dax_numa is not None else {}))
 
     def handle(self, method, d):
         if method == 'health':
@@ -688,6 +708,8 @@ class Master:
         if method == 'transport_benchmark':
             return self.transport_benchmark(d)
         if method == 'fetch':
+            require(self.c.get('experiment_layout') != 'colocated_pairs',
+                    'colocated direct profile supports paired transport sweeps only')
             with self.lock:
                 require(self.topology_ok, 'run destructive topology preflight first')
                 identity = (d['key'], self.node(d['requester'])['pool'])
@@ -723,6 +745,8 @@ class Master:
                         for i,v in self.db.execute('SELECT id,descriptor FROM members')},
                     mr_pages={i:json.loads(v).get('mr_pages')
                         for i,v in self.db.execute('SELECT id,descriptor FROM members')},
+                    dax_numa={i:json.loads(v)['dax_numa'] for i,v in
+                        self.db.execute('SELECT id,descriptor FROM members') if 'dax_numa' in json.loads(v)},
                     remaining_capacity_bytes={p:self.c['pools'][p]['capacity']-n
                         for p,n in self.db.execute('SELECT id,next FROM pools')},
                     topology_verified=self.topology_ok,
@@ -744,7 +768,8 @@ class Master:
                 with self.lock:
                     self.topology_ok = True
                 self.log.emit('topology_verified', mode=self.c['mode'], members=len(members))
-                return dict(shared_pairs_verified=True, separate_pools_verified=True, mode=self.c['mode'])
+                return dict(shared_pairs_verified=True, separate_pools_verified=True, mode=self.c['mode'],
+                            pools_checked=len(self.c['pools']))
         if method == 'seed':
             require(isinstance(d['key'], str) and 0 < len(d['key']) <= 512, 'invalid key')
             with self.lock:

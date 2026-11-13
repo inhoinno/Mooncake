@@ -3,6 +3,7 @@ import time
 import random
 import hashlib
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 TOTAL_BYTES = 8 * 1024**3
@@ -124,7 +125,19 @@ def write_loop(write, source, destination, block, total, limit, samples_out=None
                 addressable_window_bytes=strategy.slots*block,unused_window_tail_bytes=strategy.window%block,
                 degenerate_one_slot=strategy.slots==1,
                 random_seed=random_seed,address_selection_scope='included in loop; excluded from per-request timer',
+                sender_loop_start_monotonic_ns=start,
                 sender_start_unix_ns=wall_start,sender_end_unix_ns=time.time_ns(),
                 request_timing_version=1,
                 latency_scope='sender logical WRITE call start through drain; excludes control and checksum',
                 instrumentation='offset selection (including random RNG), two monotonic reads and in-memory samples; no loop file I/O')
+def dax_numa_evidence(path, hca, sysroot=Path('/sys')):
+    """Check device backing locality, not the caller's CPU binding."""
+    dax = Path(path).name
+    if Path(hca).name != hca or hca in ('', '.', '..'):
+        raise ValueError('invalid HCA name')
+    dax_node = int((sysroot/'bus/dax/devices'/dax/'target_node').read_text())
+    nic_node = int((sysroot/'class/infiniband'/hca/'device/numa_node').read_text())
+    if min(dax_node,nic_node)<0 or dax_node==nic_node:
+        raise ValueError(f'{path} target_node={dax_node}, {hca} numa_node={nic_node}: '
+                         'select an inventoried NUMA-remote source DAX device')
+    return dict(path=path, hca=hca, dax_target_node=dax_node, nic_numa_node=nic_node)

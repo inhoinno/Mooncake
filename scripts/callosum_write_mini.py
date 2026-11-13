@@ -57,6 +57,8 @@ def load_spec(path, workers, mode_override=None):
     else:
         require(len(pairs)>=2 and {p[k] for p in pairs for k in ('source','receiver')}==set(nodes),
                 'four-worker mini must exercise all four workers')
+    if c.get('experiment_layout')=='colocated_pairs':
+        require(workers==4 and len(pairs)==2, 'colocated benchmark must exercise both pairs')
     if spec['schedule']=='concurrent_pairs':
         endpoints=[p[k] for p in pairs for k in ('source','receiver')]
         require(len(endpoints)==len(set(endpoints)),'concurrent pairs must use disjoint endpoints')
@@ -128,6 +130,17 @@ def execute(spec,c,topology,env,output,runner):
             'live campaign is not healthy or does not match configured topology')
     require(all(status.get('benchmark_request_timing_versions',{}).get(p['source'])==1 for p in spec['pairs']),
             'running sender lacks request timing; do not hot-restart retained services')
+    if c.get('experiment_layout')=='colocated_pairs':
+        clocks=set()
+        for pair in spec['pairs']:
+            placement = status.get('dax_numa', {}).get(pair['source'], {})
+            require(min(placement.get('dax_target_node',-1), placement.get('nic_numa_node',-1))>=0 and
+                    placement['dax_target_node']!=placement['nic_numa_node'],
+                    'running sender lacks NUMA-remote DAX evidence')
+            require(placement.get('boot_id') and placement.get('time_namespace'),
+                    'missing colocated source clock evidence')
+            clocks.add((placement['boot_id'],placement['time_namespace']))
+        require(len(clocks)==1,'the direct senders must share one host monotonic clock')
     if spec.get('access_pattern','overwrite')!='overwrite' or spec.get('access_window_bytes') is not None:
         require(spec.get('access_pattern','overwrite') in status.get('transport_access_patterns',[]),
                 'running master lacks access-strategy support; no seed or WRITE sent')
@@ -210,6 +223,12 @@ def execute(spec,c,topology,env,output,runner):
                         useful_bytes=sum(r['bytes'] for r in group),
                         aggregate_protocol_GBps=sum(r['bytes'] for r in group)/elapsed,
                         scope='one controller window includes CLI startup, RPC, verification and JSON return; excludes final report writing; not sender-loop sum')
+            if c.get('experiment_layout')=='colocated_pairs':
+                starts=[r['sender_loop_start_monotonic_ns'] for r in group]
+                ends=[start+r['sender_write_loop_ns'] for start,r in zip(starts,group)]
+                common.update(sender_common_window_ns=max(ends)-min(starts),
+                              sender_loop_overlap_ns=max(0,min(ends)-max(starts)),
+                              aggregate_sender_GBps=common['useful_bytes']/(max(ends)-min(starts)))
             groups.append(common)
             (output/f'group-{group_id}.json').write_text(json.dumps(common,indent=2)+'\n')
             for row in group:
@@ -228,6 +247,7 @@ def execute(spec,c,topology,env,output,runner):
                          f"{g['useful_bytes']/2**30:g} | {g['aggregate_protocol_GBps']:.3f} |\n")
     (output/'summary.json').write_text(json.dumps(dict(status='PASS',evidence_class='TRANSFER_ONLY',
         report=report,results=rows,groups=groups,services_retained=True,
+        experiment_layout=c.get('experiment_layout','standard'),
         multipath_object_assembly_proven=False),indent=2)+'\n')
     runner.say((output/'report.md').read_text())
     runner.say(f'[evidence] {output}')

@@ -126,8 +126,11 @@ class ProbeTest(unittest.TestCase):
             self.assertEqual(probe.main([*args, '--master-address', '192.0.2.1:50051']), 1)
             self.assertEqual(output.read_bytes(), original_config)
             self.assertEqual(probe.main([*base, *receipts, '--config', str(self.root / 'second.json'),
-                                         '--master-address', '192.0.2.1:50051']), 0)
+                                         '--reverse', '--sweep-mib', '1', '8', '--repetitions', '2']), 0)
             self.assertEqual(token.read_bytes(), original_token)
+        reverse = probe.load_config(self.root / 'second.json')
+        self.assertEqual((reverse['source'], reverse['requester']), ('receiver', 'sender'))
+        self.assertEqual(len(probe.trial_specs(reverse)), 5)
         c = probe.load_config(output)
         self.assertEqual(c['nodes']['receiver']['expected_store_sha256'], 'b' * 64)
         self.assertEqual(c['nodes']['sender']['expected_store_sha256'], 'c' * 64)
@@ -211,6 +214,81 @@ class ProbeTest(unittest.TestCase):
         self.assertFalse(report['serving_proven'])
         self.assertFalse(report['gpu_delivery_proven'])
         self.assertEqual(probe.crc64(b'123456789'), 0x6C40DF5F0B497347)
+
+    def test_store_sweep_verifies_fresh_tasks_and_preserves_clock_breakdown(self):
+        from callosum_benchmark_report import write_store_sweep_report
+
+        campaign = dict(self.c, sweep=dict(sizes_mib=[1, 8], repetitions=1))
+        original = self.c
+        all_tx, all_rx, master = [], [], []
+        source_trials, requester_trials = [], []
+        for t in probe.trial_specs(campaign):
+            self.c = t
+            tx, rx = self.logs()
+            source, requester = self.receipts()
+            source_trials.append(source['result'])
+            requester_trials.append(requester['result'])
+            i = t['trial_index']
+            crc = probe.crc64(probe.key(t).encode())
+            task = f'task-{i}'
+            tx = [r.replace('attempt=x', f'attempt={i}').replace('task=store-task-1', f'task={task}') for r in tx]
+            rx = [r.replace('attempt=x', f'attempt={i}').replace('task=store-task-1', f'task={task}') for r in rx]
+            tx = [r + ' source_checksum_ns=3 authorize_round_trip_ns=7' if 'event=receiver_authorized ' in r
+                  else r + ' verify_round_trip_ns=9' if 'event=copy_verified ' in r
+                  else r + ' copy_end_rpc_ns=11' if 'event=replica_published ' in r else r for r in tx]
+            tx.append(f'event=copy_reserved key_crc={crc} copy_start_rpc_ns=12')
+            rx = [r + ' receiver_checksum_ns=8' if 'event=receiver_validated ' in r
+                  else r + (' initial_lookup_ns=10 create_copy_task_rpc_ns=20 wait_for_task_success_ns=900'
+                            ' query_task_rpc_total_ns=12 query_task_calls=3 final_requery_ns=30')
+                  if 'phase=remote ' in r else r for r in rx]
+            rx += [f'event=store_api_complete key_crc={crc} key_count=1 bytes={t["block_bytes"]} store_api_ns={ns}'
+                   for ns in (1100, 240)]
+            all_tx.extend(tx)
+            all_rx.extend(rx)
+            master.append(f'event=master_task_pickup task={task} enqueue_to_dequeue_ns=750')
+            master.append(f'event=master_task_success_query task={task} dequeue_to_complete_ns=100 complete_to_success_query_ns=25')
+        self.c = original
+        source['result'] = dict(trials=source_trials)
+        requester['result'] = dict(trials=requester_trials)
+        paths = [self.root / f'{name}.log' for name in ('tx', 'rx', 'master')]
+        for path, lines in zip(paths, (all_tx, all_rx, master)):
+            path.write_text('\n'.join('component=callosum_store ' + line for line in lines))
+        rows = probe.verify_sweep(campaign, source, requester, *paths)
+        self.assertEqual([r['trial_class'] for r in rows], ['warmup', 'measured', 'measured'])
+        self.assertEqual(rows[1]['latency_breakdown']['master']['enqueue_to_dequeue_ns'], 750)
+        self.assertEqual(rows[1]['latency_breakdown']['master']['complete_to_success_query_ns'], 25)
+        self.assertEqual(rows[1]['latency_breakdown']['requester']['store_api_outside_materialize_ns'], 100)
+        summary = write_store_sweep_report(self.root, rows, campaign['run_id'])
+        self.assertEqual([a['trials'] for a in summary['aggregates']], [1, 1])
+        self.assertEqual(len((self.root / 'latency.jsonl').read_text().splitlines()), 3)
+        paths[-1].write_text('')
+        with self.assertRaisesRegex(ValueError, 'master task pickup'):
+            probe.verify_sweep(campaign, source, requester, *paths)
+
+    def test_sweep_requester_reuses_registration_and_loads_each_fresh_key_twice(self):
+        campaign = dict(self.c, sweep=dict(sizes_mib=[1, 2], repetitions=1))
+        cases = probe.trial_specs(campaign)
+        stores = {probe.key(t): Store(t) for t in cases}
+        buffer_store = Store(campaign)
+        seen = []
+
+        def get(keys, buffers, sizes):
+            seen.append(keys[0])
+            return stores[keys[0]].batch_get_into_multi_buffers(keys, buffers, sizes)
+
+        module_store = SimpleNamespace(
+            get_replica_desc=lambda name: stores[name].get_replica_desc(name),
+            is_exist=lambda _: 0, batch_get_into_multi_buffers=get,
+            register_buffer=buffer_store.register_buffer, unregister_buffer=buffer_store.unregister_buffer,
+            put=buffer_store.put)
+        retained = []
+        result = probe.sweep_run(module_store, MODULE, campaign, retained, False, self.root)
+        self.assertEqual(seen, [probe.key(t) for t in cases for _ in range(2)])
+        self.assertEqual([call[0] for call in buffer_store.calls], ['register', 'unregister', 'put'])
+        self.assertEqual(buffer_store.calls[0][1], 2 << 20)
+        self.assertEqual(len(result['trials']), len(cases))
+        self.assertEqual(len((self.root / 'store-loads.jsonl').read_text().splitlines()), len(cases))
+        self.assertFalse(retained)
 
     def test_incomplete_wrong_transport_wrong_generation_and_early_publication_rejected(self):
         tx, rx = self.logs()

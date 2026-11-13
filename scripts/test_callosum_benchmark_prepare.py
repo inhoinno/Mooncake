@@ -471,6 +471,7 @@ class PreparationTest(unittest.TestCase):
             observed=[]; real_read=Path.read_text
             def read(path,*a,**kw):
                 if str(path)=='/etc/machine-id': return 'machine-'+context.node
+                if str(path)=='/sys/class/infiniband/test-hca/device/numa_node': return '0'
                 return real_read(path,*a,**kw)
             def build(source,run,args,runner):
                 (run/'setup.json').write_bytes((root/context.node/'setup.json').read_bytes())
@@ -554,13 +555,58 @@ class PreparationTest(unittest.TestCase):
                 for node,(path,args,work) in hosts.items():
                     self.assertEqual(json.loads((work/'prepare.json').read_text())['status'],'PREPARED_NOT_TESTED')
                     context.node=node
-                    with patch.object(sys,'argv',['matrix','run','--config',str(path),'--node',node]), \
+                    def transport(stage, argv, *a, **kw):
+                        from callosum_transport_benchmark import write_loop
+                        if stage=='cxl-status-preflight':
+                            c=matrix.config(Path(json.loads(path.read_text())['topology_file']))
+                            return json.dumps(dict(fingerprint=c['fingerprint'],topology_verified=True,
+                                transport_access_patterns=['sequential'],
+                                benchmark_access_patterns={n:['sequential'] for n in ('a1','b1')}))
+                        dest=(Path(json.loads(Path(argv[-1]).read_text())['output']) if stage=='cxl-native'
+                              else Path(argv[argv.index('--output')+1]))
+                        dest.mkdir()
+                        summary=dict(status='PASS')
+                        if not stage.startswith('smoke-'):
+                            if stage=='cxl-native':
+                                plan=json.loads(Path(argv[-1]).read_text())
+                                self.assertEqual((plan['access_pattern'],plan['access_window_bytes']),
+                                                 ('sequential',2*10**6))
+                            rows=[]
+                            for size in (1,2):
+                                row=write_loop(lambda s,d,n:n,4096,8192,size*10**6,2*10**6,size*10**6,
+                                               access_pattern='sequential',window_bytes=2*10**6)
+                                row.update(status='PASS',actual_transport='rdma',path_mode='direct_dax_write'
+                                           if stage=='cxl-native' else 'dram_rdma_write',direction='b1->a1',repetition=0)
+                                rows.append(row)
+                            summary['results']=rows
+                        (dest/'summary.json').write_text(json.dumps(summary))
+                    real_run=matrix.run
+                    def sender(*values):
+                        selected('sender')(*values)
+                        real_run(*values)
+                    run_args=['matrix','run','--config',str(path),'--node',node]
+                    if node=='b1':
+                        run_args += ['--access-pattern','sequential','--access-window-bytes','2000000']
+                    with patch.object(sys,'argv',run_args), \
                          patch.dict(os.environ,IO_SIZES='1 2 4 8 16 32 64 128',IO_UNIT='MiB'), \
                          patch.object(matrix,'receive',side_effect=selected('receiver')), \
-                         patch.object(matrix,'run',side_effect=selected('sender')), \
+                         patch.object(matrix,'run',side_effect=sender), \
+                         patch.object(lab.Runner,'call',side_effect=transport), \
+                         patch.object(matrix,'TOTAL_BYTES',2*10**6), \
                          patch.object(matrix,'receiver_health',return_value={}), \
                          patch.object(prep.subprocess,'check_output',side_effect=AssertionError('no run SSH')):
                         self.assertEqual(matrix.main(),0)
+                    if node=='b1':
+                        result=output.getvalue().split('[result-dir] ')[-1].splitlines()[0]
+                        command=['matrix','verify','--config',str(path),'--node',node,'--result-dir',result]
+                        with patch.object(sys,'argv',command), patch.object(matrix,'TOTAL_BYTES',2*10**6), \
+                             patch.object(prep.subprocess,'check_output',side_effect=AssertionError('no verify SSH')):
+                            self.assertEqual(matrix.main(),0)
+                            self.assertIn('OFFLINE_RESULT_VERIFICATION',output.getvalue())
+                            # Corrupt only fixture evidence; the verifier must reject it.
+                            with (Path(result)/'requests.csv').open('a') as stream:
+                                stream.write('extra,invalid\n')
+                            self.assertEqual(matrix.main(),1)
                 self.assertEqual(observed,[('receiver','a1',[1,2],'MB',1),('sender','b1',[1,2],'MB',1)])
                 for path,_,_ in hosts.values():
                     token=Path(json.loads(path.read_text())['token_file']).read_text().strip()

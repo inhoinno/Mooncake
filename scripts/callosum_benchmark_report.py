@@ -48,6 +48,73 @@ def percentile(values, p):
     return ordered[max(0, math.ceil(len(ordered)*p)-1)]
 
 
+def write_store_sweep_report(output, rows, run_id):
+    """Report verified Store requests separately from native WRITE batches."""
+    output = Path(output)
+    if not rows or any(row['status'] != 'PASS' or not row['latency_breakdown'] for row in rows):
+        raise ValueError('Store report requires complete verified trial timings')
+    flat = []
+    for row in rows:
+        phases = row['latency_breakdown']
+        record = {k: row[k] for k in ('trial_index', 'trial_class', 'repetition', 'direction',
+                                      'block_bytes', 'store_task', 'attempt', 'native_batches', 'status')}
+        for clock in ('requester', 'master', 'source', 'receiver'):
+            record.update({f'{clock}_{key}': val for key, val in phases[clock].items()})
+        flat.append(record)
+    with (output/'latency.jsonl').open('x') as stream:
+        for row in rows:
+            stream.write(json.dumps(row) + '\n')
+    with (output/'trials.csv').open('x', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(flat[0]))
+        writer.writeheader()
+        writer.writerows(flat)
+    with (output/'requests.csv').open('x', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=REQUEST_FIELDS, extrasaction='ignore')
+        writer.writeheader()
+        for row in rows:
+            writer.writerows(request_records(row, row['trial_index']))
+    groups = {}
+    for row in flat:
+        if row['trial_class'] == 'measured':
+            groups.setdefault(row['block_bytes'], []).append(row)
+    summaries = []
+    for size, samples in groups.items():
+        count = len(samples)
+        api = [r['requester_store_api_ns'] for r in samples]
+        pickup = [r['master_enqueue_to_dequeue_ns'] for r in samples]
+        drain = [r['source_write_call_to_drain_ns'] for r in samples]
+        summaries.append(dict(block_bytes=size, trials=count, store_api_p50_ms=percentile(api, .5)/1e6,
+                              store_api_p95_ms=percentile(api, .95)/1e6,
+                              task_pickup_p50_ms=percentile(pickup, .5)/1e6,
+                              write_drain_p50_ms=percentile(drain, .5)/1e6,
+                              store_GBps=size*count/sum(api), store_GiBps=size*count*1e9/(sum(api)*2**30),
+                              write_GBps=size*count/sum(drain), write_GiBps=size*count*1e9/(sum(drain)*2**30)))
+    if not summaries:
+        raise ValueError('no measured Store trials')
+    with (output/'summary.csv').open('x', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(summaries[0]))
+        writer.writeheader()
+        writer.writerows(summaries)
+    with (output/'report.md').open('x') as stream:
+        stream.write('# Store → mux WRITE sweep\n\n'
+                     'TRANSFER_ONLY. Fresh Store keys, serial requests, fixed DAX mappings and registrations.\n'
+                     'The first warmup is retained in raw evidence and excluded below. Source PUT, '
+                     'resource setup, consumer SHA-256 and the second local load are outside the timed Store miss.\n'
+                     'GB/s is useful bytes divided by summed Store API time or summed native drain time, respectively. '
+                     'Neither is wire rate. Phases nest; do not sum durations across clocks. '
+                     'Nearest-rank percentiles are descriptive; small counts do not establish tail behavior.\n\n'
+                     '| MiB | Trials | Store p50 (ms) | Pickup p50 (ms) | WRITE drain p50 (ms) | Store GB/s | WRITE GB/s |\n'
+                     '|---:|---:|---:|---:|---:|---:|---:|\n')
+        for r in summaries:
+            stream.write(f"| {r['block_bytes']/2**20:g} | {r['trials']} | {r['store_api_p50_ms']:.3f} | "
+                         f"{r['task_pickup_p50_ms']:.3f} | {r['write_drain_p50_ms']:.3f} | "
+                         f"{r['store_GBps']:.3f} | {r['write_GBps']:.3f} |\n")
+    return dict(status='PASS', scope='TRANSFER_ONLY', gate='NATIVE_STORE_TO_MUX_SWEEP',
+                run_id=run_id, direction=rows[0]['direction'], gpu_delivery_proven=False, serving_proven=False,
+                warmup_trials=sum(r['trial_class']=='warmup' for r in rows), aggregates=summaries,
+                files=['latency.jsonl', 'trials.csv', 'requests.csv', 'summary.csv', 'report.md', 'summary.json'])
+
+
 def enrich_trial(row):
     row = dict(row)
     row.setdefault('access_pattern','overwrite')

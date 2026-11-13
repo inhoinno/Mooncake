@@ -716,7 +716,8 @@ def validate_launch_config(config, node_id):
             'abi_version must be integer 2')
     nodes, pools, launch = config.get('nodes'), config.get('pools'), config.get('lab_run')
     require(isinstance(nodes,list) and len(nodes) in (2,4) and all(isinstance(n,dict) for n in nodes)
-            and isinstance(pools,dict) and len(pools)==2 and all(isinstance(p,dict) for p in pools.values()),
+            and isinstance(pools,dict) and len(pools)==(3 if config.get('experiment_layout')=='colocated_pairs' else 2)
+            and all(isinstance(p,dict) for p in pools.values()),
             'Require two/four node records and two pool records')
     def identity(value):
         return isinstance(value,str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}',value)
@@ -765,6 +766,16 @@ def validate_launch_config(config, node_id):
             and len({n['te_endpoint'] for n in nodes})==len(nodes), 'Duplicate service/TE endpoint')
     require(master.hostname==urlparse(by_id[launch['controller']]['url']).hostname,
             'Master endpoint must belong to the configured controller node')
+    if config.get('experiment_layout') == 'colocated_pairs':
+        # Validate the relay-specific membership rules before starting any owner.
+        senders=[n for n in nodes if n['can_send'] and not n['can_receive']]
+        receivers=[n for n in nodes if n['can_receive'] and not n['can_send']]
+        require(len(senders)==len(receivers)==2 and
+                len({n['pool'] for n in senders})==1 and
+                len({n['pool'] for n in receivers})==2 and
+                len({n['pool'] for n in nodes})==3 and
+                len({n['path'] for n in senders})==1 and len({n['path'] for n in receivers})==2,
+                'colocated pairs require one shared source device and two distinct destination pools')
     for pool_id,pool in pools.items():
         require(isinstance(pool.get('owner'),str) and pool['owner'].strip()
                 and isinstance(pool.get('physical_pool_id'),str) and pool['physical_pool_id'].strip(),
@@ -774,8 +785,12 @@ def validate_launch_config(config, node_id):
                 and offset>=0 and size>=4*1024**2 and offset+size<2**63
                 and align>=4096 and align & (align-1)==0 and offset%align==0 and size%align==0,
                 'Invalid exclusive extent/alignment')
-        require(sum(n['pool']==pool_id for n in nodes)==len(nodes)//2, 'Each pool needs half the nodes')
-    require(len({p['physical_pool_id'] for p in pools.values()})==2,
+        if config.get('experiment_layout') != 'colocated_pairs':
+            require(sum(n['pool']==pool_id for n in nodes)==len(nodes)//2, 'Each pool needs half the nodes')
+    if config.get('experiment_layout') == 'colocated_pairs':
+        require(len(nodes)==4 and launch['profile']=='services_only',
+                'colocated pairs require services_only with four endpoints; use the explicit topology preflight')
+    require(len({p['physical_pool_id'] for p in pools.values()})==len(pools),
             'Independent physical pool identities required')
     if launch['profile']=='two_worker_smoke':
         require(len(nodes)==2, 'two_worker_smoke needs two nodes; services_only also supports four')
@@ -1042,6 +1057,10 @@ def node_run(root, run, args, runner):
     (run/'inventory.json').write_text(json.dumps(inv,indent=2))
     runner.stage='local-device-validation'
     node = validate_node_extent(config,args.node_id,inv)
+    if config.get('experiment_layout') == 'colocated_pairs' and node['can_send']:
+        from callosum_transport_benchmark import dax_numa_evidence
+        (run/'source-numa.json').write_text(json.dumps(
+            dax_numa_evidence(node['path'],node['rdma_device']),indent=2))
     startup_checks(config,args.node_id,runner)
     os.environ['CALLOSUM_CONTROL_TOKEN']=secret
     fingerprint=runtime.config(args.config)['fingerprint']

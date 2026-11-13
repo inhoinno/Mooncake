@@ -53,7 +53,7 @@ from callosum_lab import Runner, clean_env
 from callosum_runtime import config, require, rpc
 from callosum_transport_benchmark import block_bytes, TOTAL_BYTES, ACCESS_PATTERNS, access_strategy
 from callosum_dram_benchmark import allocation_geometry, hugepage_capacity, source_identity
-from callosum_benchmark_report import write_report
+from callosum_benchmark_report import enrich_trial, request_records, REQUEST_FIELDS, write_report
 
 
 def resolve(base,value):
@@ -685,11 +685,75 @@ def apply_session_profile(args):
         setattr(args,key,value if value is not None else profile.get(key,default))
 
 
+def verify_run(config_path, node, result_dir):
+    """Recheck the exact source result without opening devices or contacting peers."""
+    import csv
+    config_path = Path(config_path).resolve()
+    raw = config_path.read_bytes()
+    spec = json.loads(raw)
+    out = Path(result_dir).resolve()
+    require(out.parent == resolve(config_path.parent, spec['output_root']),
+            'result directory is outside this config’s output root')
+    require(node == spec['pair']['source'], 'verify on the configured source host')
+    manifest = json.loads((out/'experiment.json').read_text())
+    require(manifest['action']=='run' and manifest['node']==node and
+            manifest['config_sha256']==hashlib.sha256(raw).hexdigest(),
+            'run evidence belongs to a different node/config')
+    topology = resolve(config_path.parent, spec['topology_file'])
+    require(manifest['topology_sha256']==hashlib.sha256(topology.read_bytes()).hexdigest(),
+            'saved topology differs from the topology used for this result')
+    profile = spec.get('fresh_session', {}).get('profile', {})
+    require(all(manifest[k]==profile[k] for k in ('sizes','unit','repetitions','backings','page_modes') if k in profile),
+            'recorded run profile differs from init')
+    require(not (out/'failure.json').exists(), 'run recorded a failure')
+    summary = json.loads((out/'summary.json').read_text())
+    require(summary['status']=='PASS' and summary['evidence_class']=='TRANSFER_ONLY',
+            'no completed transport performance result')
+    expected_smoke = {'cxl'} if 'cxl' in manifest['backings'] else set()
+    if 'local_numa' in manifest['backings']:
+        expected_smoke.update(f'local_numa-{m}' for m in manifest['page_modes'])
+    smoke = json.loads((out/'smoke-results.json').read_text())
+    require(len(smoke)==len(expected_smoke) and {r['case'] for r in smoke if r['status']=='PASS'}==expected_smoke,
+            'missing successful content/transport smoke evidence')
+    expected = {(f'{b}-{m}', block_bytes(s,manifest['unit']), rep)
+                for b in manifest['backings'] for m in manifest['page_modes']
+                for s in manifest['sizes'] for rep in range(manifest['repetitions'])}
+    rows = summary['results']
+    observed = {(r['experiment_case'],r['block_bytes'],r['repetition']) for r in rows}
+    require(len(rows)==len(expected) and observed==expected, 'missing or duplicate case/size/repeat')
+    count = 0
+    with (out/'requests.csv').open(newline='') as stream:
+        reader = csv.DictReader(stream)
+        require(reader.fieldnames==REQUEST_FIELDS,'unexpected requests.csv schema')
+        for i, row in enumerate(rows):
+            require(row['direction']==f"{node}->{spec['pair']['receiver']}" and row['bytes']==TOTAL_BYTES and
+                    row.get('measurement_kind','PERFORMANCE')=='PERFORMANCE' and row.get('request_timing_version')==1 and
+                    row.get('access_pattern','overwrite')==manifest['access_pattern'] and
+                    (manifest['access_window_bytes'] is None or row['window_bytes']==manifest['access_window_bytes']) and
+                    row.get('random_seed',0)==manifest['random_seed'],
+                    'trial direction, payload bytes, timing or strategy differs from the recorded plan')
+            checked = enrich_trial(row)
+            for sample in request_records(checked,i):
+                actual = next(reader,None)
+                require(actual=={k:str(sample[k]) if sample[k] is not None else '' for k in REQUEST_FIELDS},
+                        'requests.csv does not match verified trial samples')
+                count += 1
+        require(next(reader,None) is None,'unexpected extra request samples')
+    require(summary['report']['trials']==len(rows) and summary['report']['request_samples']==count and
+            summary['report']['latency_complete'] and all((out/n).stat().st_size>0
+                for n in ('trials.csv','summary.csv','report.md')),
+            'incomplete aggregate report')
+    return dict(status='PASS', scope='OFFLINE_RESULT_VERIFICATION', evidence=str(out),
+                direction=f"{node}->{spec['pair']['receiver']}", trials=len(rows),
+                payload_bytes_per_trial=TOTAL_BYTES, request_samples=count)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['init','prepare','run','provision-hugepages','retire','start-cxl','stop-receivers','receive'])
+    parser.add_argument('action',choices=['init','prepare','run','verify','provision-hugepages','retire','start-cxl','stop-receivers','receive'])
     parser.add_argument('--config',required=True)
     parser.add_argument('--node',required=True)
+    parser.add_argument('--result-dir',help='verify: exact sender result directory printed by run')
     parser.add_argument('--work-dir',help='Preparation/evidence directory; defaults to runs/benchmark-prep/<node>')
     parser.add_argument('--peer-report',help='Signed readiness.json from the other physical host')
     parser.add_argument('--topology',help='init: existing approved topology, never generated device ownership')
@@ -723,6 +787,12 @@ def main():
     transition_possible=False; host_resources_changed=False
     try:
         benchmark_account()
+        if args.action=='verify':
+            phase='verify-result'
+            require(args.result_dir, 'verify requires --result-dir from the sender run')
+            print(json.dumps(verify_run(args.config,args.node,args.result_dir),indent=2))
+            return 0
+        require(args.result_dir is None,'--result-dir is only valid with verify')
         apply_session_profile(args)
         require(args.access_window_bytes is None or args.access_window_bytes>0,'access window must be positive')
         access_strategy('overwrite',1,1,args.random_seed)
@@ -900,8 +970,17 @@ def main():
             runner.say('[READY] CXL-only targets already started by prepare; run on the source performs the sweep')
         else:
             (receive if is_receiver else run)(spec,c,args,topology,receipt,private,env,out,runner)
+            if not is_receiver:
+                runner.stage='verify-result'
+                runner.say(json.dumps(verify_run(args.config,args.node,out),indent=2))
+                runner.say(f'[result-dir] {out}')
         return 0
     except Exception as error:
+        if phase=='verify-result':
+            print(json.dumps(dict(status='FAIL',stage=phase,error=str(error),evidence=args.result_dir,
+                action='Preserve the result directory; inspect its plan, raw trial JSON and report. No devices opened or services contacted.'),
+                indent=2),file=sys.stderr)
+            return 1
         transition_possible=transition_possible or bool(runner and runner.services_may_be_live)
         host_resources_changed=host_resources_changed or bool(
             runner and getattr(runner,'hugepage_pool_change_possible',False))

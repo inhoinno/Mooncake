@@ -52,12 +52,39 @@ def validate_config(c, path):
             'run_id must be a fresh shared identifier (8..80 characters)')
     require(type(c.get('block_bytes')) is int and 0 < c['block_bytes'] <= 64 * 1024**2,
             'block_bytes must be 1..67108864; this is a correctness probe')
+    cases = trial_specs(c)
+    biggest = max(t['block_bytes'] for t in cases)
+    # Keep every trial's replicas until retirement; budget headroom for the
+    # allocator and completion-marker keys rather than reclaiming in flight.
+    required = max(4 * biggest, 2 * sum(t['block_bytes'] for t in cases))
     require(type(c.get('wait_seconds')) is int and 0 < c['wait_seconds'] <= 300,
             'wait_seconds must be 1..300 (the native bridge bound)')
     host(c['master_address'])
     require(c.get('metadata') == 'P2PHANDSHAKE', 'probe requires P2PHANDSHAKE')
-    require(c['source'] != c['requester'] and
-            set(c['nodes']) == {c['source'], c['requester']}, 'exactly two distinct nodes required')
+    pairs = c.get('pairs')
+    if pairs is None:
+        require(c['source'] != c['requester'] and
+                set(c['nodes']) == {c['source'], c['requester']}, 'exactly two distinct nodes required')
+    else:
+        require('sweep' in c and len(pairs) == 2 and
+                all(set(p) == {'source', 'requester'} for p in pairs) and
+                len(c['nodes']) == 4 and {n for p in pairs for n in p.values()} == set(c['nodes']),
+                'two disjoint Store sweep pairs must cover four endpoints')
+        senders = [c['nodes'][p['source']] for p in pairs]
+        receivers = [c['nodes'][p['requester']] for p in pairs]
+        require(len({host(n['local_hostname']) for n in senders}) == 1 and
+                len({host(n['local_hostname']) for n in receivers}) == 1 and
+                len({n['rdma_device'] for n in senders}) == len({n['rdma_device'] for n in receivers}) == 1 and
+                all(n.get('require_remote_dax_numa') is True for n in senders) and
+                len({n['bridge']['path'] for n in receivers}) == 2,
+                'expected two colocated NUMA-remote sources and two distinct destination DAX devices')
+        a, b = (n['bridge'] for n in senders)
+        require(a['path'] == b['path'] and
+                (a['mapping_offset']+a['capacity'] <= b['mapping_offset'] or
+                 b['mapping_offset']+b['capacity'] <= a['mapping_offset']),
+                'source clients on one device need disjoint mappings')
+        require(len({n['local_hostname'] for n in c['nodes'].values()})==4,
+                'duplicate Store endpoint')
     require(all(re.fullmatch(r'[A-Za-z0-9_-]{1,64}', n) for n in c['nodes']), 'invalid node identifier')
     pools, hosts = set(), set()
     for node in c['nodes'].values():
@@ -78,7 +105,7 @@ def validate_config(c, path):
                 b['owned_offset'] % b['alignment'] == 0 and
                 b['owned_size'] % b['alignment'] == 0, 'unaligned owned mapping')
         require(b['owned_offset'] + b['owned_size'] <= b['capacity'] and
-                b['owned_size'] >= 4 * c['block_bytes'], 'owned arena too small or out of bounds')
+                b['owned_size'] >= required, f'owned arena too small or out of bounds (need {required} bytes)')
         require(node.get('extent_authorization'), 'record the exclusive extent owner/authorization')
         require(type(b.get('mux_capacity',2)) is int and 0 < b.get('mux_capacity',2) <= 32 and
                 type(b.get('mux_queue_limit',32)) is int and 0 < b.get('mux_queue_limit',32) <= 4096,
@@ -87,17 +114,37 @@ def validate_config(c, path):
                 re.fullmatch(r'[0-9a-f]{64}', node['expected_store_sha256']),
                 'expected_store_sha256 must identify the built Store module')
         b['token_file'] = str((path.parent / b['token_file']).resolve())
-    require(len(pools) == 2 and len(hosts) == 2, 'two independent pool IDs and physical hosts required')
+    require(len(pools) == len(c['nodes']) and len(hosts) == 2,
+            'distinct Store arena IDs and two physical hosts required')
     return c
 
 
+def trial_specs(c):
+    if 'sweep' not in c:
+        return [c]
+    sweep = c['sweep']
+    sizes, repetitions = sweep['sizes_mib'], sweep['repetitions']
+    require(isinstance(sizes, list) and 1 <= len(sizes) <= 10 and
+            all(type(x) is int and 1 <= x <= 512 for x in sizes) and
+            len(set(sizes)) == len(sizes) and type(repetitions) is int and 1 <= repetitions <= 32,
+            'sweep requires 1..10 distinct sizes (1..512 MiB) and 1..32 repetitions')
+    return [dict(c, trial_index=i, repetition=rep, block_bytes=size << 20,
+                 trial_class='warmup' if rep == -1 else 'measured')
+            for i, (size, rep) in enumerate([(sizes[0], -1)] +
+                [(size, rep) for size in sizes for rep in range(repetitions)])]
+
+
 def payload(c):
-    pattern = hashlib.sha256(c['run_id'].encode()).digest()
+    seed = key(c) if 'trial_index' in c else c['run_id']
+    pattern = hashlib.sha256(seed.encode()).digest()
     return (pattern * ((c['block_bytes'] + 31) // 32))[:c['block_bytes']]
 
 
 def key(c):
-    return 'callosum-store-proof/' + c['run_id'] + '/kv'
+    base = 'callosum-store-proof/' + c['run_id'] + '/kv'
+    if 'pair_index' in c:
+        base += f"/pair-{c['pair_index']}"
+    return f"{base}/{c['trial_index']}" if 'trial_index' in c else base
 
 
 def crc64(data):
@@ -153,6 +200,12 @@ def native_store_hash():
     return hashlib.sha256(native.read_bytes()).hexdigest()
 
 
+def pair_config(c, index):
+    pair = c['pairs'][index]
+    return dict(c, **pair, pair_index=index,
+                nodes={n: c['nodes'][n] for n in pair.values()})
+
+
 def private_token(path):
     info = path.lstat()
     require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and
@@ -181,7 +234,10 @@ def initialize(args):
         hca = node['rdma_device']
         require(re.fullmatch(r'[A-Za-z0-9_.-]+', hca) and hca not in ('.', '..') and
                 (Path('/sys/class/infiniband') / hca).is_dir(), f'RDMA device {hca} not found')
-        _, device_size, align = dax_geometry(Path(b['path']))
+        device, device_size, align = dax_geometry(Path(b['path']))
+        if node.get('require_remote_dax_numa'):
+            from callosum_transport_benchmark import dax_numa_evidence
+            dax_numa_evidence(b['path'], hca)
         digest = native_store_hash()
         offset, size = b['mapping_offset'], b['capacity']
         owned_offset, owned_size = b['owned_offset'], b['owned_size']
@@ -195,19 +251,38 @@ def initialize(args):
                 f'device size={device_size}, device alignment={align}')
         node.update(store_module='store', expected_store_sha256=digest,
                     extent_authorization=EXTENT_CONFIRMATION_REQUIRED)
-        write_json(out, dict(node=args.node, template_sha256=template_sha, config=node))
+        receipt = dict(node=args.node, template_sha256=template_sha, config=node)
+        if 'pairs' in c:
+            receipt.update(device_number=device.st_rdev,
+                           boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+        write_json(out, receipt)
         return dict(status='NODE_INPUT_SAVED', node=args.node, path=str(out), device=b['path'],
                     mapping_offset=offset, capacity=size, alignment=b['alignment'], devices_mapped=False)
 
-    require(args.config and len(args.node_input) == 2, 'assembly requires --config and two --node-input files')
+    require(args.config and len(args.node_input) == len(c['nodes']),
+            'assembly requires --config and one --node-input file per node')
     out = Path(args.config).resolve()
     require(not os.path.lexists(out), f'{out} exists; preserve it or choose a new --config path')
     receipts = [json.loads(Path(p).read_text()) for p in args.node_input]
     require(all(r['template_sha256'] == template_sha for r in receipts) and
             {r['node'] for r in receipts} == set(c['nodes']), 'node inputs must match the same template and cover both nodes')
+    if 'pairs' in c:
+        by_node = {r['node']: r for r in receipts}
+        a, b = [[by_node[p[role]] for p in c['pairs']] for role in ('source','requester')]
+        require(a[0]['boot_id'] == a[1]['boot_id'] != b[0]['boot_id'] == b[1]['boot_id'] and
+                a[0]['device_number'] == a[1]['device_number'] and
+                b[0]['device_number'] != b[1]['device_number'],
+                'need two source receipts on one DAX and two receiver receipts on distinct local DAX devices')
+        for receipt in receipts:
+            receipt['config']['device_number'] = receipt['device_number']
     c['nodes'] = {r['node']: r['config'] for r in receipts}
     c['run_id'] = uuid.uuid4().hex
     c['master_address'] = args.master_address or c['master_address']
+    if args.reverse:
+        require('pairs' not in c, 'select the direction in the pair template')
+        c['source'], c['requester'] = c['requester'], c['source']
+    if args.sweep_mib:
+        c['sweep'] = dict(sizes_mib=args.sweep_mib, repetitions=args.repetitions)
     validate_config(json.loads(json.dumps(c)), out)
     tokens = {node['bridge']['token_file'] for node in c['nodes'].values()}
     require(len(tokens) == 1, 'both nodes must use the same token file')
@@ -293,7 +368,7 @@ def wait_for(check, seconds, description):
     raise TimeoutError(description + '; no automatic retry or resource reclamation')
 
 
-def source(store, module, c):
+def seed(store, module, c):
     name = key(c)
     require(not snapshot(store, module, name) and store.is_exist(name + '/done') == 0,
             'run_id already exists; do not overwrite historical objects')
@@ -302,43 +377,103 @@ def source(store, module, c):
     initial = snapshot(store, module, name)
     own = host(c['nodes'][c['source']]['local_hostname'])
     expect_replicas(initial, {own}, len(data))
-    print(json.dumps(dict(status='SOURCE_READY', key=name, replicas=initial)), flush=True)
+    return dict(before=initial, payload_sha256=hashlib.sha256(data).hexdigest())
+
+
+def source(store, module, c):
+    name = key(c)
+    result = seed(store, module, c)
+    print(json.dumps(dict(status='SOURCE_READY', key=name, replicas=result['before'])), flush=True)
     wait_for(lambda: store.is_exist(name + '/done') == 1, c['wait_seconds'], 'requester completion missing')
     final = snapshot(store, module, name)
     expect_replicas(final, {host(n['local_hostname']) for n in c['nodes'].values()}, len(data))
-    return dict(before=initial, after=final, payload_sha256=hashlib.sha256(data).hexdigest())
+    return dict(result, after=final)
 
 
-def requester(store, module, c, retained):
+def requester(store, module, c, retained, shared_buffer=None, before_miss=None):
     name = key(c)
     initial = wait_for(lambda: snapshot(store, module, name), c['wait_seconds'], 'source key missing')
     expect_replicas(initial, {host(c['nodes'][c['source']]['local_hostname'])}, c['block_bytes'])
     require(store.is_exist(name + '/done') == 0, 'completion key already exists')
-    buffer = ctypes.create_string_buffer(c['block_bytes'])
-    retained.append(buffer)  # Unknown native outcomes must not free this backing.
+    buffer = shared_buffer if shared_buffer is not None else ctypes.create_string_buffer(c['block_bytes'])
     address = ctypes.addressof(buffer)
-    require(store.register_buffer(address, c['block_bytes']) == 0, 'consumer buffer registration failed')
+    if shared_buffer is None:
+        retained.append(buffer)  # Unknown native outcomes must not free this backing.
+        require(store.register_buffer(address, c['block_bytes']) == 0, 'consumer buffer registration failed')
     expected = hashlib.sha256(payload(c)).hexdigest()
     measurements = []
     all_hosts = {host(n['local_hostname']) for n in c['nodes'].values()}
     for phase in ('materialize', 'local_reuse'):
         ctypes.memset(address, 0, c['block_bytes'])
+        if phase == 'materialize' and before_miss is not None:
+            before_miss()
         start = time.monotonic_ns()
         result = store.batch_get_into_multi_buffers([name], [[address]], [[c['block_bytes']]])
         elapsed = time.monotonic_ns() - start
         require(result == [c['block_bytes']], 'Store multi-buffer load failed')
-        require(hashlib.sha256(buffer.raw).hexdigest() == expected, 'consumer SHA-256 mismatch')
+        require(hashlib.sha256(ctypes.string_at(address, c['block_bytes'])).hexdigest() == expected,
+                'consumer SHA-256 mismatch')
         rows = snapshot(store, module, name)
         expect_replicas(rows, all_hosts, c['block_bytes'])
-        measurements.append(dict(phase=phase, elapsed_ns=elapsed, replicas=rows, payload_sha256=expected))
+        measurements.append(dict(phase=phase, elapsed_ns=elapsed, start_ns=start,
+                                 replicas=rows, payload_sha256=expected))
     require(measurements[0]['replicas'] == measurements[1]['replicas'], 'reuse changed replica placement')
-    require(store.unregister_buffer(address) == 0, 'consumer unregister failed')
-    retained.clear()  # Both synchronous loads completed and validated.
-    require(store.put(name + '/done', expected.encode()) == 0, 'completion publication failed')
+    if shared_buffer is None:
+        require(store.unregister_buffer(address) == 0, 'consumer unregister failed')
+        retained.clear()  # Both synchronous loads completed and validated.
+    if shared_buffer is None:
+        require(store.put(name + '/done', expected.encode()) == 0, 'completion publication failed')
     return dict(before=initial, loads=measurements, payload_sha256=expected)
 
 
+def sweep_run(store, module, c, retained, is_source, output):
+    cases = trial_specs(c)
+    records = []
+    if is_source:
+        seeded = [seed(store, module, t) for t in cases]
+        print(json.dumps(dict(status='SOURCE_READY', trials=len(cases))), flush=True)
+        done = key(cases[-1]) + '/done'
+        wait_for(lambda: store.is_exist(done) == 1, c['wait_seconds'] * len(cases),
+                 'sweep completion missing')
+        all_hosts = {host(n['local_hostname']) for n in c['nodes'].values()}
+        for t, record in zip(cases, seeded):
+            final = snapshot(store, module, key(t))
+            expect_replicas(final, all_hosts, t['block_bytes'])
+            records.append(dict(record, after=final))
+    else:
+        buffer = ctypes.create_string_buffer(max(t['block_bytes'] for t in cases))
+        retained.append(buffer)
+        address = ctypes.addressof(buffer)
+        require(store.register_buffer(address, len(buffer)) == 0, 'sweep consumer registration failed')
+        # Flush each finished trial outside its timed API call, so a later
+        # failed trial cannot erase the successful requester measurements.
+        with (output / 'store-loads.jsonl').open('x') as log:
+            for t in cases:
+                before_miss = None
+                if 'pair_index' in c:
+                    def before_miss():
+                        # Both requester processes share this host's run
+                        # directory; release only the same size/repetition.
+                        index, trial = c['pair_index'], t['trial_index']
+                        marker = output.parent / f'ready-{index}-{trial}'
+                        peer = output.parent / f'ready-{1-index}-{trial}'
+                        with marker.open('x'):
+                            pass
+                        wait_for(peer.is_file, c['wait_seconds'], 'other requester is not ready for this trial')
+                record = requester(store, module, t, retained, buffer, before_miss)
+                records.append(record)
+                log.write(json.dumps(dict(trial_index=t['trial_index'], block_bytes=t['block_bytes'],
+                                          trial_class=t['trial_class'], result=record)) + '\n')
+                log.flush()
+        require(store.unregister_buffer(address) == 0, 'sweep consumer unregister failed')
+        retained.clear()
+        require(store.put(key(cases[-1]) + '/done', b'verified') == 0, 'sweep completion publication failed')
+    return dict(trials=records)
+
+
 def events(path):
+    if isinstance(path, list):
+        return path
     result = []
     for line in Path(path).read_text().splitlines():
         if 'component=callosum_store ' in line:
@@ -346,7 +481,7 @@ def events(path):
     return result
 
 
-def verify(c, source_receipt, requester_receipt, source_log, requester_log):
+def verify(c, source_receipt, requester_receipt, source_log, requester_log, master_log=None):
     for node_id, receipt in ((c['source'], source_receipt), (c['requester'], requester_receipt)):
         require(receipt.get('status') == 'CLIENT_PATH_VALIDATED_NATIVE_REVIEW_REQUIRED' and
                 receipt.get('node') == node_id and receipt.get('run_id') == c['run_id'] and
@@ -438,6 +573,53 @@ def verify(c, source_receipt, requester_receipt, source_log, requester_log):
             'native timing lies outside the source dispatch window')
     transport_ns = sum(r['latency_ns'] for r in samples)  # One actual source endpoint, serial batches.
     ready_ns = int(usable[0]['request_to_usable_replica_ns'])
+    breakdown = None
+    if master_log is not None:
+        def number(row, field):
+            require(field in row and int(row[field]) >= 0, f'missing or invalid latency field: {field}')
+            return int(row[field])
+
+        def one(rows, description):
+            require(len(rows) == 1, f'expected one {description} timing event')
+            return rows[0]
+
+        task_id = tasks[0]['task']
+        pickup = one([r for r in events(master_log) if r.get('event') == 'master_task_pickup'
+                      and r.get('task') == task_id], 'master task pickup')
+        observed = one([r for r in events(master_log) if r.get('event') == 'master_task_success_query'
+                        and r.get('task') == task_id], 'master success query')
+        reserve = one([r for r in tx if r.get('event') == 'copy_reserved'
+                       and r.get('key_crc') == key_crc], 'source CopyStart')
+        api = [r for r in rx if r.get('event') == 'store_api_complete' and r.get('key_crc') == key_crc]
+        require(len(api) == 2 and all(r.get('key_count') == '1' and number(r, 'bytes') == end for r in api),
+                'expected two successful native single-key Store API timings')
+        requester_times = {name: number(usable[0], name) for name in
+                           ('initial_lookup_ns', 'create_copy_task_rpc_ns', 'wait_for_task_success_ns',
+                            'query_task_rpc_total_ns', 'query_task_calls', 'final_requery_ns')}
+        api_ns = number(api[0], 'store_api_ns')
+        require(api_ns >= ready_ns and
+                requester_times['wait_for_task_success_ns'] >= requester_times['query_task_rpc_total_ns'] and
+                sum(requester_times[name] for name in ('initial_lookup_ns', 'create_copy_task_rpc_ns',
+                    'wait_for_task_success_ns', 'final_requery_ns')) <= ready_ns,
+                'requester timing spans are inconsistent')
+        breakdown = dict(
+            requester=dict(requester_times, store_api_ns=api_ns, request_to_usable_replica_ns=ready_ns,
+                           store_api_outside_materialize_ns=api_ns - ready_ns,
+                           local_reuse_store_api_ns=number(api[1], 'store_api_ns'),
+                           consumer_call_ns=loads[0]['elapsed_ns']),
+            master=dict(enqueue_to_dequeue_ns=number(pickup, 'enqueue_to_dequeue_ns'),
+                        dequeue_to_complete_ns=number(observed, 'dequeue_to_complete_ns'),
+                        complete_to_success_query_ns=number(observed, 'complete_to_success_query_ns')),
+            source=dict(copy_start_rpc_ns=number(reserve, 'copy_start_rpc_ns'),
+                        source_checksum_ns=number(a, 'source_checksum_ns'),
+                        authorize_round_trip_ns=number(a, 'authorize_round_trip_ns'),
+                        mux_queue_ns=number(admitted, 'queue_wait_ns'),
+                        mux_dispatch_gather_ns=number(gathered, 'dispatch_ns'),
+                        write_call_to_drain_ns=transport_ns,
+                        verify_round_trip_ns=number(copied[0], 'verify_round_trip_ns'),
+                        copy_end_rpc_ns=number(published[0], 'copy_end_rpc_ns')),
+            receiver=dict(checksum_ns=number(one(valid, 'receiver checksum'), 'receiver_checksum_ns')),
+            timing='per-process monotonic durations; RPC and transfer spans nest; do not sum across clocks')
     requests = [dict(request_index=i,request_bytes=r['bytes'],native_calls=1,status='PASS',
                      sender_start_offset_ns=r['start_ns']-samples[0]['start_ns'],
                      sender_end_offset_ns=r['end_ns']-samples[0]['start_ns'],
@@ -448,6 +630,9 @@ def verify(c, source_receipt, requester_receipt, source_log, requester_log):
                 requests=requests, path_mode='store_mux_direct_dax_write',
                 experiment_case='STORE_TO_MUX_NATIVE_BATCH', block_bytes=end,
                 source_generation=a['source_generation'], target_generation=a['target_generation'],
+                latency_breakdown=breakdown,
+                requester_call_start_ns=loads[0].get('start_ns'),
+                requester_call_elapsed_ns=loads[0]['elapsed_ns'],
                 store_key_path_validated=True, destination_local_replica_reuse=True,
                 store_to_mux_validated=True, store_task=tasks[0]['task'],
                 participants=dict(sender=source_endpoint, receiver=receiver_endpoint,
@@ -466,6 +651,22 @@ def verify(c, source_receipt, requester_receipt, source_log, requester_log):
                 performance_baseline='NOT_APPLICABLE')
 
 
+def verify_sweep(c, source_receipt, requester_receipt, source_log, requester_log, master_log):
+    require(master_log, 'sweep verification requires --master-log from this campaign')
+    cases = trial_specs(c)
+    logs = [events(path) for path in (source_log, requester_log, master_log)]
+    records = [r['result']['trials'] for r in (source_receipt, requester_receipt)]
+    require(all(len(items) == len(cases) for items in records), 'missing sweep trial receipts')
+    rows = []
+    for t, source_row, requester_row in zip(cases, *records):
+        result = verify(t, dict(source_receipt, result=source_row), dict(requester_receipt, result=requester_row),
+                        *logs)
+        rows.append(dict(result, trial_index=t['trial_index'], trial_class=t['trial_class'],
+                         repetition=t['repetition'], direction=f"{c['source']}->{c['requester']}"))
+    require(len({row['store_task'] for row in rows}) == len(rows), 'each trial requires a fresh remote copy task')
+    return rows
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('action', choices=['init', 'check', 'run', 'verify'])
@@ -474,6 +675,11 @@ def main(argv=None):
     p.add_argument('--template', help='init: shared experiment template')
     p.add_argument('--node-input', action='append', default=[], help='init: one receipt per node')
     p.add_argument('--master-address', help='init: override the template master IPv4:port')
+    p.add_argument('--reverse', action='store_true', help='init assembly: swap source and requester')
+    p.add_argument('--sweep-mib', type=int, nargs='+', help='init assembly: ordered Store object sizes in MiB')
+    p.add_argument('--repetitions', type=int, default=3, help='init assembly: measured trials per sweep size')
+    p.add_argument('--master-log', help='verify: native master log, required for the sweep')
+    p.add_argument('--pair-index', type=int, choices=(0,1), help='verify one pair of a colocated Store sweep')
     p.add_argument('--confirm-exclusive-extent', action='store_true',
                    help='run: confirm both pools are physically independent and this node owns the approved, drained test extent')
     p.add_argument('--output', help='new evidence directory; default runs/store-<run_id>/<node or action>')
@@ -494,6 +700,16 @@ def main(argv=None):
         require(args.config, '--config is required')
         c = load_config(args.config)
         require(os.geteuid() != 0, 'run as the benchmark account, not sudo; no output created')
+        if 'pairs' in c:
+            if args.action == 'verify':
+                require(args.pair_index is not None, 'verify requires --pair-index 0 or 1')
+                c = pair_config(c, args.pair_index)
+            else:
+                matches = [i for i,pair in enumerate(c['pairs']) if args.node in pair.values()]
+                require(len(matches)==1, 'select a configured --node')
+                c = pair_config(c, matches[0])
+        else:
+            require(args.pair_index is None, '--pair-index requires a colocated Store sweep')
         if args.action != 'verify':
             require(args.node in c['nodes'], 'select a configured --node')
             if args.action == 'run':
@@ -506,6 +722,8 @@ def main(argv=None):
         else:
             require(args.node is None, 'verify combines both node receipts; do not pass --node')
         leaf = args.node if args.action == 'run' else args.action + ('-'+args.node if args.node else '')
+        if args.action == 'verify' and args.pair_index is not None:
+            leaf += f'-pair-{args.pair_index}'
         out = (Path(args.output) if args.output else Path('runs') / ('store-'+c['run_id']) / leaf).resolve()
         out.mkdir(parents=True, mode=0o700, exist_ok=False)
         created = True
@@ -514,10 +732,18 @@ def main(argv=None):
             values = []
             for name in ('source_receipt', 'requester_receipt'):
                 values.append(json.loads(Path(getattr(args, name)).read_text()))
-            result = verify(c, *values, args.source_log, args.requester_log)
+            if 'sweep' in c:
+                from callosum_benchmark_report import write_store_sweep_report
+                rows = verify_sweep(c, *values, args.source_log, args.requester_log, args.master_log)
+                result = write_store_sweep_report(out, rows, c['run_id'])
+            else:
+                result = verify(c, *values, args.source_log, args.requester_log, args.master_log)
+                from callosum_benchmark_report import write_request_csv
+                write_request_csv(out / 'requests.csv', result)
+                if result['latency_breakdown'] is not None:
+                    with (out / 'latency.jsonl').open('x') as stream:
+                        stream.write(json.dumps(result) + '\n')
             write_json(out / 'summary.json', result)
-            from callosum_benchmark_report import write_request_csv
-            write_request_csv(out / 'requests.csv', result)
             print(json.dumps(result, indent=2))
             return 0
         require(args.node in c['nodes'], 'select a configured --node')
@@ -545,9 +771,19 @@ def main(argv=None):
                         operator_extent_confirmation=args.action == 'run' and args.confirm_exclusive_extent,
                         transport_env={name:os.environ.get(name,'default') for name in
                                        ('MC_NUM_QP_PER_EP','MC_GID_INDEX','MC_MTU')})
+        if node.get('require_remote_dax_numa'):
+            from callosum_transport_benchmark import dax_numa_evidence
+            evidence['dax_numa'] = dax_numa_evidence(b['path'], node['rdma_device'])
+        if 'pair_index' in c:
+            evidence['clock_boot_id'] = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            evidence['clock_time_namespace'] = os.readlink('/proc/self/ns/time')
+            evidence['dax_device_number'] = Path(b['path']).lstat().st_rdev
+            require(evidence['dax_device_number'] == node['device_number'],
+                    'local DAX device identity changed after init')
         write_json(out / 'preflight.json', evidence)
         stage = 'local-resource-preparation'
-        prepare_resources(b, c['block_bytes'], out, authorize=args.prepare_resources or args.action == 'run')
+        largest = max(t['block_bytes'] for t in trial_specs(c))
+        prepare_resources(b, largest, out, authorize=args.prepare_resources or args.action == 'run')
         if args.action == 'check':
             print(json.dumps(dict(evidence, status='PASS', scope='IMPORT_CONFIG_RESOURCES_ONLY',
                                   evidence=str(out), devices_mapped=False)))
@@ -561,10 +797,12 @@ def main(argv=None):
         print(json.dumps(dict(stage='native-store-start', evidence=str(out), native_log=str(out/'native.log'))), flush=True)
         store = module.MooncakeDistributedStore()
         stage = 'native-store-setup'
-        require(store.setup(node['local_hostname'], c['metadata'], 0, max(c['block_bytes'], 16 * 1024**2),
+        require(store.setup(node['local_hostname'], c['metadata'], 0, max(largest, 16 * 1024**2),
                             'rdma', node['rdma_device'], c['master_address']) == 0, 'real Store setup failed')
         stage = 'store-load-through-mux'
-        result = source(store, module, c) if args.node == c['source'] else requester(store, module, c, retained)
+        is_source = args.node == c['source']
+        result = (sweep_run(store, module, c, retained, is_source, out) if 'sweep' in c else
+                  source(store, module, c) if is_source else requester(store, module, c, retained))
         write_json(out / 'receipt.json', dict(evidence, result=result,
                    status='CLIENT_PATH_VALIDATED_NATIVE_REVIEW_REQUIRED'))
         # Keep both native owners alive for evidence collection and positive-drain

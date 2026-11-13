@@ -226,6 +226,11 @@ else
   echo "[build] configure=unchanged action=skip"
 fi
 printf '%s\n' "$configure_signature" > "$signature_file"
+if [ "${MOONCAKE_NATIVE_STORE_ONLY:-0}" = 1 ]; then
+  cmake --build "$build_dir" --parallel "$build_jobs" --target store mooncake_master master_service_test
+  touch "$signature_file"
+  exit 0
+fi
 cmake --build "$build_dir" --parallel "$build_jobs"
 touch "$signature_file"
 ctest --test-dir "$build_dir" --output-on-failure -L todo1 -LE hardware

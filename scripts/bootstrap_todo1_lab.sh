@@ -8,6 +8,7 @@ set -Eeuo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mode="all"
+native_only=0
 build_dir_name="${MOONCAKE_BUILD_DIR:-build-todo1-cpu}"
 skip_apt="${MOONCAKE_SETUP_SKIP_APT:-0}"
 skip_submodules="${MOONCAKE_SETUP_SKIP_SUBMODULES:-0}"
@@ -33,6 +34,7 @@ validation.
 Options:
   --preflight          Check dependencies/source without apt, git, or builds.
   --status             Report an existing build's cache, tests, and artifacts.
+  --native-only        Build Store, master and master test without staging a wheel.
   --skip-apt           Do not invoke apt; still fail if packages are missing.
   --skip-submodules    Do not update submodules; still verify their contents.
   --build-dir NAME     In-repository build directory (default: build-todo1-cpu).
@@ -66,6 +68,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --status)
       mode="status"
+      ;;
+    --native-only)
+      native_only=1
       ;;
     --skip-apt)
       skip_apt=1
@@ -500,6 +505,10 @@ create_python_environment() {
   if [ ! -x "$venv_dir/bin/python" ]; then
     python3 -m venv "$venv_dir"
   fi
+  if [ "$native_only" = 1 ]; then
+    pass "python_venv" "path=$venv_dir (build-tree import)"
+    return
+  fi
   # auditwheel >= 6 requires patchelf >= 0.14.5, but Ubuntu 22.04 apt ships
   # 0.14.3, which fails the wheel-repair step. The PyPI patchelf package bundles
   # a modern static binary into the venv; putting $venv_dir/bin ahead of PATH in
@@ -597,7 +606,7 @@ run_all() {
   verify_python
   create_python_environment
 
-  stage="Mooncake TODO#1 CPU build, CTests, and wheel"
+  stage="Mooncake TODO#1 CPU build"
   local python_version
   python_version="$("$venv_dir/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
   local cmake_extra="-DPython3_EXECUTABLE=$venv_dir/bin/python"
@@ -611,6 +620,7 @@ run_all() {
   MOONCAKE_USE_CUDA=OFF \
   MOONCAKE_BUILD_DIR="$build_dir_name" \
   MOONCAKE_BUILD_JOBS="$build_jobs" \
+  MOONCAKE_NATIVE_STORE_ONLY="$native_only" \
   MOONCAKE_CMAKE_ARGS="$cmake_extra" \
   PYTHON_BIN="$venv_dir/bin/python" \
   PYTHON_VERSION="$python_version" \
@@ -618,6 +628,11 @@ run_all() {
     bash "$repo_dir/scripts/build_todo1_overlay.sh"
 
   verify_cpu_cache
+  if [ "$native_only" = 1 ]; then
+    echo "[PASS] native Store build complete: $build_dir"
+    echo "[PASS] complete_log=$log_file"
+    return
+  fi
   stage="final TODO#1 test gate"
   # Include the multisource/GPU-path policy tests (gpu_transfer_policy_test,
   # multipath_placement_test, CxlAware allocation): they are CPU-only logic
