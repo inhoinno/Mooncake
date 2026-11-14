@@ -111,6 +111,32 @@ class DramBenchmarkTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'cpuset'):
                     bench.nic_placement('hca0', override=2, sysroot=root)
 
+    def test_remote_dram_keeps_local_cpus_and_rejects_cxl_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hca = root/'class/infiniband/hca0/device'
+            (hca/'net/eth0').mkdir(parents=True)
+            (hca/'numa_node').write_text('0')
+            local = root/'devices/system/node/node0'
+            local.mkdir(parents=True)
+            (local/'cpulist').write_text('0-3')
+            remote = local.parent/'node1'
+            remote.mkdir()
+            (remote/'meminfo').write_text('Node 1 MemTotal: 1048576 kB\n')
+            with patch.object(os,'sched_getaffinity',create=True,return_value={2,3,5}), \
+                 patch.object(bench.subprocess,'check_output',return_value='[]') as inventory:
+                placement = bench.nic_placement('hca0',1,root,require_remote=True,apply_cpu=False)
+                self.assertEqual((placement['cpu_numa_node'],placement['memory_numa_node'],placement['cpus']),
+                                 (0,1,[2,3]))
+                with self.assertRaisesRegex(RuntimeError,'different'):
+                    bench.nic_placement('hca0',0,root,require_remote=True,apply_cpu=False)
+                inventory.return_value = '[{"devices":[{"chardev":"dax0.0","target_node":1,"mode":"system-ram"}]}]'
+                with self.assertRaisesRegex(RuntimeError,'device-DAX target'):
+                    bench.nic_placement('hca0',1,root,require_remote=True,apply_cpu=False)
+            bench.require_remote_pages(placement,dict(pages_by_node={'1':2},kernel_page_bytes=4096),8192)
+            with self.assertRaisesRegex(RuntimeError,'fully resident'):
+                bench.require_remote_pages(placement,dict(pages_by_node={'1':2,'0':1},kernel_page_bytes=4096),8192)
+
     def test_preflight_residency_requires_all_local_pages(self):
         result = bench.resident_pages(4096, 2, 8192,
                                      '1000 bind:2 file=/dev/zero N2=2 kernelpagesize_kB=4')
@@ -118,6 +144,38 @@ class DramBenchmarkTest(unittest.TestCase):
         for line in ('1000 N2=1 N0=1', '1000 N2=1', '2000 N2=2'):
             with self.assertRaises(RuntimeError):
                 bench.resident_pages(4096, 2, 8192, line)
+
+    def test_pair_barrier_matches_trial_and_aborts_before_next_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = Path(directory)
+            arrived = threading.Event()
+            def first():
+                bench.pair_barrier(gate,'ready',1,'a1','a2',timeout=2)
+                arrived.set()
+            thread = threading.Thread(target=first,daemon=True)
+            (gate/'ready-0-a2').touch()
+            thread.start()
+            self.assertFalse(arrived.wait(.05))
+            bench.pair_barrier(gate,'ready',1,'a2','a1',timeout=2)
+            thread.join(2)
+            self.assertTrue(arrived.is_set())
+            (gate/'abort').touch()
+            with self.assertRaisesRegex(RuntimeError,'no next WRITE'):
+                bench.pair_barrier(gate,'ready',2,'a1','a2',timeout=2)
+
+    def test_remote_sweep_rejects_local_receiver_before_target_is_advertised(self):
+        pages = dict(backing='anonymous_dram',mode='native',pages_by_node={'0':1},kernel_page_bytes=4096)
+        health = dict(node_id='b1',peer_id='a1',fingerprint='fp',memory='dram',
+                      configured_qps=16,source_identity=bench.source_identity(),state='IDLE',
+                      capacity=4096,mr_pages=pages,placement=dict(nic_numa_node=0,
+                      cpu_numa_node=0,memory_numa_node=0))
+        memory = SimpleNamespace(capacity=4096,page_evidence=pages)
+        args = SimpleNamespace(control_port=21101,require_remote_numa=True)
+        with patch.object(bench,'rpc',return_value=health) as rpc:
+            with self.assertRaisesRegex(RuntimeError,'NIC-remote DRAM'):
+                bench.sweep(None,memory,dict(fingerprint='fp'),dict(id='a1'),
+                            dict(id='b1',url='http://b1'),{},args,None)
+            rpc.assert_called_once_with('http://b1:21101','health')
 
     def test_preflight_setup_reexec_uses_local_receipt_and_scrubs_cxl(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -65,23 +65,69 @@ def cpulist(value):
     return result
 
 
-def nic_placement(device, override=None, sysroot=Path('/sys')):
+def nic_placement(device, override=None, sysroot=Path('/sys'), *, require_remote=False, apply_cpu=True):
     require(device and '/' not in device and device not in ('.', '..'), 'invalid RDMA device')
     base = sysroot / 'class/infiniband' / device / 'device'
     nic_node = int((base / 'numa_node').read_text())
-    require(override is not None or nic_node >= 0,
+    require((override is not None and not require_remote) or nic_node >= 0,
+            'RNIC NUMA node is unknown; cannot prove remote DRAM placement' if require_remote else
             'NIC NUMA node is unknown; supply an explicitly reviewed --numa-node')
     node = nic_node if override is None else override
     require(type(node) is int and node >= 0, 'invalid NUMA node')
+    if require_remote:
+        require(override is not None and node != nic_node,
+                f'Remote DRAM requires an explicit memory node different from RNIC NUMA {nic_node}')
+        meminfo = (sysroot/f'devices/system/node/node{node}/meminfo').read_text().splitlines()
+        total = next((int(line.split()[-2]) for line in meminfo if 'MemTotal:' in line),0)
+        require(total>0,f'NUMA {node} has no online memory')
+        # Linux may expose CXL devices in system-RAM mode as ordinary NUMA
+        # memory. Do not label such an allocation as the DRAM control.
+        dax = json.loads(subprocess.check_output(['daxctl','list'],text=True))
+        def dax_nodes(value):
+            if isinstance(value,list):
+                return {n for child in value for n in dax_nodes(child)}
+            if not isinstance(value,dict):
+                return set()
+            here = {value['target_node']} if 'chardev' in value and 'target_node' in value else set()
+            return here | {n for child in value.values() for n in dax_nodes(child)}
+        require(node not in dax_nodes(dax), f'NUMA {node} is a device-DAX target; select ordinary DRAM')
     allowed = os.sched_getaffinity(0)
-    local = cpulist((sysroot / f'devices/system/node/node{node}/cpulist').read_text()) & allowed
+    cpu_node = nic_node if require_remote else node
+    local = cpulist((sysroot / f'devices/system/node/node{cpu_node}/cpulist').read_text()) & allowed
     require(local, 'NIC-local CPUs are excluded by this process cpuset')
-    os.sched_setaffinity(0, local)
-    require(os.sched_getaffinity(0) == local, 'CPU affinity was not applied')
+    if apply_cpu:
+        os.sched_setaffinity(0, local)
+        require(os.sched_getaffinity(0) == local, 'CPU affinity was not applied')
     netdevs = sorted(p.name for p in (base / 'net').iterdir())
     require(netdevs, 'no netdev found for selected RDMA device')
     return dict(rdma_device=device, nic_numa_node=nic_node, memory_numa_node=node,
-                numa_override=override is not None, cpus=sorted(local), netdevs=netdevs)
+                numa_override=override is not None, cpu_numa_node=cpu_node,
+                cpus=sorted(local), netdevs=netdevs)
+
+
+def require_remote_pages(placement, pages, capacity):
+    nic, mem = (placement.get(k) for k in ('nic_numa_node','memory_numa_node'))
+    require(type(nic) is int and type(mem) is int and min(nic,mem)>=0 and nic!=mem and
+            placement.get('cpu_numa_node')==nic, 'expected NIC-local CPUs and NIC-remote DRAM')
+    counts = {str(k):v for k,v in pages.get('pages_by_node',{}).items()}
+    page = pages.get('kernel_page_bytes',0)
+    require(type(capacity) is int and capacity>0 and
+            pages.get('backing','anonymous_dram')=='anonymous_dram' and type(page) is int and page>0 and
+            counts.get(str(mem),0)*page>=capacity and all(k==str(mem) or not v for k,v in counts.items()),
+            f'DRAM MR is not fully resident on remote NUMA node {mem}')
+
+
+def pair_barrier(directory, phase, ordinal, node, peer, timeout=300):
+    """Local M2 rendezvous. Never wait here with an exposed RDMA target."""
+    directory = Path(directory)
+    deadline = time.monotonic()+timeout
+    (directory/f'{phase}-{ordinal}-{node}').touch(exist_ok=False)
+    while True:
+        require(not (directory/'abort').exists(), 'paired DRAM run aborted; no next WRITE')
+        if (directory/f'{phase}-{ordinal}-{peer}').is_file():
+            return
+        require(time.monotonic()<deadline, f'paired DRAM rendezvous timed out: {phase} {ordinal}')
+        time.sleep(.01)
 
 
 def bind_memory(address, length, node):
@@ -266,6 +312,13 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
             'wrong DRAM receiver or mismatched benchmark source')
     require(health.get('mr_pages',{}).get('mode','native')==page_mode,
             'DRAM sender/receiver page mode mismatch; no mixed-backing result')
+    if getattr(args,'require_remote_numa',False):
+        require(not health.get('sealed') and health.get('state')=='IDLE',
+                'remote DRAM receiver is not idle or is sealed')
+        require(health['capacity']==memory.capacity and health['mr_pages'].get('backing')=='anonymous_dram',
+                'receiver must have the matched private DRAM registration')
+        require_remote_pages(health['placement'],health['mr_pages'],health['capacity'])
+        require_remote_pages(placement,memory.page_evidence,memory.capacity)
     if page_mode=='huge2MB':
         for pages in (health['mr_pages'],getattr(memory,'page_evidence',{})):
             require(pages.get('hugetlb') is True and pages.get('kernel_page_bytes')==2**21,
@@ -285,6 +338,8 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
         require(length <= health['capacity'], 'receiver window is smaller than the requested block')
         expected = memory.digest(length)
         for index in range(args.repetitions):
+            if getattr(args,'paired_gate',None):
+                pair_barrier(args.paired_gate,'ready',len(results),node['id'],args.local_partner)
             identity = secrets.token_hex(16)
             protocol_wall_start = time.time_ns()
             protocol_start = time.monotonic_ns()
@@ -332,6 +387,9 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
             verified = rpc(peer_url, 'complete', dict(attempt=identity, sender_drained=True,checksum=expected), timeout=300)
             require(verified['checksum'] == expected, 'receiver validation failed')
             safety['exposed'] = False
+            if getattr(args,'require_remote_numa',False):
+                require_remote_pages(placement,local_placement,memory.capacity)
+                require_remote_pages(health['placement'],verified['placement'],health['capacity'])
             result['protocol_e2e_ns'] = time.monotonic_ns()-protocol_start
             result['controller_start_unix_ns'] = protocol_wall_start
             result['controller_end_unix_ns'] = time.time_ns()
@@ -350,6 +408,11 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                           measurement_kind='CORRECTNESS_SMOKE' if getattr(args,'smoke_bytes',0) else 'PERFORMANCE',
                           mr_pages={node['id']:getattr(memory,'page_evidence',None),
                                     peer['id']:health.get('mr_pages')})
+            if getattr(args,'require_remote_numa',False):
+                result.update(experiment_case='remote_numa_dram',sender_topology=placement,
+                              receiver_topology=health['placement'],
+                              sender_clock=dict(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                                                time_namespace=os.readlink('/proc/self/ns/time')))
             result = enrich_trial(result)
             save(output / f'block-{size}{args.unit}-rep-{index}.json', result)
             write_request_csv(output/f'requests-{size}{args.unit}-rep-{index}.csv',result,len(results))
@@ -386,6 +449,9 @@ def main():
     parser.add_argument('--control-port', type=int, default=19201)
     parser.add_argument('--te-port', type=int, default=19401)
     parser.add_argument('--numa-node', type=int)
+    parser.add_argument('--require-remote-numa',action='store_true')
+    parser.add_argument('--paired-gate',type=Path,help=argparse.SUPPRESS)
+    parser.add_argument('--local-partner',help=argparse.SUPPRESS)
     parser.add_argument('--page-mode',choices=['native','huge2MB'],default='native')
     parser.add_argument('--access-pattern',choices=ACCESS_PATTERNS,default='overwrite')
     parser.add_argument('--access-window-bytes',type=int)
@@ -411,6 +477,10 @@ def main():
                  and args.smoke_bytes<=block_bytes(args.sizes[0],args.unit))), 'invalid correctness-only volume')
         require(1 <= args.control_port <= 65535 and 1 <= args.te_port <= 65535,
                 'invalid benchmark port')
+        require((args.paired_gate is None)==(args.local_partner is None), 'incomplete paired rendezvous')
+        if args.paired_gate:
+            require(args.role=='sender' and args.require_remote_numa and args.paired_gate.is_dir() and
+                    args.local_partner!=args.node,'invalid paired sender rendezvous')
         receipt = setup_environment(args.setup_run)
         c = config(args.config)
         require(c['mode'] == 'rdma', 'DRAM control requires an RDMA manifest')
@@ -429,7 +499,10 @@ def main():
         os.environ['CALLOSUM_CONTROL_TOKEN'] = secret
         os.environ.setdefault('MC_NUM_QP_PER_EP', '16')
         require(os.environ['MC_NUM_QP_PER_EP'] == '16', 'benchmark requires 16 configured QPs')
-        capacity = allocation_geometry(max(block_bytes(n, args.unit) for n in args.sizes),args.page_mode)
+        window = max(block_bytes(n,args.unit) for n in args.sizes)
+        if args.require_remote_numa and args.access_window_bytes is not None:
+            window = max(window,args.access_window_bytes)
+        capacity = allocation_geometry(window,args.page_mode)
         soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
         if soft!=resource.RLIM_INFINITY and soft<capacity and (hard==resource.RLIM_INFINITY or hard>=capacity):
             resource.setrlimit(resource.RLIMIT_MEMLOCK,(capacity,hard))
@@ -443,7 +516,8 @@ def main():
             with socket.socket() as probe:
                 probe.bind((parsed.hostname, parsed.port))
         stage = 'numa-preflight'
-        placement = nic_placement(node['rdma_device'], args.numa_node)
+        placement = (nic_placement(node['rdma_device'],args.numa_node,require_remote=True)
+                     if args.require_remote_numa else nic_placement(node['rdma_device'],args.numa_node))
         stage = 'native-origin'
         import mooncake.engine as engine_module
         import callosum_relay_native as native
@@ -455,6 +529,8 @@ def main():
         stage = 'dram-allocation'
         memory = (Memory(capacity, placement['memory_numa_node']) if args.page_mode=='native' else
                   Memory(capacity, placement['memory_numa_node'],args.page_mode))
+        if args.require_remote_numa:
+            require_remote_pages(placement,memory.page_evidence,capacity)
         stage = 'engine-registration'
         engine = engine_module.TransferEngine()
         require(engine.relay_abi_version() == 2, 'engine relay ABI mismatch')

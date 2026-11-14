@@ -146,11 +146,11 @@ def initialize(spec_path, node_id, token_path, run):
         evidence = Path(authorization[field])
         require(evidence.is_absolute() and evidence.is_file() and evidence.stat().st_size > 0,
                 f"missing operator evidence: {field}")
-    run.mkdir(mode=0o700, parents=True, exist_ok=True)
     master = spec["nodes"][spec["master_node"]]
     native = {k: node[k] for k in ("pool_id", "capacity", "mapping_offset", "alignment", "owned_offset", "owned_size")}
     native.update(campaign=spec["campaign"], path=node["dax_path"], backend_kind="devdax",
-                  token_file=str(token), journal=str(run / "arena.journal"), wait_ms=30000)
+                  token_file=str(token), journal=str(run / "arena.journal"), wait_ms=30000,
+                  mux_capacity=2, mux_queue_limit=32)
     connector = dict(metadata_server="P2PHANDSHAKE",
                      master_server_address=f"{master.get('control_ip', master['ip'])}:{spec['master_port']}", protocol="rdma",
                      device_name=node["hca"], mode="standalone-store", global_segment_size=0,
@@ -164,6 +164,7 @@ def initialize(spec_path, node_id, token_path, run):
                  challenge_sha256=sha(authorization["challenge_evidence"]),
                  source=str(SOURCE), root=str(ROOT))
     validate_environment(setup)
+    run.mkdir(mode=0o700, parents=True, exist_ok=True)
     for name, value in (("native.json", native), ("connector.json", connector), ("setup.json", setup)):
         save(run / name, value)
     return setup
@@ -381,12 +382,21 @@ def start(setup, role, peer_path=None, prepare=False):
             "installed artifacts changed since preflight")
     env, effective = environment(setup, role)
     argv = command(setup, role)
+    if role == "master":
+        build_receipt = json.loads((run / "build.json").read_text())
+        require(str(Path(argv[0]).resolve()) == build_receipt["master"] and
+                sha(argv[0]) == build_receipt["master_sha256"], "master artifact changed after build")
     node = setup["spec"]["nodes"][setup["node_id"]]
     bind_ip = node.get("control_ip", node["ip"])
     port = setup["spec"]["master_port"] if role == "master" else node["api_port"]
     with socket.socket() as probe:
         probe.settimeout(1)
         require(probe.connect_ex((bind_ip, port)) != 0, "selected service port is already occupied")
+    if role == "worker":
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            require(probe.connect_ex((node["ip"], node["te_port"])) != 0,
+                    "selected worker RDMA handshake port is already occupied")
     log = run / f"{role}.log"
     require(not log.exists(), "preserve existing service log; select a fresh campaign after controlled retirement")
     if role == "worker":
@@ -394,6 +404,9 @@ def start(setup, role, peer_path=None, prepare=False):
         master = setup["spec"]["nodes"][setup["spec"]["master_node"]]
         with socket.create_connection((master.get("control_ip", master["ip"]), setup["spec"]["master_port"]), timeout=2):
             pass
+        require(not (run / "resources.json").exists() or
+                json.loads((run / "resources.json").read_text()).get("status") != "PASS",
+                "existing successful resource receipt requires inspection before remount")
         prepare_resources(json.loads(Path(setup["native"]).read_text()), 64 * 1024 * 1024,
                           run, authorize=prepare)
     with log.open("xb") as output:
@@ -524,10 +537,10 @@ print(json.dumps(dict(binding=store.__file__, engine=engine.__file__,
     return report
 
 
-def request(setup, phase):
+def request(setup, phase, source_run=None):
     node = setup["spec"]["nodes"][setup["node_id"]]
     require((phase == "produce" and node["role"] == "source") or
-            (phase in ("reuse", "cold") and node["role"] == "requester"), "request phase does not match node role")
+            (phase in ("reuse", "local", "cold") and node["role"] == "requester"), "request phase does not match node role")
     role = "cold" if phase == "cold" else "worker"
     require((Path(setup["run"]) / f"{role}.process.json").exists(), "start the owned ready service first")
     model = setup["spec"]["model"]
@@ -537,6 +550,21 @@ def request(setup, phase):
     path = run / f"{phase}.response.json"
     if path.exists():
         return json.loads(path.read_text())
+    if phase == "reuse":
+        require(source_run is not None, "reuse requires B's export evidence via --source-evidence")
+        source_run = Path(source_run)
+        _, peer = preflight_pair(setup, source_run / "preflight.json")
+        identity = setup["spec"]["campaign"] + "-produce"
+        receipt = json.loads((source_run / "produce.response.json").read_text())
+        require(receipt["request_id"] == identity, "source response belongs to another campaign")
+        prefix = model["block_size"] * model["prefix_blocks"]
+        exported = objects(trace_rows(source_run / "worker.log", identity),
+                           "callosum_connector_export", prefix, model["block_size"])
+        source = setup["spec"]["nodes"][peer["node_id"]]
+        require(all(row["replica_endpoints"] == [endpoint(source)] for row in exported),
+                "B must have exported every claimed full block to its own pool")
+    if phase == "local":
+        require((run / "reuse.response.json").is_file(), "run the remote-reuse request first")
     inflight = run / "request.inflight.json"
     require(not inflight.exists(), "a request already started; inspect the logs before any retry")
     with inflight.open("x") as stream:
@@ -557,6 +585,166 @@ def request(setup, phase):
     return report
 
 
+def trace_rows(path, identity):
+    prefix = "cmpl-" + identity + "-0"
+    rows = []
+    for line in Path(path).read_text().splitlines():
+        if "[TTFT_TRACE] " not in line:
+            continue
+        event = json.loads(line.split("[TTFT_TRACE] ", 1)[1])
+        rid = event.get("request_id", "")
+        if rid == prefix or re.fullmatch(re.escape(prefix) + r"-[0-9a-f]{8}", rid):
+            rows.append(event)
+    require(rows and len({row["request_id"] for row in rows}) == 1,
+            f"missing or ambiguous engine request ID for {identity}")
+    return rows
+
+
+def one(rows, name, **fields):
+    selected = [r for r in rows if r.get("event") == name and
+                all(r.get(key) == value for key, value in fields.items())]
+    require(len(selected) == 1, f"expected one {name} event for {fields}")
+    return selected[0]
+
+
+def objects(rows, name, prefix_tokens, block_size):
+    selected = sorted((r for r in rows if r.get("event") == name), key=lambda r: r["start_token"])
+    require(len(selected) == prefix_tokens // block_size, f"wrong full-block count for {name}")
+    require(len({r["object_key"] for r in selected}) == len(selected), f"duplicate connector key for {name}")
+    for start, row in zip(range(0, prefix_tokens, block_size), selected, strict=True):
+        require(row["start_token"] == start and row["end_token"] == start + block_size and
+                row["status"] == "ok" and row["tp_rank"] == row["group_index"] == 0 and
+                row["tensor_bytes"] and all(type(n) is int and n > 0 for n in row["tensor_bytes"]) and
+                sum(row["tensor_bytes"]) == row["bytes"], f"bad layout, status or token coverage for {name}")
+    return selected
+
+
+def verify_compute(rows, start, end):
+    cursor = start
+    for r in sorted((r for r in rows if r.get("event") == "callosum_compute"), key=lambda r: r["timestamp_ns"]):
+        require(r["computed_tokens_before"] == cursor and r["scheduled_tokens"] > 0,
+                "actual compute overlaps the claimed reused prefix or has a gap")
+        cursor += r["scheduled_tokens"]
+    require(cursor == end and end > start, "missing actual prefill compute evidence")
+
+
+def load_window(rows, prefix, prompt_tokens):
+    wait = one(rows, "external_kv_wait_start")
+    require(wait.get("external_cached_tokens") == prefix and wait.get("local_cached_tokens") == 0,
+            "scheduler did not reserve the expected external-only prefix")
+    finished = one(rows, "external_kv_request_complete")
+    require(finished.get("status") == "ok" and finished.get("token_count") == prefix,
+            "connector reported a load failure or incomplete prefix")
+    ready = one(rows, "external_kv_completion_observed")
+    computed = [r for r in rows if r.get("event") == "callosum_compute"]
+    require(computed and wait["timestamp_ns"] <= finished["timestamp_ns"] <= ready["timestamp_ns"] <=
+            min(r["timestamp_ns"] for r in computed), "GPU load/readiness did not precede compute")
+    verify_compute(rows, prefix, prompt_tokens)
+    return ready["timestamp_ns"] - wait["timestamp_ns"]
+
+
+def verify_transfer(tx, rx, key_crc, size, source, requester):
+    match = dict(key_crc=key_crc)
+    auth = one(tx, "receiver_authorized", **match)
+    attempt = auth["attempt"]
+    gens = {k: auth[k] for k in ("source_generation", "target_generation")}
+    require(auth["source_pool"] == source["pool_id"] and auth["destination_pool"] == requester["pool_id"] and
+            auth["receiver"] == endpoint(requester) and auth["receiver_epoch"] and int(auth["bytes"]) == size,
+            "wrong receiver authorization or object length")
+    for label, node in (("source", source), ("destination", requester)):
+        offset = int(auth[label + "_offset"])
+        require(node["owned_offset"] <= offset <= node["owned_offset"] + node["owned_size"] - size,
+                "payload range exceeds approved arena")
+    queued, admitted, gathered = (one(tx, f"mux_{stage}", attempt=attempt)
+                                  for stage in ("queued", "admitted", "gathered"))
+    require(all(int(r["bytes"]) == size for r in (queued, admitted, gathered)), "mux byte count mismatch")
+    writes = [r for r in tx if r.get("event") == "write_drained" and r.get("attempt") == attempt]
+    end = 0
+    for row in writes:
+        require(row["protocol"] == "rdma" and row["opcode"] == "WRITE" and
+                row["sender"] == endpoint(source) and 1 <= int(row["batch"]) <= 32 and
+                all(row[k] == v for k, v in gens.items()), "wrong native opcode, endpoint, batch or generation")
+        count = int(row["batch_bytes"])
+        require(count > 0 and int(row["completed_end"]) == end + count, "gap in WRITE byte coverage")
+        end += count
+    require(writes and end == size, "incomplete native WRITE coverage")
+    validated = one(rx, "receiver_validated", attempt=attempt)
+    require(validated["content_ok"] == "1" and int(validated["bytes"]) == size and
+            validated["epoch"] == auth["receiver_epoch"], "receiver content or epoch check failed")
+    copied = one(tx, "copy_verified", attempt=attempt, **match)
+    published = one(tx, "replica_published", **match, **gens)
+    require(int(copied["bytes"]) == size and tx.index(auth) < tx.index(queued) < tx.index(admitted) <
+            tx.index(writes[0]) <= tx.index(writes[-1]) < tx.index(gathered) < tx.index(copied) < tx.index(published),
+            "publication did not follow native drain, gather and checksum")
+    missed = one(rx, "initial_local_miss", **match)
+    requested = one(rx, "remote_materialization", **match)
+    dispatch = one(tx, "store_task_dispatch", **match)
+    require(missed["pool"] == requester["pool_id"] and requested["task"] == dispatch["task"] and
+            tx.index(dispatch) < tx.index(auth), "requester miss did not trigger the source Store task")
+    remote = one(rx, "replica_usable", phase="remote", **match)
+    local = one(rx, "replica_usable", phase="local", **match)
+    gpu = [(i, r) for i, r in enumerate(rx) if r.get("event") == "gpu_load_verified" and r.get("key_crc") == key_crc]
+    require(len(gpu) == 2 and all(int(r["bytes"]) == size and r["path"] == "local_cxl_copy" and
+            r["replica_generation"] == gens["target_generation"] for _, r in gpu) and
+            rx.index(missed) < rx.index(requested) < rx.index(validated) < rx.index(remote) < gpu[0][0] <
+            rx.index(local) < gpu[1][0], "missing ordered GPU copy/checksum or local reuse evidence")
+    return dict(attempt=attempt, task=requested["task"], bytes=size, native_batches=len(writes), **gens)
+
+
+def verify(setup, source_run):
+    run = Path(setup["run"])
+    source_run = Path(source_run)
+    requester = setup["spec"]["nodes"][setup["node_id"]]
+    require(requester["role"] == "requester", "verify on requester A or with its local receipt")
+    source = next(n for n in setup["spec"]["nodes"].values() if n["role"] == "source")
+    preflight_pair(setup, source_run / "preflight.json")
+    require((source_run / "host-preflight/summary.json").is_file() and
+            (run / "host-preflight/summary.json").is_file(), "retain both host diagnostic bundles")
+    spec = setup["spec"]
+    model = spec["model"]
+    prefix = model["block_size"] * model["prefix_blocks"]
+    prompt = prefix + 1
+    evidence = {}
+    for phase in ("produce", "reuse", "local", "cold"):
+        directory = source_run if phase == "produce" else run
+        identity = spec["campaign"] + "-" + phase
+        response = json.loads((directory / f"{phase}.response.json").read_text())
+        require(response["phase"] == phase and response["request_id"] == identity and
+                response["response"]["id"] == "cmpl-" + identity and
+                response["response"]["usage"]["prompt_tokens"] == prompt and
+                response["response"]["usage"]["completion_tokens"] == 1 and response["response"]["choices"],
+                f"invalid inference response for {phase}")
+        evidence[phase] = (response, trace_rows(directory / ("cold.log" if phase == "cold" else "worker.log"), identity))
+    exported = objects(evidence["produce"][1], "callosum_connector_export", prefix, model["block_size"])
+    ready = {}
+    for phase in ("reuse", "local"):
+        rows = evidence[phase][1]
+        loaded = objects(rows, "external_kv_chunk_complete", prefix, model["block_size"])
+        for saved, received in zip(exported, loaded, strict=True):
+            require(all(saved[k] == received[k] for k in ("object_key", "tensor_bytes", "bytes")) and
+                    received["result_code"] == received["bytes"], "legacy GPU load does not match B's exported block")
+        ready[phase] = load_window(rows, prefix, prompt)
+    verify_compute(evidence["cold"][1], 0, prompt)
+    require(not any(r["event"].startswith("external_kv_") for r in evidence["cold"][1]),
+            "cold control had external reuse enabled")
+    verify_compute(evidence["produce"][1], 0, prompt)
+    tx, rx = events(source_run / "worker.log"), events(run / "worker.log")
+    transfers = []
+    for row in exported:
+        require(row["replica_endpoints"] == [endpoint(source)], "initial complete placement was not source-only")
+        transfers.append(verify_transfer(tx, rx, str(crc64(row["object_key"].encode())), row["bytes"], source, requester))
+    require(len({r["attempt"] for r in transfers}) == len(transfers), "transfer attempt reused across objects")
+    report = dict(status="SERVING_REUSE_PROVEN", campaign=spec["campaign"], export_origin="ordinary_prefill_save",
+                  source=endpoint(source), requester=endpoint(requester), scope="CXL_FIRST_LEGACY_STORE",
+                  reused_blocks=len(transfers), reused_prefix_tokens=prefix, reused_compute_tokens=1,
+                  local_compute_tokens=1, cold_compute_tokens=prompt, transfer_bytes=sum(r["bytes"] for r in transfers),
+                  requester_gpu_ready_ns=ready, requests={phase: row[0]["elapsed_ns"] for phase, row in evidence.items()},
+                  output_text_matches_cold=evidence["reuse"][0]["response"]["choices"][0]["text"] ==
+                    evidence["cold"][0]["response"]["choices"][0]["text"], transfers=transfers)
+    save(run / "serving-verification.json", report)
+    return report
+
+
 def build(setup):
     require(platform.system() == "Linux" and sys.prefix != sys.base_prefix,
             "production Store builds require Linux and the selected target-compatible venv")
@@ -565,7 +753,10 @@ def build(setup):
     require(not any(run.glob("*.process.json")), "stop owned services before rebuilding")
     directory = run / "build-store-cuda"
     source_fingerprint = {name: sha(SOURCE / name) for name in NATIVE_SOURCES}
-    save(run / "build.source.json", source_fingerprint)
+    git = lambda directory, *args: subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
+    revisions = dict(parent=git(ROOT, "rev-parse", "HEAD"), mooncake=git(SOURCE, "rev-parse", "HEAD"),
+                     dirty=git(SOURCE, "status", "--porcelain"))
+    save(run / "build.source.json", dict(files=source_fingerprint, revisions=revisions))
     if (run / "build.json").exists():
         recorded = json.loads((run / "build.json").read_text())
         for name in ("binding", "engine", "master"):
@@ -584,7 +775,8 @@ def build(setup):
         subprocess.run(argv, env=env, check=True)
     package = Path(sysconfig.get_path("platlib")) / "mooncake"
     extension = sysconfig.get_config_var("EXT_SUFFIX")
-    receipt = dict(build=str(directory), interpreter=sys.executable, source_fingerprint=source_fingerprint)
+    receipt = dict(build=str(directory), interpreter=sys.executable, source_fingerprint=source_fingerprint,
+                   revisions=revisions, cmake_cache_sha256=sha(directory / "CMakeCache.txt"))
     for name, path in (("binding", package / ("store" + extension)),
                        ("engine", package / ("engine" + extension)),
                        ("master", directory / "mooncake-store/src/mooncake_master")):
@@ -596,13 +788,17 @@ def build(setup):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("token", "init", "build", "instrument", "preflight", "start", "request", "stop"))
+    parser.add_argument("stage", choices=("token", "init", "build", "instrument", "preflight", "start", "request", "verify", "stop"))
     parser.add_argument("--run", type=Path)
     parser.add_argument("--spec", type=Path)
     parser.add_argument("--node")
     parser.add_argument("--token", type=Path)
     parser.add_argument("--role", choices=("master", "worker", "cold"))
-    parser.add_argument("--phase", choices=("produce", "reuse", "cold"))
+    parser.add_argument("--phase", choices=("produce", "reuse", "local", "cold"))
+    parser.add_argument("--peer-preflight", type=Path)
+    parser.add_argument("--peer-retired", type=Path)
+    parser.add_argument("--source-evidence", type=Path)
+    parser.add_argument("--prepare-resources", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.stage == "token":
@@ -624,15 +820,23 @@ def main(argv=None):
                 elif args.stage == "preflight": result = preflight(setup)
                 elif args.stage in ("start", "stop"):
                     require(args.role, "start/stop requires --role")
-                    result = (start if args.stage == "start" else stop)(setup, args.role)
+                    if args.stage == "start":
+                        result = start(setup, args.role, args.peer_preflight, args.prepare_resources)
+                    else:
+                        result = stop(setup, args.role, args.peer_retired)
+                elif args.stage == "verify":
+                    require(args.source_evidence, "verify requires --source-evidence")
+                    result = verify(setup, args.source_evidence)
                 else:
                     require(args.phase, "request requires --phase")
-                    result = request(setup, args.phase)
-        print(encoded(dict(status="PREPARATION_OR_INFERENCE_ONLY", result=result)), end="")
+                    result = request(setup, args.phase, args.source_evidence)
+        status = "SERVING_REUSE_PROVEN" if args.stage == "verify" else "PREPARATION_OR_INFERENCE_ONLY"
+        print(encoded(dict(status=status, result=result)), end="")
         return 0
     except Exception as error:
-        print(encoded(dict(status="BLOCKED", cause=str(error),
-                           recovery="retain existing config, journals, services and evidence; repair the named prerequisite")), end="")
+        status = "REUSE_NOT_PROVEN" if args.stage == "verify" else "BLOCKED"
+        print(encoded(dict(status=status, stage=args.stage, cause=str(error),
+                           recovery="inspect the stage receipts and logs; preserve live services, journals and prior evidence")), end="")
         return 1
 
 
