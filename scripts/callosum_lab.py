@@ -716,7 +716,7 @@ def validate_launch_config(config, node_id):
             'abi_version must be integer 2')
     nodes, pools, launch = config.get('nodes'), config.get('pools'), config.get('lab_run')
     require(isinstance(nodes,list) and len(nodes) in (2,4) and all(isinstance(n,dict) for n in nodes)
-            and isinstance(pools,dict) and len(pools)==(3 if config.get('experiment_layout')=='colocated_pairs' else 2)
+            and isinstance(pools,dict) and len(pools) in ((3,4) if config.get('experiment_layout')=='colocated_pairs' else (2,))
             and all(isinstance(p,dict) for p in pools.values()),
             'Require two/four node records and two pool records')
     def identity(value):
@@ -771,11 +771,14 @@ def validate_launch_config(config, node_id):
         senders=[n for n in nodes if n['can_send'] and not n['can_receive']]
         receivers=[n for n in nodes if n['can_receive'] and not n['can_send']]
         require(len(senders)==len(receivers)==2 and
-                len({n['pool'] for n in senders})==1 and
                 len({n['pool'] for n in receivers})==2 and
-                len({n['pool'] for n in nodes})==3 and
-                len({n['path'] for n in senders})==1 and len({n['path'] for n in receivers})==2,
-                'colocated pairs require one shared source device and two distinct destination pools')
+                len({n['pool'] for n in nodes})==len(pools) and
+                len({n['path'] for n in senders})==len({n['pool'] for n in senders}) and
+                len({n['path'] for n in receivers})==2 and
+                not ({n['pool'] for n in senders} & {n['pool'] for n in receivers}),
+                'colocated pairs require one or two source pools and two distinct destination pools')
+        require(type(config.get('require_remote_dax_numa',True)) is bool,
+                'require_remote_dax_numa must be boolean')
     for pool_id,pool in pools.items():
         require(isinstance(pool.get('owner'),str) and pool['owner'].strip()
                 and isinstance(pool.get('physical_pool_id'),str) and pool['physical_pool_id'].strip(),
@@ -1064,7 +1067,8 @@ def node_run(root, run, args, runner):
     if config.get('experiment_layout') == 'colocated_pairs' and node['can_send']:
         from callosum_transport_benchmark import dax_numa_evidence
         (run/'source-numa.json').write_text(json.dumps(
-            dax_numa_evidence(node['path'],node['rdma_device']),indent=2))
+            dax_numa_evidence(node['path'],node['rdma_device'],
+                              require_remote=config.get('require_remote_dax_numa',True)),indent=2))
     startup_checks(config,args.node_id,runner)
     os.environ['CALLOSUM_CONTROL_TOKEN']=secret
     fingerprint=runtime.config(args.config)['fingerprint']

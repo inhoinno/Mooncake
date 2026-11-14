@@ -75,11 +75,10 @@ def validate_config(c, path):
         require(len({host(n['local_hostname']) for n in senders}) == 1 and
                 len({host(n['local_hostname']) for n in receivers}) == 1 and
                 len({n['rdma_device'] for n in senders}) == len({n['rdma_device'] for n in receivers}) == 1 and
-                all(n.get('require_remote_dax_numa') is True for n in senders) and
                 len({n['bridge']['path'] for n in receivers}) == 2,
-                'expected two colocated NUMA-remote sources and two distinct destination DAX devices')
+                'expected two colocated sources and two distinct destination DAX devices')
         a, b = (n['bridge'] for n in senders)
-        require(a['path'] == b['path'] and
+        require(a['path'] != b['path'] or
                 (a['mapping_offset']+a['capacity'] <= b['mapping_offset'] or
                  b['mapping_offset']+b['capacity'] <= a['mapping_offset']),
                 'source clients on one device need disjoint mappings')
@@ -269,10 +268,11 @@ def initialize(args):
     if 'pairs' in c:
         by_node = {r['node']: r for r in receipts}
         a, b = [[by_node[p[role]] for p in c['pairs']] for role in ('source','requester')]
+        same_source = a[0]['config']['bridge']['path']==a[1]['config']['bridge']['path']
         require(a[0]['boot_id'] == a[1]['boot_id'] != b[0]['boot_id'] == b[1]['boot_id'] and
-                a[0]['device_number'] == a[1]['device_number'] and
+                (a[0]['device_number'] == a[1]['device_number'])==same_source and
                 b[0]['device_number'] != b[1]['device_number'],
-                'need two source receipts on one DAX and two receiver receipts on distinct local DAX devices')
+                'DAX device identities or host boot IDs differ from the configured two-host layout')
         for receipt in receipts:
             receipt['config']['device_number'] = receipt['device_number']
     c['nodes'] = {r['node']: r['config'] for r in receipts}
@@ -771,9 +771,10 @@ def main(argv=None):
                         operator_extent_confirmation=args.action == 'run' and args.confirm_exclusive_extent,
                         transport_env={name:os.environ.get(name,'default') for name in
                                        ('MC_NUM_QP_PER_EP','MC_GID_INDEX','MC_MTU')})
-        if node.get('require_remote_dax_numa'):
+        if node.get('require_remote_dax_numa') or ('pair_index' in c and args.node==c['source']):
             from callosum_transport_benchmark import dax_numa_evidence
-            evidence['dax_numa'] = dax_numa_evidence(b['path'], node['rdma_device'])
+            evidence['dax_numa'] = dax_numa_evidence(b['path'], node['rdma_device'],
+                                                    require_remote=node.get('require_remote_dax_numa',False))
         if 'pair_index' in c:
             evidence['clock_boot_id'] = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
             evidence['clock_time_namespace'] = os.readlink('/proc/self/ns/time')

@@ -130,14 +130,21 @@ def write_loop(write, source, destination, block, total, limit, samples_out=None
                 request_timing_version=1,
                 latency_scope='sender logical WRITE call start through drain; excludes control and checksum',
                 instrumentation='offset selection (including random RNG), two monotonic reads and in-memory samples; no loop file I/O')
-def dax_numa_evidence(path, hca, sysroot=Path('/sys')):
+def dax_numa_evidence(path, hca, sysroot=Path('/sys'), *, require_remote=True):
     """Check device backing locality, not the caller's CPU binding."""
     dax = Path(path).name
     if Path(hca).name != hca or hca in ('', '.', '..'):
         raise ValueError('invalid HCA name')
-    dax_node = int((sysroot/'bus/dax/devices'/dax/'target_node').read_text())
-    nic_node = int((sysroot/'class/infiniband'/hca/'device/numa_node').read_text())
-    if min(dax_node,nic_node)<0 or dax_node==nic_node:
+    def read_node(file):
+        try:
+            return int(file.read_text())
+        except (FileNotFoundError,ValueError):
+            if require_remote:
+                raise
+            return -1
+    dax_node = read_node(sysroot/'bus/dax/devices'/dax/'target_node')
+    nic_node = read_node(sysroot/'class/infiniband'/hca/'device/numa_node')
+    if require_remote and (min(dax_node,nic_node)<0 or dax_node==nic_node):
         raise ValueError(f'{path} target_node={dax_node}, {hca} numa_node={nic_node}: '
                          'select an inventoried NUMA-remote source DAX device')
     return dict(path=path, hca=hca, dax_target_node=dax_node, nic_numa_node=nic_node)

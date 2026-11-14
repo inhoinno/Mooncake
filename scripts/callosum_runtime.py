@@ -113,10 +113,13 @@ def config(path):
             'this runtime cannot serve as Store or GlobalMaster authority')
     colocated = c.get('experiment_layout') == 'colocated_pairs'
     require(c.get('experiment_layout') in (None, 'colocated_pairs'), 'unknown experiment layout')
-    require((len(c['nodes']) == 4 and len(c['pools']) == 3 and c['mode'] == 'rdma')
+    require((len(c['nodes']) == 4 and len(c['pools']) in (3,4) and c['mode'] == 'rdma')
             if colocated else (len(c['nodes']) in (2, 4) and len(c['pools']) == 2),
-            'require two/four workers in two pools, or four colocated endpoints in three RDMA pools')
+            'require two/four workers in two pools, or four colocated endpoints in three/four RDMA pools')
     require(len({n['id'] for n in c['nodes']}) == len(c['nodes']), 'duplicate node')
+    if colocated:
+        from callosum_lab import validate_launch_config
+        validate_launch_config(c,c['lab_run']['controller'])
     urls = [c['master']] + [n['url'] for n in c['nodes']]
     require(len(urls) == len(set(urls)), 'duplicate service endpoint')
     for url in urls:
@@ -164,15 +167,6 @@ def config(path):
                 'explicit TE endpoint and RDMA device required per worker')
         require(len({n['te_endpoint'] for n in c['nodes']}) == len(c['nodes']),
                 'duplicate TE endpoint')
-        if colocated:
-            from collections import Counter
-            senders = [n for n in c['nodes'] if n['can_send'] and not n['can_receive']]
-            receivers = [n for n in c['nodes'] if n['can_receive'] and not n['can_send']]
-            require(len(senders) == len(receivers) == 2 and
-                    sorted(Counter(n['pool'] for n in c['nodes']).values()) == [1, 1, 2] and
-                    len({n['pool'] for n in senders}) == 1 and len({n['pool'] for n in receivers}) == 2 and
-                    len({n['path'] for n in senders}) == 1 and len({n['path'] for n in receivers}) == 2,
-                    'colocated pairs require a shared source device and two separate destination pools/devices')
     require(type(c.get('batch_cap', 32)) is int and 1 <= c.get('batch_cap', 32) <= 256,
             'batch_cap must be 1..256')
     require(type(c.get('max_inflight_bytes', 64*1024**2)) is int and
@@ -327,7 +321,8 @@ class Agent:
         self.node = next(n for n in c['nodes'] if n['id'] == node_id)
         if c.get('experiment_layout') == 'colocated_pairs' and self.node['can_send']:
             from callosum_transport_benchmark import dax_numa_evidence
-            self.dax_numa = dax_numa_evidence(self.node['path'], self.node['rdma_device'])
+            self.dax_numa = dax_numa_evidence(self.node['path'], self.node['rdma_device'],
+                                             require_remote=c.get('require_remote_dax_numa',True))
             self.dax_numa.update(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                                  time_namespace=os.readlink('/proc/self/ns/time'))
         self.mapping = Mapping(c, self.node)
@@ -768,7 +763,8 @@ class Master:
                 with self.lock:
                     self.topology_ok = True
                 self.log.emit('topology_verified', mode=self.c['mode'], members=len(members))
-                return dict(shared_pairs_verified=True, separate_pools_verified=True, mode=self.c['mode'],
+                return dict(shared_pairs_verified=any(sum(m['pool']==p for m in members)>1 for p in challenges),
+                            separate_pools_verified=True, mode=self.c['mode'],
                             pools_checked=len(self.c['pools']))
         if method == 'seed':
             require(isinstance(d['key'], str) and 0 < len(d['key']) <= 512, 'invalid key')

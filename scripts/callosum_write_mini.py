@@ -134,9 +134,10 @@ def execute(spec,c,topology,env,output,runner):
         clocks=set()
         for pair in spec['pairs']:
             placement = status.get('dax_numa', {}).get(pair['source'], {})
-            require(min(placement.get('dax_target_node',-1), placement.get('nic_numa_node',-1))>=0 and
-                    placement['dax_target_node']!=placement['nic_numa_node'],
-                    'running sender lacks NUMA-remote DAX evidence')
+            if c.get('require_remote_dax_numa',True):
+                require(min(placement.get('dax_target_node',-1), placement.get('nic_numa_node',-1))>=0 and
+                        placement['dax_target_node']!=placement['nic_numa_node'],
+                        'running sender lacks NUMA-remote DAX evidence')
             require(placement.get('boot_id') and placement.get('time_namespace'),
                     'missing colocated source clock evidence')
             clocks.add((placement['boot_id'],placement['time_namespace']))
