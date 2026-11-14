@@ -806,8 +806,6 @@ def validate_launch_config(config, node_id):
 def validate_node_extent(config, node_id, inv):
     selected,_=validate_launch_config(config,node_id)
     path = selected['path']
-    require(path in inv['devices'] and selected['rdma_device'] in inv['hcas'],
-            'Configured local DAX/HCA is absent from inventory')
     pool, geometry = config['pools'][selected['pool']], inv['geometry'].get(path, {})
     offset, size, align = pool.get('map_offset'), pool.get('capacity'), pool.get('mapping_alignment')
     require(type(offset) is int and type(size) is int and type(align) is int
@@ -815,7 +813,13 @@ def validate_node_extent(config, node_id, inv):
             and offset % align == 0 and size % align == 0, 'Invalid exclusive extent/alignment')
     require(geometry.get('mode') == 'devdax' and type(geometry.get('size')) is int
             and geometry.get('align') == align and offset + size <= geometry['size'],
-            'Configured extent disagrees with local daxctl geometry')
+            f'{node_id}: {path} geometry needs mode=devdax, alignment={align}, '
+            f'and at least {offset + size} device bytes for [{offset}, {offset + size}); '
+            f'daxctl reports mode={geometry.get("mode")}, alignment={geometry.get("align")}, '
+            f'size={geometry.get("size")}. Do not reconfigure a live device.')
+    require(path in inv['devices'] and selected['rdma_device'] in inv['hcas'],
+            f'{node_id}: configured DAX character device {path} or HCA '
+            f'{selected["rdma_device"]} is absent from inventory')
     network=inv.get('network',{})
     require(network.get('status')=='PASS', 'Local IP inventory is unavailable')
     addresses=set(re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}(?=/\d+)',network.get('output','')))

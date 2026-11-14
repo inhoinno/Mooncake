@@ -6,25 +6,33 @@ import argparse
 import ast
 import hashlib
 import importlib.util
+import importlib.metadata
+import ipaddress
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import secrets
 import signal
 import socket
 import stat
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.request
 
 from callosum_lab import process_stamp
+from callosum_store_probe import crc64, dax_geometry, events, prepare_resources
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = Path(__file__).resolve().parents[1]
 WORKER = Path("distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py")
 SCHEDULER = Path("v1/core/sched/scheduler.py")
+NATIVE_SOURCES = ("mooncake-store/src/callosum_store.cpp", "mooncake-store/src/client_service.cpp",
+                  "mooncake-store/src/master_service.cpp", "mooncake-store/src/real_client.cpp",
+                  "mooncake-store/src/transfer_task.cpp", "mooncake-integration/store/store_py.cpp")
 
 
 def require(condition, message):
@@ -66,7 +74,8 @@ def private_token(path):
 
 
 def validate_spec(spec):
-    require(spec.get("schema") == 1 and spec.get("campaign"), "spec needs schema=1 and a campaign ID")
+    require(spec.get("schema") == 1 and re.fullmatch(r"[A-Za-z0-9_-]{8,64}", spec.get("campaign") or ""),
+            "spec needs schema=1 and a fresh campaign ID (8..64 safe characters)")
     nodes = spec.get("nodes", {})
     require(len(nodes) == 2 and {n.get("role") for n in nodes.values()} == {"source", "requester"},
             "exactly two explicit source/requester nodes are required")
@@ -83,6 +92,8 @@ def validate_spec(spec):
         require(all(node[f] % node["alignment"] == 0 for f in
                     ("capacity", "mapping_offset", "owned_offset", "owned_size")), "unaligned pool geometry")
         require(node["dax_path"].startswith("/dev/dax"), "serving requires an actual devdax path")
+        ipaddress.IPv4Address(node["ip"])
+        ipaddress.IPv4Address(node.get("control_ip", node["ip"]))
         require(0 < node["api_port"] < 65536 and 0 < node["te_port"] < 65536, "invalid node port")
     a, b = nodes.values()
     require(a["hostname"] != b["hostname"] and a["ip"] != b["ip"] and
@@ -100,8 +111,17 @@ def validate_spec(spec):
     require(model.get("max_model_len", 0) > model["block_size"] * model["prefix_blocks"] + 1,
             "context must hold the complete prompt and continuation")
     require(spec.get("master_node") in nodes, "master_node must identify an experiment worker")
-    for field in ("master_port", "metadata_port", "metrics_port"):
+    require(nodes[spec["master_node"]]["role"] == "source", "run the owned master on the source host")
+    for field in ("master_port", "metrics_port"):
         require(type(spec.get(field)) is int and 0 < spec[field] < 65536, f"invalid {field}")
+    for name, node in nodes.items():
+        ports = [node["api_port"], node["te_port"]]
+        if name == spec["master_node"]:
+            ports += [spec["master_port"], spec["metrics_port"]]
+        require(len(ports) == len(set(ports)), f"colliding service ports on {name}")
+    for name, value in spec.get("rdma_environment", {}).items():
+        require(name in ("MC_GID_INDEX", "MC_MTU", "MC_NUM_QP_PER_EP") and
+                isinstance(value, str) and value.isdecimal(), "invalid resolved RDMA environment")
     return spec
 
 
@@ -119,21 +139,31 @@ def initialize(spec_path, node_id, token_path, run):
     for field in ("hostname", "pool_id", "physical_pool_id", "dax_path", "owner",
                   "mapping_offset", "capacity", "owned_offset", "owned_size", "alignment"):
         require(authorization.get(field) == node[field], f"authorization does not match {field}")
-    require(authorization.get("exclusive") is True and authorization.get("physical_evidence"),
-            "exclusive ownership and physical topology evidence are required")
+    require(authorization.get("exclusive") is True and authorization.get("physical_evidence") and
+            authorization.get("challenge_evidence"),
+            "exclusive ownership, physical topology and reserved-byte visibility evidence are required")
+    for field in ("physical_evidence", "challenge_evidence"):
+        evidence = Path(authorization[field])
+        require(evidence.is_absolute() and evidence.is_file() and evidence.stat().st_size > 0,
+                f"missing operator evidence: {field}")
     run.mkdir(mode=0o700, parents=True, exist_ok=True)
     master = spec["nodes"][spec["master_node"]]
     native = {k: node[k] for k in ("pool_id", "capacity", "mapping_offset", "alignment", "owned_offset", "owned_size")}
     native.update(campaign=spec["campaign"], path=node["dax_path"], backend_kind="devdax",
                   token_file=str(token), journal=str(run / "arena.journal"), wait_ms=30000)
-    connector = dict(metadata_server=f"http://{master['ip']}:{spec['metadata_port']}/metadata",
-                     master_server_address=f"{master['ip']}:{spec['master_port']}", protocol="rdma",
+    connector = dict(metadata_server="P2PHANDSHAKE",
+                     master_server_address=f"{master.get('control_ip', master['ip'])}:{spec['master_port']}", protocol="rdma",
                      device_name=node["hca"], mode="standalone-store", global_segment_size=0,
                      local_buffer_size=64 * 1024 * 1024, enable_offload=False)
     setup = dict(schema=1, spec=spec, node_id=node_id, run=str(run), python=sys.executable,
                  native=str(run / "native.json"), connector=str(run / "connector.json"),
                  authorization_sha256=sha(authorization_path), token_sha256=sha(token),
+                 input_sha256={"native": hashlib.sha256(encoded(native).encode()).hexdigest(),
+                               "connector": hashlib.sha256(encoded(connector).encode()).hexdigest()},
+                 physical_sha256=sha(authorization["physical_evidence"]),
+                 challenge_sha256=sha(authorization["challenge_evidence"]),
                  source=str(SOURCE), root=str(ROOT))
+    validate_environment(setup)
     for name, value in (("native.json", native), ("connector.json", connector), ("setup.json", setup)):
         save(run / name, value)
     return setup
@@ -141,10 +171,14 @@ def initialize(spec_path, node_id, token_path, run):
 
 def load(run):
     setup = json.loads((Path(run) / "setup.json").read_text())
+    require(Path(run).resolve() == Path(setup["run"]) and setup["source"] == str(SOURCE),
+            "setup receipt belongs to another run directory or checkout")
     require(setup["python"] == sys.executable, "use the interpreter recorded by init")
     node = setup["spec"]["nodes"][setup["node_id"]]
     require(socket.gethostname() == node["hostname"], "setup receipt belongs to another host")
     require(sha(node["authorization"]) == setup["authorization_sha256"], "authorization changed after init")
+    for name in ("native", "connector"):
+        require(sha(setup[name]) == setup["input_sha256"][name], f"resolved {name} config changed after init")
     native = json.loads(Path(setup["native"]).read_text())
     require(sha(private_token(native["token_file"])) == setup["token_sha256"], "token changed after init")
     require(native["campaign"] == setup["spec"]["campaign"], "native config campaign changed")
@@ -154,26 +188,58 @@ def load(run):
 def environment(setup, role):
     node = setup["spec"]["nodes"][setup["node_id"]]
     fixed = {"MC_STORE_RDMA_GPU_DIRECT": "0", "MOONCAKE_STORE_CHECKSUM": "1",
-             "MC_STORE_LOCAL_HOT_CACHE_SIZE": "0", "MC_NUM_QP_PER_EP": "16",
-             "VLLM_TTFT_BREAKDOWN": "1", "CUDA_VISIBLE_DEVICES": node["cuda_devices"],
+             "MC_STORE_LOCAL_HOT_CACHE_SIZE": "0", "MC_STORE_MEMCPY": "1",
+             "MC_NUM_QP_PER_EP": "16", "GLOG_logtostderr": "1", "PYTHONHASHSEED": "0",
+             "VLLM_TTFT_BREAKDOWN": "1", "VLLM_LOGGING_LEVEL": "INFO",
+             "CUDA_VISIBLE_DEVICES": node["cuda_devices"],
              "MOONCAKE_REQUESTER_LOCAL_HOSTNAME": f"{node['ip']}:{node['te_port']}"}
+    fixed.update(setup["spec"].get("rdma_environment", {}))
     if role == "worker":
         fixed.update(MC_CALLOSUM_STORE_CONFIG=setup["native"], MOONCAKE_CONFIG_PATH=setup["connector"])
     if role == "master":
         fixed["MC_CALLOSUM_RETAIN_COPY_TASKS"] = "1"
-    forbidden = ("MC_CXL_", "MC_STORE_USE_HUGEPAGE", "MOONCAKE_PREFERRED_SEGMENT")
+    forbidden = ("MC_CXL_", "MC_STORE_USE_HUGEPAGE", "MOONCAKE_PREFERRED_SEGMENT",
+                 "MC_USE_TENT", "MC_USE_TEV1", "MC_LEGACY_RPC_PORT_BINDING", "MC_MS_AUTO_DISC",
+                 "MOONCAKE_GPU_RDMA_", "MOONCAKE_RDMA_")
     for name, value in os.environ.items():
         if name.startswith(forbidden):
             raise RuntimeError(f"inherited {name} conflicts with the resolved serving mode")
         if name in fixed:
             require(value == fixed[name], f"inherited {name} conflicts with resolved configuration")
-        elif name in ("MC_CALLOSUM_STORE_CONFIG", "MOONCAKE_CONFIG_PATH", "MC_CALLOSUM_RETAIN_COPY_TASKS"):
+        elif name in ("MC_CALLOSUM_STORE_CONFIG", "MOONCAKE_CONFIG_PATH", "MC_CALLOSUM_RETAIN_COPY_TASKS",
+                      "MC_GID_INDEX", "MC_MTU"):
             raise RuntimeError(f"{name} is not valid for the selected role")
     env = os.environ.copy()
     env.update(fixed)
     libraries = str(Path(sys.prefix) / "lib")
     env["LD_LIBRARY_PATH"] = libraries + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
     return env, fixed
+
+
+def validate_environment(setup):
+    environment(setup, "worker")
+
+
+def endpoint(node):
+    return f"{node['ip']}:{node['te_port']}"
+
+
+def api_url(node):
+    return f"http://{node.get('control_ip', node['ip'])}:{node['api_port']}"
+
+
+def preflight_pair(setup, peer_path):
+    local = json.loads((Path(setup["run"]) / "preflight.json").read_text())
+    peer = json.loads(Path(peer_path).read_text())
+    expected = (set(setup["spec"]["nodes"]) - {setup["node_id"]}).pop()
+    require(peer.get("node_id") == expected and
+            peer.get("hostname") == setup["spec"]["nodes"][expected]["hostname"],
+            "peer preflight belongs to a different node")
+    for field in ("spec_sha256", "token_sha256", "model_manifest", "connector_sha256",
+                  "scheduler_sha256", "vllm_version", "native_abi", "native_mux_abi", "source_fingerprint"):
+        require(peer.get(field) is not None and local[field] == peer[field],
+                f"peer preflight differs in {field}")
+    return local, peer
 
 
 def vllm_root():
@@ -187,15 +253,27 @@ def instrument(root, run):
     changes = []
     export_anchor = "                failed = [i for i, v in enumerate(res) if v < 0]\n"
     export = '''                # Callosum serving evidence v1 (ordinary save, not eviction).
-                for key, size, start, end, group, result in zip(
-                    keys, sizes, starts, ends, group_indices, res, strict=True
-                ):
-                    emit_ttft_event(
-                        "callosum_connector_export", request_id=req_id,
-                        object_key=key, num_bytes=sum(size), start_token=start,
-                        end_token=end, group_index=group,
-                        status="ok" if result >= 0 else "error",
-                    )
+                if ttft_trace_enabled():
+                    # Keep diagnostic lookup failure out of the save result.
+                    try:
+                        placement = self.store.batch_get_replica_desc(keys)
+                    except Exception:
+                        placement = {}
+                    for key, size, start, end, group, result in zip(
+                        keys, sizes, starts, ends, group_indices, res, strict=True
+                    ):
+                        replicas = [
+                            r.get_memory_descriptor().buffer_descriptor
+                            for r in placement.get(key, ()) if r.is_memory_replica()
+                        ]
+                        emit_ttft_event(
+                            "callosum_connector_export", request_id=req_id,
+                            object_key=key, num_bytes=sum(size), start_token=start,
+                            end_token=end, group_index=group, tp_rank=self.tp_rank,
+                            tensor_bytes=size,
+                            replica_endpoints=[r.transport_endpoint for r in replicas],
+                            status="ok" if result >= 0 else "error",
+                        )
 '''
     compute_anchor = "            request.num_computed_tokens += num_scheduled_token\n"
     compute = '''            # Callosum serving evidence v1: actual scheduled compute ranges.
@@ -206,20 +284,26 @@ def instrument(root, run):
                 prompt_tokens=request.num_prompt_tokens,
             )
 '''
-    for relative, marker, anchor, addition in (
-        (WORKER, '"callosum_connector_export"', export_anchor, export),
-        (SCHEDULER, '"callosum_compute"', compute_anchor, compute),
+    chunk_anchor = "                            result_code=result,\n"
+    chunk = "                            tensor_bytes=sizes, tp_rank=self.tp_rank,\n"
+    for relative, edits in (
+        (WORKER, [('"callosum_connector_export"', export_anchor, export),
+                  ("tensor_bytes=sizes, tp_rank=self.tp_rank", chunk_anchor, chunk)]),
+        (SCHEDULER, [('"callosum_compute"', compute_anchor, compute)]),
     ):
         path = Path(root) / relative
         original = path.read_text()
         require("emit_ttft_event" in original, f"installed source lacks required trace API: {relative}")
-        if marker in original:
-            require(addition in original, "existing Callosum trace instrumentation differs")
-            continue
-        require(original.count(anchor) == 1, f"installed source does not match audited seam: {relative}")
-        updated = original.replace(anchor, addition + anchor)
+        updated = original
+        for marker, anchor, addition in edits:
+            if marker in updated:
+                require(addition in updated, "existing Callosum trace instrumentation differs")
+                continue
+            require(updated.count(anchor) == 1, f"installed source does not match audited seam: {relative}")
+            updated = updated.replace(anchor, addition + anchor)
         ast.parse(updated)
-        changes.append((path, original, updated))
+        if updated != original:
+            changes.append((path, original, updated))
     run = Path(run)
     for path, original, updated in changes:
         backup = run / (path.name + ".before")
@@ -237,9 +321,10 @@ def command(setup, role):
         require(setup["node_id"] == spec["master_node"], "master role belongs to another node")
         binary = Path(setup["run"]) / "build-store-cuda/mooncake-store/src/mooncake_master"
         require(binary.is_file(), "build the Store master before startup")
-        return [str(binary), f"--port={spec['master_port']}", f"--metrics_port={spec['metrics_port']}",
-                "--memory_allocator=offset", "--enable_http_metadata_server=true",
-                f"--http_metadata_server_port={spec['metadata_port']}"]
+        return [str(binary), f"--rpc_port={spec['master_port']}",
+                f"--rpc_address={node.get('control_ip', node['ip'])}",
+                f"--metrics_port={spec['metrics_port']}", "--enable_metric_reporting=false",
+                "--memory_allocator=offset"]
     model = spec["model"]
     result = [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", model["path"],
               "--tokenizer", model["path"], "--served-model-name", "callosum-test",
@@ -247,10 +332,12 @@ def command(setup, role):
               "--block-size", str(model["block_size"]), "--max-model-len", str(model["max_model_len"]),
               "--tensor-parallel-size", "1", "--pipeline-parallel-size", "1",
               "--no-enable-prefix-caching", "--prefix-caching-hash-algo", "sha256",
-              "--enable-request-id-headers", "--host", node["ip"], "--port", str(node["api_port"])]
+              "--enable-request-id-headers", "--host", node.get("control_ip", node["ip"]),
+              "--port", str(node["api_port"])]
     if role == "worker":
         result += ["--kv-transfer-config", json.dumps(dict(kv_connector="MooncakeStoreConnector",
-                       kv_role="kv_both", kv_connector_extra_config={"load_async": True}))]
+                       kv_role="kv_producer" if node["role"] == "source" else "kv_consumer",
+                       kv_connector_extra_config={"load_async": True}))]
     return result
 
 
@@ -269,41 +356,65 @@ def journals(run):
         return {}
     content = path.read_text()
     require(not content or content.endswith("\n"), "truncated arena journal; retain all resources")
+    lines = content.splitlines()
+    require(lines and lines[0].startswith("IDENTITY "), "invalid arena journal identity")
     states = {}
-    for line in content.splitlines()[1:]:
+    for line in lines[1:]:
         identity, state = line.split()
+        require(state in {"PENDING", "DRAINED", "NO_POST", "VALIDATED"}, "invalid arena journal state")
         states[identity] = state
     return states
 
 
-def start(setup, role):
+def start(setup, role, peer_path=None, prepare=False):
     run = Path(setup["run"])
     receipt = run / f"{role}.process.json"
     require(not receipt.exists(), f"inspect retained process receipt before replacement: {receipt}")
     if role == "cold":
-        require(not (run / "worker.process.json").exists(), "stop the owned requester worker before the cold control")
+        require((run / "worker.process.retired.json").is_file(), "retire the owned requester worker before cold control")
+    require(peer_path is not None, "start requires both host preflights via --peer-preflight")
+    local, _ = preflight_pair(setup, peer_path)
+    require(sha(local["binding"]) == local["binding_sha256"] and
+            sha(local["engine"]) == local["engine_sha256"] and
+            sha(local["connector"]) == local["connector_sha256"] and
+            sha(local["scheduler"]) == local["scheduler_sha256"],
+            "installed artifacts changed since preflight")
     env, effective = environment(setup, role)
     argv = command(setup, role)
     node = setup["spec"]["nodes"][setup["node_id"]]
+    bind_ip = node.get("control_ip", node["ip"])
     port = setup["spec"]["master_port"] if role == "master" else node["api_port"]
     with socket.socket() as probe:
-        require(probe.connect_ex((node["ip"], port)) != 0, "selected service port is already occupied")
-    if role != "master":
-        require((run / "preflight.json").exists(), "preflight must pass before starting inference")
+        probe.settimeout(1)
+        require(probe.connect_ex((bind_ip, port)) != 0, "selected service port is already occupied")
     log = run / f"{role}.log"
     require(not log.exists(), "preserve existing service log; select a fresh campaign after controlled retirement")
+    if role == "worker":
+        require(not (run / "arena.journal").exists(), "retain the previous native arena journal; do not remount")
+        master = setup["spec"]["nodes"][setup["spec"]["master_node"]]
+        with socket.create_connection((master.get("control_ip", master["ip"]), setup["spec"]["master_port"]), timeout=2):
+            pass
+        prepare_resources(json.loads(Path(setup["native"]).read_text()), 64 * 1024 * 1024,
+                          run, authorize=prepare)
     with log.open("xb") as output:
         child = subprocess.Popen(argv, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-    save(receipt, dict(pid=child.pid, stamp=process_stamp(child.pid), argv=argv,
+    stamp = process_stamp(child.pid)
+    require(stamp is not None, f"child start identity unavailable; inspect {log}")
+    save(receipt, dict(pid=child.pid, stamp=stamp, argv=argv,
                        role=role, campaign=setup["spec"]["campaign"], environment=effective))
     deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
         require(child.poll() is None, f"{role} exited; inspect {log}; no other service was stopped")
         try:
             if role == "master":
-                with socket.create_connection((node["ip"], port), timeout=1):
+                with socket.create_connection((bind_ip, port), timeout=1):
                     return str(receipt)
-            elif http(f"http://{node['ip']}:{port}/v1/models", timeout=2).get("data"):
+            elif http(f"http://{bind_ip}:{port}/v1/models", timeout=2).get("data"):
+                if role == "worker":
+                    mounted = [r for r in events(log) if r.get("event") == "pool_mounted"]
+                    require(len(mounted) == 1 and mounted[0].get("segment") == endpoint(node) and
+                            mounted[0].get("pool") == node["pool_id"] and mounted[0].get("backend") == "devdax",
+                            "live Store arena does not match the approved DAX endpoint")
                 return str(receipt)
         except (OSError, ValueError):
             pass
@@ -311,13 +422,24 @@ def start(setup, role):
     raise RuntimeError(f"readiness timed out; retain {receipt} and {log}; no process was killed")
 
 
-def stop(setup, role):
+def stop(setup, role, peer_retired=None):
     run = Path(setup["run"])
     path = run / f"{role}.process.json"
     receipt = json.loads(path.read_text())
     require(receipt["campaign"] == setup["spec"]["campaign"], "process belongs to another campaign")
     require(all(state != "PENDING" for state in journals(run).values()),
             "pending DMA authorization prevents retirement; preserve journals and source pins")
+    require(role == "cold" or not (run / "request.inflight.json").exists(),
+            "request outcome is not recorded; inspect the retained service and journal")
+    if role == "master":
+        require((run / "worker.process.retired.json").is_file() and peer_retired is not None,
+                "retire both owned workers before the master")
+        peer = json.loads(Path(peer_retired).read_text())
+        requester = next(n for n in setup["spec"]["nodes"].values() if n["role"] == "requester")
+        require(peer.get("campaign") == setup["spec"]["campaign"] and peer.get("role") == "worker" and
+                peer.get("node_id") in setup["spec"]["nodes"] and
+                setup["spec"]["nodes"][peer["node_id"]] == requester and peer.get("retired") is True,
+                "invalid requester retirement receipt")
     pid = receipt["pid"]
     require(process_stamp(pid) == receipt["stamp"], "owned process identity changed; no process was stopped")
     argv = subprocess.check_output(["ps", "-p", str(pid), "-o", "args="], text=True).strip()
@@ -334,8 +456,8 @@ def stop(setup, role):
     while time.monotonic() < deadline:
         if process_stamp(pid) != receipt["stamp"]:
             retired = path.with_suffix(".retired.json")
-            require(not retired.exists(), "retirement evidence collision")
-            path.rename(retired)
+            save(retired, dict(receipt, node_id=setup["node_id"], retired=True))
+            path.unlink()
             return str(retired)
         time.sleep(0.2)
     raise RuntimeError("owned process has not exited; do not force kill or recycle its arena")
@@ -345,19 +467,36 @@ def preflight(setup):
     require(platform.system() == "Linux", "Linux/RDMA/CUDA preflight is unavailable on this development Mac")
     require(sys.prefix != sys.base_prefix, "use a target-compatible venv, not system Python")
     node = setup["spec"]["nodes"][setup["node_id"]]
+    run = Path(setup["run"])
+    build_receipt = json.loads((run / "build.json").read_text())
     env, effective = environment(setup, "worker")
-    info = Path(node["dax_path"]).stat()
-    require(stat.S_ISCHR(info.st_mode), "DAX path must be a character device")
-    fd = os.open(node["dax_path"], os.O_RDWR); os.close(fd)  # Inventory only: no mapping/write.
+    _, device_size, alignment = dax_geometry(Path(node["dax_path"]))
+    require(node["mapping_offset"] + node["capacity"] <= device_size and
+            node["alignment"] % alignment == 0, "approved mapping exceeds live DAX geometry")
     require(Path("/sys/class/infiniband", node["hca"]).exists(), "configured RDMA device is unavailable")
-    import mooncake.store as store
-    require(getattr(store, "CALLOSUM_STORE_ABI", 0) == 1, "imported Store binding lacks Callosum code")
+    probe = subprocess.run([sys.executable, "-c", '''
+import json, torch
+from mooncake import engine, store
+print(json.dumps(dict(binding=store.__file__, engine=engine.__file__,
+    native_abi=getattr(store, "CALLOSUM_STORE_ABI", 0),
+    native_mux_abi=getattr(store, "CALLOSUM_STORE_MUX_ABI", 0),
+    cuda=torch.cuda.is_available(), gpu_count=torch.cuda.device_count())))
+'''], env=env, check=True, capture_output=True, text=True)
+    native = json.loads(probe.stdout.strip().splitlines()[-1])
+    require(native["native_abi"] == native["native_mux_abi"] == 1 and
+            native["cuda"] and native["gpu_count"] == 1,
+            "require rebuilt Store/mux bindings and one available CUDA GPU per worker")
+    for name in ("binding", "engine"):
+        require(str(Path(native[name]).resolve()) == build_receipt[name] and
+                sha(native[name]) == build_receipt[name + "_sha256"],
+                f"imported {name} differs from the build receipt")
     root = vllm_root()
     for relative, marker in ((WORKER, '"callosum_connector_export"'), (SCHEDULER, '"callosum_compute"')):
         require(marker in (root / relative).read_text(), "install the bounded trace instrumentation before startup")
     model_path = Path(setup["spec"]["model"]["path"]).resolve(strict=True)
     config = json.loads((model_path / "config.json").read_text())
-    require(config.get("model_type") in ("llama", "qwen2", "qwen3") and not config.get("sliding_window"),
+    require(config.get("model_type") in ("llama", "qwen2", "qwen3") and not config.get("sliding_window") and
+            set(config.get("layer_types") or ["full_attention"]) == {"full_attention"},
             "initial serving gate requires an available full-attention Llama/Qwen model")
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True)
@@ -368,14 +507,20 @@ def preflight(setup):
     manifest = {p.name: sha(p) for p in files}
     report = dict(node_id=setup["node_id"], hostname=socket.gethostname(), environment=effective,
                   spec_sha256=hashlib.sha256(encoded(setup["spec"]).encode()).hexdigest(),
-                  model_manifest=manifest, binding=str(store.__file__), binding_sha256=sha(store.__file__),
+                  model_manifest=manifest, binding=str(Path(native["binding"]).resolve()),
+                  binding_sha256=sha(native["binding"]), engine=str(Path(native["engine"]).resolve()),
+                  engine_sha256=sha(native["engine"]), token_sha256=setup["token_sha256"],
+                  num_layers=config["num_hidden_layers"],
                   connector=str(root / WORKER), connector_sha256=sha(root / WORKER),
-                  scheduler_sha256=sha(root / SCHEDULER), native_abi=store.CALLOSUM_STORE_ABI,
+                  scheduler=str(root / SCHEDULER), scheduler_sha256=sha(root / SCHEDULER),
+                  vllm_version=importlib.metadata.version("vllm"), native_abi=native["native_abi"],
+                  native_mux_abi=native["native_mux_abi"], source_fingerprint=build_receipt["source_fingerprint"],
                   authorization_sha256=setup["authorization_sha256"], hardware="UNVERIFIED")
-    save(Path(setup["run"]) / "preflight.json", report)
-    subprocess.run(["bash", str(ROOT / "scripts/capture_preflight.sh"), "--output",
-                    str(Path(setup["run"]) / "host-preflight"), "--checkout", str(SOURCE),
-                    "--python", sys.executable, "--dax", node["dax_path"]], env=env, check=True)
+    if not (run / "preflight.json").exists():
+        subprocess.run(["bash", str(ROOT / "scripts/capture_preflight.sh"), "--output",
+                        str(run / "host-preflight"), "--checkout", str(SOURCE),
+                        "--python", sys.executable, "--dax", node["dax_path"]], env=env, check=True)
+    save(run / "preflight.json", report)
     return report
 
 
@@ -388,17 +533,27 @@ def request(setup, phase):
     model = setup["spec"]["model"]
     prompt = [model["token_id"]] * (model["block_size"] * model["prefix_blocks"] + 1)
     identity = setup["spec"]["campaign"] + "-" + phase
-    path = Path(setup["run"]) / f"{phase}.response.json"
-    require(not path.exists(), "request already has evidence; do not warm the prefix again")
+    run = Path(setup["run"])
+    path = run / f"{phase}.response.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    inflight = run / "request.inflight.json"
+    require(not inflight.exists(), "a request already started; inspect the logs before any retry")
+    with inflight.open("x") as stream:
+        stream.write(encoded(dict(phase=phase, request_id=identity)))
     started = time.monotonic_ns()
-    response = http(f"http://{node['ip']}:{node['api_port']}/v1/completions",
+    response = http(api_url(node) + "/v1/completions",
                     dict(model="callosum-test", prompt=prompt, max_tokens=1, temperature=0,
-                         stream=False, seed=0), identity)
+                         stream=False, seed=0, cache_salt=setup["spec"]["campaign"]), identity,
+                    timeout=300)
     require(response.get("usage", {}).get("prompt_tokens") == len(prompt) and response.get("choices"),
             "inference response is incomplete or prompt accounting differs")
+    require(response.get("id") == "cmpl-" + identity and response["usage"].get("completion_tokens") == 1,
+            "completion ID or generated token count differs from the requested experiment")
     report = dict(phase=phase, request_id=identity, prompt_tokens=len(prompt), response=response,
                   elapsed_ns=time.monotonic_ns() - started, status="INFERENCE_ONLY")
     save(path, report)
+    inflight.rename(run / f"{phase}.request.json")
     return report
 
 
@@ -406,17 +561,37 @@ def build(setup):
     require(platform.system() == "Linux" and sys.prefix != sys.base_prefix,
             "production Store builds require Linux and the selected target-compatible venv")
     env, _ = environment(setup, "build")
-    directory = Path(setup["run"]) / "build-store-cuda"
+    run = Path(setup["run"])
+    require(not any(run.glob("*.process.json")), "stop owned services before rebuilding")
+    directory = run / "build-store-cuda"
+    source_fingerprint = {name: sha(SOURCE / name) for name in NATIVE_SOURCES}
+    save(run / "build.source.json", source_fingerprint)
+    if (run / "build.json").exists():
+        recorded = json.loads((run / "build.json").read_text())
+        for name in ("binding", "engine", "master"):
+            require(sha(recorded[name]) == recorded[name + "_sha256"], f"retained {name} changed after build")
+        return recorded
     argv = ["cmake", "-S", str(SOURCE), "-B", str(directory), f"-DPython3_EXECUTABLE={sys.executable}",
             f"-DCMAKE_INSTALL_PREFIX={sys.prefix}", "-DUSE_CUDA=ON", "-DUSE_CXL=OFF", "-DUSE_TCP=OFF",
             "-DWITH_TE=ON", "-DWITH_STORE=ON", "-DWITH_STORE_RUST=OFF", "-DWITH_EP=OFF",
-            "-DBUILD_EXAMPLES=OFF", "-DBUILD_BENCHMARK=OFF", "-DBUILD_UNIT_TESTS=ON"]
-    commands = [argv, ["cmake", "--build", str(directory), "--parallel", "2", "--target", "store", "engine", "mooncake_master", "mooncake_client"],
+            "-DBUILD_EXAMPLES=OFF", "-DBUILD_BENCHMARK=OFF", "-DBUILD_UNIT_TESTS=ON",
+            "-DUSE_TENT=OFF", "-DENABLE_MULTI_PROTOCOL=OFF"]
+    commands = [argv, ["cmake", "--build", str(directory), "--parallel", "2", "--target", "store", "engine", "mooncake_master", "mooncake_client", "master_service_test"],
+                [str(directory / "mooncake-store/tests/master_service_test"), "--gtest_filter=MasterServiceTest.CallosumLookupAuthorizePublishRequery"],
                 ["cmake", "--install", str(directory)]]
-    save(Path(setup["run"]) / "build.commands.json", commands)
+    save(run / "build.commands.json", commands)
     for argv in commands:
         subprocess.run(argv, env=env, check=True)
-    return dict(build=str(directory), interpreter=sys.executable)
+    package = Path(sysconfig.get_path("platlib")) / "mooncake"
+    extension = sysconfig.get_config_var("EXT_SUFFIX")
+    receipt = dict(build=str(directory), interpreter=sys.executable, source_fingerprint=source_fingerprint)
+    for name, path in (("binding", package / ("store" + extension)),
+                       ("engine", package / ("engine" + extension)),
+                       ("master", directory / "mooncake-store/src/mooncake_master")):
+        receipt[name] = str(path.resolve())
+        receipt[name + "_sha256"] = sha(path)
+    save(run / "build.json", receipt)
+    return receipt
 
 
 def main(argv=None):

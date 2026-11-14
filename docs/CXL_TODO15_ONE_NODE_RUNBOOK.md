@@ -20,6 +20,14 @@ next lab milestone — **two-node shared-CXL, single-Master validation**.
 
 ## Part 0 — Prerequisites and platform
 
+The file-model test needs no HugeTLB pool. For the hardware case, verify
+that the approved CXL device is in `devdax` mode.
+
+```bash
+daxctl list
+# DAX-only: no nr_hugepages write or hugetlbfs mount.
+```
+
 | Requirement | Value | Why |
 |---|---|---|
 | OS | Linux (Ubuntu/Debian apt host) | Store bindings + CXL transport are Linux-only; the scripts hard-fail on non-Linux. |

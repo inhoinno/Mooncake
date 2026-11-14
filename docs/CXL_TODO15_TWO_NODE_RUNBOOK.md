@@ -45,6 +45,14 @@ fact from a checksum PASS.
 
 ## Safety and prerequisites
 
+Each Store client maps the shared device-DAX pool. Neither client requires
+an anonymous HugeTLB pool for this test.
+
+```bash
+daxctl list
+# DAX-only: no nr_hugepages write or hugetlbfs mount.
+```
+
 - Use a dedicated, coherent CXL shared-memory extent visible to both physical
   nodes. Do not target an in-use TraCT pool.
 - Both nodes must use the same logical `MC_CXL_POOL_ID`, capacity, and mapping

@@ -144,6 +144,14 @@ unregistered provider fails closed. It never falls back to FakeTraCT.
 
 ## Portable and device-DAX gates
 
+The portable gate needs no HugeTLB pool. The hardware gate maps the
+approved device-DAX range rather than allocating anonymous HugeTLB pages.
+
+```bash
+daxctl list
+# DAX-only: no nr_hugepages write or hugetlbfs mount.
+```
+
 After building:
 
 ```bash

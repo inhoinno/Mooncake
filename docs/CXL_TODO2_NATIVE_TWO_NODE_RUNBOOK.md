@@ -47,6 +47,14 @@ ownership status.
 
 ## Lab configuration
 
+Each native CXL client maps device-DAX. A HugeTLB pool is not a prerequisite
+for these clients. Check the approved device on both hosts.
+
+```bash
+daxctl list
+# DAX-only: no nr_hugepages write or hugetlbfs mount.
+```
+
 The example uses one 1 GiB shared pool split equally. Local `/dev/dax` names
 may differ, but pool ID, full capacity, and mapping offset must describe the
 same physical bytes.

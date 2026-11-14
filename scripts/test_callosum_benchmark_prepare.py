@@ -1274,14 +1274,21 @@ class PreparationTest(unittest.TestCase):
 
     def test_auto_hugepages_skips_native_ready_reused_and_independently_blocked_cases(self):
         from callosum_lab import Runner
-        for case in ('native','already_free','reused','permission','other_blocker'):
+        for case in ('native','already_free','reused','existing_group_policy','other_blocker'):
             with self.subTest(case=case),tempfile.TemporaryDirectory() as directory,contextlib.ExitStack() as stack:
                 root=Path(directory); path,args,state,extra,reused,needed=self.auto_hugepage_fixture(root,stack)
                 runner=Runner(root/'work')
                 if case=='native': needed[0]=0
                 if case=='already_free': state['available_pages']=62
                 if case=='reused': reused[0]=True
-                if case=='permission': extra.append(dict(check='hugetlb_permission',error='fixture permission denied'))
+                if case=='existing_group_policy':
+                    extra.append(dict(check='hugetlb_permission',error='fixture permission denied'))
+                    original=Path.read_text
+                    def read(p,*a,**kw):
+                        if str(p)=='/proc/sys/vm/hugetlb_shm_group': return '2000'
+                        return original(p,*a,**kw)
+                    stack.enter_context(patch.object(Path,'read_text',new=read))
+                    stack.enter_context(patch.object(prep.os,'getegid',return_value=1000))
                 if case=='other_blocker': extra.append(dict(check='dax_access',error='fixture device access denied'))
                 try:
                     with patch.object(runner,'call',side_effect=AssertionError('must not request sudo')) as calls, \
@@ -1289,6 +1296,9 @@ class PreparationTest(unittest.TestCase):
                         report=prep.inspect_resources(path,args,root/'work',matrix.load,runner)
                     calls.assert_not_called()
                     self.assertFalse(getattr(runner,'hugepage_pool_change_possible',False))
+                    if case=='existing_group_policy':
+                        record=json.loads((root/'work/hugetlb-permission.json').read_text())
+                        self.assertIn('already has a policy',record['error'])
                     self.assertEqual(report['status'],'BLOCKED' if extra else 'INPUTS_CHECKED_NOT_STARTED')
                 finally: runner.log.close()
 
