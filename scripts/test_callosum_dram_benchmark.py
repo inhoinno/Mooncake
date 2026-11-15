@@ -18,8 +18,9 @@ import callosum_runtime as runtime
 
 
 class FakeMemory:
-    def __init__(self, capacity=8192, node=0):
+    def __init__(self, capacity=8192, node=0, page_mode='native', *, backing='dram'):
         self.capacity, self.node, self.placement = capacity, node, {}
+        self.page_evidence = dict(mode=page_mode,backing=bench.NUMA_BACKINGS[backing])
         self.memory = mmap.mmap(-1, capacity)
         self.address = ctypes.addressof(ctypes.c_char.from_buffer(self.memory))
         ctypes.memset(self.address, 0x5A, capacity)
@@ -131,8 +132,15 @@ class DramBenchmarkTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,'different'):
                     bench.nic_placement('hca0',0,root,require_remote=True,apply_cpu=False)
                 inventory.return_value = '[{"devices":[{"chardev":"dax0.0","target_node":1,"mode":"system-ram"}]}]'
-                with self.assertRaisesRegex(RuntimeError,'device-DAX target'):
+                with self.assertRaisesRegex(RuntimeError,'CXL/DAX-backed'):
                     bench.nic_placement('hca0',1,root,require_remote=True,apply_cpu=False)
+                cxl = bench.nic_placement('hca0',1,root,require_remote=True,apply_cpu=False,backing='cxl-system-ram')
+                self.assertEqual(cxl['dax_targets'],[dict(chardev='dax0.0',target_node=1,mode='system-ram')])
+                bench.require_remote_pages(cxl,dict(pages_by_node={'1':2},kernel_page_bytes=4096,
+                                                    backing='anonymous_cxl_system_ram'),8192)
+                inventory.return_value = inventory.return_value.replace('system-ram','devdax')
+                with self.assertRaisesRegex(RuntimeError,'not a verified system-ram'):
+                    bench.nic_placement('hca0',1,root,require_remote=True,apply_cpu=False,backing='cxl-system-ram')
             bench.require_remote_pages(placement,dict(pages_by_node={'1':2},kernel_page_bytes=4096),8192)
             with self.assertRaisesRegex(RuntimeError,'fully resident'):
                 bench.require_remote_pages(placement,dict(pages_by_node={'1':2,'0':1},kernel_page_bytes=4096),8192)
@@ -144,6 +152,44 @@ class DramBenchmarkTest(unittest.TestCase):
         for line in ('1000 N2=1 N0=1', '1000 N2=1', '2000 N2=2'):
             with self.assertRaises(RuntimeError):
                 bench.resident_pages(4096, 2, 8192, line)
+
+    def test_mixed_backing_sweep_validates_before_write_and_labels_result(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            out = Path(directory)
+            block = 1 << 20
+            src, dst = FakeMemory(block,1), FakeMemory(block,2,backing='cxl-system-ram')
+            source = dict(nic_numa_node=0,cpu_numa_node=0,memory_numa_node=1,memory_backing='dram')
+            target = dict(nic_numa_node=0,cpu_numa_node=0,memory_numa_node=2,memory_backing='cxl-system-ram',
+                          dax_targets=[dict(chardev='dax0.0',target_node=2,mode='system-ram')])
+            def resident(address, node, capacity):
+                return dict(pages_by_node={node:capacity//4096},kernel_page_bytes=4096)
+            for m in (src,dst):
+                m.page_evidence.update(resident(m.address,m.node,m.capacity))
+            service = bench.Receiver(dst,'segment','b1','a1','fp',target,out,peer_backing='dram')
+            def native(_, src, dst, size):
+                ctypes.memmove(dst[0],src[0],size[0])
+                return size
+            engine = SimpleNamespace(relay_write_batch_drained=native)
+            args = SimpleNamespace(control_port=21101,require_remote_numa=True,sizes=[1],unit='MiB',
+                                   repetitions=1,warmup_blocks=0,smoke_bytes=block)
+            with patch.object(bench,'rpc',side_effect=lambda url, method, data=None, **kw:service.handle(method,data or {})) as rpc, \
+                 patch.object(bench,'resident_pages',side_effect=resident),patch.object(bench,'snapshot',return_value={}), \
+                 patch.object(Path,'read_text',return_value='fixture-boot-id'), \
+                 patch.object(bench.os,'readlink',return_value='fixture-time-ns'):
+                def run():
+                    return bench.sweep(engine,src,dict(fingerprint='fp'),dict(id='a1'),
+                                       dict(id='b1',url='http://b1'),source,args,out)
+                with self.assertRaisesRegex(RuntimeError,'backing mismatch'):
+                    run()
+                rpc.assert_called_once_with('http://b1:21101','health')
+                args.peer_backing = 'cxl-system-ram'
+                result, = run()
+                self.assertEqual((result['sender_backing'],result['receiver_backing'],result['path_mode']),
+                                 ('dram','cxl-system-ram','cxl_system_ram_rdma_write'))
+                self.assertEqual(result['receiver']['placement']['pages_by_node'],{2:256})
+                self.assertEqual(result['receiver']['checksum'],src.digest(block))
+            src.memory.close()
+            dst.memory.close()
 
     def test_pair_barrier_matches_trial_and_aborts_before_next_target(self):
         with tempfile.TemporaryDirectory() as directory:

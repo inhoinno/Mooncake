@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import socket
@@ -89,16 +90,22 @@ class ServingTest(unittest.TestCase):
         setup = self.init()
         for node, directory in (('a1', self.requester), ('b1', self.source)):
             serving.save(directory / 'preflight.json', dict(
-                node_id=node, hostname=self.spec['nodes'][node]['hostname'], spec_sha256='same',
-                token_sha256='same', model_manifest={}, connector_sha256='same', scheduler_sha256='same',
+                node_id=node, hostname=self.spec['nodes'][node]['hostname'],
+                spec_sha256=hashlib.sha256(serving.encoded(self.spec).encode()).hexdigest(),
+                token_sha256=setup['token_sha256'], model_manifest={}, connector_sha256='same', scheduler_sha256='same',
                 vllm_version='fixture', native_abi=1, native_mux_abi=1, source_fingerprint={}))
             (directory / 'host-preflight').mkdir()
             serving.save(directory / 'host-preflight/summary.json', {})
         src, dst = (self.spec['nodes'][k] for k in ('b1', 'a1'))
+        src_te, dst_te = (f"{n['ip']}:19800" for n in (src, dst))
 
         def line(path, value):
             with path.open('a') as stream:
                 stream.write(value + '\n')
+
+        for directory, node, te in ((self.source, src, src_te), (self.requester, dst, dst_te)):
+            line(directory / 'worker.log', 'component=callosum_store event=pool_mounted '
+                 f"pool={node['pool_id']} segment={serving.endpoint(node)} te_endpoint={te} backend=devdax")
 
         for phase in ('produce', 'reuse', 'local', 'cold'):
             directory = self.source if phase == 'produce' else self.requester
@@ -124,7 +131,7 @@ class ServingTest(unittest.TestCase):
                     trace('external_kv_chunk_complete' if reused else 'callosum_connector_export',
                           object_key=f'fixture-key-{i}', start_token=16*i, end_token=16*(i+1),
                           status='ok', tp_rank=0, group_index=0, tensor_bytes=[8, 8], bytes=16,
-                          replica_endpoints=[serving.endpoint(src)], result_code=16)
+                          replica_endpoints=[src_te], result_code=16)
             if reused:
                 trace('external_kv_request_complete', status='ok', token_count=32)
                 trace('external_kv_completion_observed')
@@ -142,11 +149,11 @@ class ServingTest(unittest.TestCase):
 
             native(self.source, 'store_task_dispatch', key_crc=key, task=f'task{i}')
             native(self.source, 'receiver_authorized', **identity, key_crc=key, bytes=16,
-                   source_pool=src['pool_id'], destination_pool=dst['pool_id'], receiver=serving.endpoint(dst),
+                   source_pool=src['pool_id'], destination_pool=dst['pool_id'], receiver=dst_te,
                    source_offset=0, destination_offset=0, receiver_epoch='epoch')
             native(self.source, 'mux_queued', attempt=identity['attempt'], bytes=16)
             native(self.source, 'mux_admitted', attempt=identity['attempt'], bytes=16)
-            native(self.source, 'write_drained', **identity, protocol='rdma', opcode='WRITE', sender=serving.endpoint(src),
+            native(self.source, 'write_drained', **identity, protocol='rdma', opcode='WRITE', sender=src_te,
                    batch=1, batch_bytes=16, completed_end=16)
             native(self.source, 'mux_gathered', attempt=identity['attempt'], bytes=16)
             native(self.source, 'copy_verified', attempt=identity['attempt'], key_crc=key, bytes=16)
@@ -164,10 +171,32 @@ class ServingTest(unittest.TestCase):
         setup = self.fixture()
         result = serving.verify(setup, self.source)
         self.assertEqual(result['reused_prefix_tokens'], 32)
+        self.assertEqual(result['source'], '192.0.2.2:19800')
         log = self.requester / 'worker.log'
         log.write_text(log.read_text().replace('"computed_tokens_before": 32', '"computed_tokens_before": 0'))
         with self.assertRaisesRegex(RuntimeError, 'compute overlaps'):
             serving.verify(setup, self.source)
+
+    def test_function_reuse_sends_its_own_request_id_after_checking_source_exports(self):
+        setup = self.fixture()
+        (self.requester / 'reuse.response.json').unlink()
+        owner = dict(campaign=self.spec['campaign'], role='worker', pid=17, stamp='start17')
+        serving.save(self.requester / 'worker.process.json', owner)
+        serving.save(self.requester / 'worker.ready.json', owner)
+        response = dict(id='cmpl-test-campaign-reuse', choices=[dict(text='fixture')],
+                        usage=dict(prompt_tokens=33, completion_tokens=1))
+        with patch.object(serving, 'process_stamp', return_value='replacement'), \
+                patch.object(serving, 'http') as http:
+            with self.assertRaisesRegex(RuntimeError, 'service changed after readiness'):
+                serving.request(setup, 'reuse', self.source)
+            http.assert_not_called()
+        with patch.object(serving, 'process_stamp', return_value='start17'), \
+                patch.object(serving, 'http', return_value=response) as request:
+            report = serving.request(setup, 'reuse', self.source)
+            self.assertEqual(serving.request(setup, 'reuse', self.source), report)
+            request.assert_called_once()
+        self.assertEqual(request.call_args.args[2], 'test-campaign-reuse')
+        self.assertEqual(report['request_id'], 'test-campaign-reuse')
 
     def test_failure_rejects_tcp_and_wrong_gpu_generation(self):
         setup = self.fixture()
@@ -176,11 +205,26 @@ class ServingTest(unittest.TestCase):
         log.write_text(original.replace('protocol=rdma', 'protocol=tcp'))
         with self.assertRaisesRegex(RuntimeError, 'wrong native opcode'):
             serving.verify(setup, self.source)
+        log.write_text(original.replace('te_endpoint=192.0.2.2:19800', 'te_endpoint=192.0.2.1:19800'))
+        with self.assertRaisesRegex(RuntimeError, 'wrong interface'):
+            serving.verify(setup, self.source)
         log.write_text(original)
         log = self.requester / 'worker.log'
         log.write_text(log.read_text().replace('replica_generation=d0', 'replica_generation=d1'))
         with self.assertRaisesRegex(RuntimeError, 'GPU copy/checksum'):
             serving.verify(setup, self.source)
+
+    def test_failure_pending_dma_cannot_retire(self):
+        setup = self.init()
+        with self.assertRaisesRegex(RuntimeError, 'missing native arena journal'):
+            serving.transfer_snapshot_ready(setup, 'worker')
+        journal = self.requester / 'arena.journal'
+        journal.write_text('IDENTITY test-campaign:pool1\ncopy-rx PENDING\n')
+        with self.assertRaisesRegex(RuntimeError, 'pending DMA'):
+            serving.transfer_snapshot_ready(setup, 'worker')
+        with journal.open('a') as stream:
+            stream.write('copy-rx VALIDATED\n')
+        serving.transfer_snapshot_ready(setup, 'worker')
 
 
 if __name__ == '__main__':
