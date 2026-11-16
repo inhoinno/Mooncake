@@ -1475,6 +1475,10 @@ void RdmaContext::trackPostedSlices(
     worker_pool_->trackPostedSlices(slice_list, first, count);
 }
 
+RdmaContext::WriteSnapshot RdmaContext::snapshotWrites() {
+    return worker_pool_ ? worker_pool_->snapshotWrites() : WriteSnapshot{};
+}
+
 void RdmaContext::untrackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {

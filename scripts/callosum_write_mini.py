@@ -8,12 +8,13 @@ import json
 import os
 from pathlib import Path
 import secrets
+import statistics
 import sys
 import time
 
 from callosum_lab import Runner, clean_env
 from callosum_runtime import config as read_topology, require
-from callosum_transport_benchmark import block_bytes, TOTAL_BYTES, access_strategy
+from callosum_transport_benchmark import block_bytes, TOTAL_BYTES, access_strategy, MIXED_WRITE
 from callosum_benchmark_report import enrich_trial, write_report, write_request_csv
 
 
@@ -29,7 +30,8 @@ def load_spec(path, workers, mode_override=None):
     require(spec.get('schema_version')==1,'mini config schema_version must be 1')
     require(set(spec) <= {'schema_version','topology_file','runtime','token_file','output','output_root',
                          'pairs','schedule','sizes','unit','repetitions','mr_page_mode','require_dax_2m',
-                         'access_pattern','access_window_bytes','random_seed'},'unknown mini config fields')
+                         'access_pattern','access_window_bytes','random_seed','diagnostic_driver',
+                         'diagnostic_pair','sample_queues','synchronized'},'unknown mini config fields')
     require(type(spec.get('require_dax_2m',False)) is bool,'require_dax_2m must be boolean')
     if mode_override is not None:
         spec['mr_page_mode']=mode_override
@@ -59,6 +61,16 @@ def load_spec(path, workers, mode_override=None):
                 'four-worker mini must exercise all four workers')
     if c.get('experiment_layout')=='colocated_pairs':
         require(workers==4 and len(pairs)==2, 'colocated benchmark must exercise both pairs')
+    require(type(spec.get('synchronized',False)) is bool and (not spec.get('synchronized')
+            or (c.get('experiment_layout')=='colocated_pairs' and spec['schedule']=='concurrent_pairs')),
+            'synchronized transfer requires the colocated concurrent_pairs profile')
+    driver,pair=spec.get('diagnostic_driver'),spec.get('diagnostic_pair')
+    require(driver in (None,'python','native') and type(spec.get('sample_queues',False)) is bool and
+            (not spec.get('sample_queues') or driver) and
+            (pair is None or driver or spec.get('synchronized')) and
+            (pair is None or pair in {p['source'] for p in pairs}), 'invalid diagnostic driver/pair')
+    if pair is not None:
+        pairs=spec['pairs']=[p for p in pairs if p['source']==pair]
     if spec['schedule']=='concurrent_pairs':
         endpoints=[p[k] for p in pairs for k in ('source','receiver')]
         require(len(endpoints)==len(set(endpoints)),'concurrent pairs must use disjoint endpoints')
@@ -130,6 +142,20 @@ def execute(spec,c,topology,env,output,runner):
             'live campaign is not healthy or does not match configured topology')
     require(all(status.get('benchmark_request_timing_versions',{}).get(p['source'])==1 for p in spec['pairs']),
             'running sender lacks request timing; do not hot-restart retained services')
+    driver=spec.get('diagnostic_driver')
+    synchronized=spec.get('synchronized',False)
+    if synchronized:
+        require(status.get('synchronized_transport_version')==1,
+                'live campaign lacks synchronized transfer gates; no seed or WRITE sent')
+        if not driver:
+            require(not any(status.get('benchmark_diagnostic_tracking',{}).values()),
+                    'disable native tracking for the formal synchronized sweep; no seed or WRITE sent')
+    if driver:
+        require(all(status.get('benchmark_diagnostic_versions',{}).get(n['id'])==1 for n in c['nodes']),
+                'diagnostic needs rebuilt bindings on all endpoints; no seed or WRITE sent')
+    if spec.get('sample_queues'):
+        require(all(status.get('benchmark_diagnostic_tracking',{}).get(p['source']) is True for p in spec['pairs']),
+                'start diagnostic senders with MC_TRACK_RDMA_POSTED_SLICES=1; no seed or WRITE sent')
     if c.get('experiment_layout')=='colocated_pairs':
         clocks=set()
         for pair in spec['pairs']:
@@ -138,9 +164,10 @@ def execute(spec,c,topology,env,output,runner):
                 require(min(placement.get('dax_target_node',-1), placement.get('nic_numa_node',-1))>=0 and
                         placement['dax_target_node']!=placement['nic_numa_node'],
                         'running sender lacks NUMA-remote DAX evidence')
-            require(placement.get('boot_id') and placement.get('time_namespace'),
+            clock = status.get('sender_clocks', {}).get(pair['source'], placement)
+            require(clock.get('boot_id') and clock.get('time_namespace'),
                     'missing colocated source clock evidence')
-            clocks.add((placement['boot_id'],placement['time_namespace']))
+            clocks.add((clock['boot_id'],clock['time_namespace']))
         require(len(clocks)==1,'the direct senders must share one host monotonic clock')
     if spec.get('access_pattern','overwrite')!='overwrite' or spec.get('access_window_bytes') is not None:
         require(spec.get('access_pattern','overwrite') in status.get('transport_access_patterns',[]),
@@ -156,6 +183,13 @@ def execute(spec,c,topology,env,output,runner):
             observed=pages.get(member) or {}
             require(observed.get('mode','native')==page_mode,
                     'live MR mode mismatch; do not relabel or re-register an active mapping')
+            if c.get('path_mode') == MIXED_WRITE:
+                node = next(n for n in c['nodes'] if n['id']==member)
+                pool = c['pools'][node['pool']]
+                require(observed.get('backing')=='cxl_mixed' and observed.get('device')==node['path']
+                        and observed.get('map_offset_bytes')==pool['map_offset']
+                        and observed.get('mapping_bytes')==pool['capacity'],
+                        'live member did not register the configured mixed-CXL mapping')
             if page_mode=='huge2MB' or spec.get('require_dax_2m',False):
                 require(observed.get('device_alignment_bytes')==2**21 and
                         observed.get('kernel_page_size_bytes')==2**21 and
@@ -176,14 +210,27 @@ def execute(spec,c,topology,env,output,runner):
                     '--receiver',pair['receiver'],'--key',sources[i],'--block-size',size,
                  '--block-unit',spec['unit'],'--config',topology,
                  *(['--access-pattern',spec.get('access_pattern','overwrite'),'--access-window-bytes',str(spec['access_window_bytes']),
-                    '--random-seed',str(spec.get('random_seed',0))] if spec.get('access_pattern','overwrite')!='overwrite' or spec.get('access_window_bytes') is not None else [])],
+                    '--random-seed',str(spec.get('random_seed',0))] if spec.get('access_pattern','overwrite')!='overwrite' or spec.get('access_window_bytes') is not None else []),
+                 *(['--diagnose',driver] if driver else []),
+                 *(['--sample-queues'] if spec.get('sample_queues') else [])],
                  env,capture=True,log_stdout=False)
         end=time.monotonic_ns(); end_wall=time.time_ns()
+        return record_trial(name,i,pair,rep,raw,begin,end,begin_wall,end_wall)
+    def record_trial(name,i,pair,rep,raw,begin,end,begin_wall,end_wall):
         # Preserve the exact response outside the controller timer, even if validation fails.
         # Do not match block*.json: offline reports must not count a trial twice.
         with (output/f'observed-{name}.json').open('x') as stream:
             stream.write(raw)
         row=json.loads(raw)
+        if driver:
+            require(row.get('diagnostic_driver')==driver and row.get('diagnostic_requests') and
+                    row.get('controller_diagnostic_ns'), 'native diagnostic evidence is missing')
+            phases=row['diagnostic_requests']
+            row['diagnostic_phase_totals_ns']={
+                key:sum(p[key] for p in phases) for key in
+                ('check_ns','submit_ns','wait_ns','between_calls_ns','in_call_residual_ns')}
+            row['diagnostic_phase_totals_ns']['tail_ns']=row['diagnostic_loop_tail_ns']
+            row['diagnostic_phase_totals_ns']['native_schedule_ns']=row.get('native_schedule_build_ns',0)
         if spec.get('access_pattern','overwrite')!='overwrite' or spec.get('access_window_bytes') is not None:
             require(row.get('access_pattern')==spec.get('access_pattern','overwrite') and
                     row.get('window_bytes')==spec['access_window_bytes'] and
@@ -191,6 +238,9 @@ def execute(spec,c,topology,env,output,runner):
                     'benchmark result does not match requested strategy/window/seed')
         require(row.get('bytes')==TOTAL_BYTES and row.get('request_timing_version')==1,
                 'missing byte accounting or request timings')
+        if c.get('path_mode') == MIXED_WRITE:
+            require(row.get('path_mode')==MIXED_WRITE and row.get('actual_transport')=='rdma',
+                    'mixed-CXL result did not use the requested native RDMA path')
         row.update(direction=f'{pair["source"]}->{pair["receiver"]}',repetition=rep,
                    source=pair['source'],receiver=pair['receiver'],pair_index=i,
                    mr_page_mode=page_mode,
@@ -209,7 +259,26 @@ def execute(spec,c,topology,env,output,runner):
     for size in spec['sizes']:
         for rep in range(spec['repetitions']):
             start_wall=time.time_ns(); start=time.monotonic_ns()
-            if spec['schedule']=='concurrent_pairs':
+            if synchronized:
+                begin_wall,begin=time.time_ns(),time.monotonic_ns()
+                requests=[dict(node=p['source'],receiver=p['receiver'],key=sources[i],
+                    block_size=size,block_unit=spec['unit'],window_bytes=spec.get('access_window_bytes'),
+                    access_pattern=spec.get('access_pattern','overwrite'),random_seed=spec.get('random_seed',0),
+                    diagnostic_driver=driver,sample_queues=spec.get('sample_queues',False))
+                    for i,p in enumerate(spec['pairs'])]
+                label=f'group-{size}{spec["unit"]}-rep-{rep}'
+                raw=runner.call(label,['bash',relay,'transport-group','--config',topology],env,
+                                capture=True,log_stdout=False,input_text=json.dumps(dict(pairs=requests)))
+                end,end_wall=time.monotonic_ns(),time.time_ns()
+                (output/f'observed-{label}.json').write_text(raw)
+                result=json.loads(raw)
+                require(isinstance(result,list) and len(result)==len(requests) and
+                        all(r.get('trial_group') and r['trial_group']==result[0]['trial_group'] for r in result),
+                        'synchronized group lacks complete, correlated drain evidence')
+                group=[record_trial(f'block-{size}{spec["unit"]}-pair-{i}-rep-{rep}',
+                        i,p,rep,json.dumps(r),begin,end,begin_wall,end_wall)
+                       for i,(p,r) in enumerate(zip(spec['pairs'],result))]
+            elif spec['schedule']=='concurrent_pairs':
                 # All futures are joined on errors. Never equate an RPC timeout with drain.
                 with ThreadPoolExecutor(max_workers=len(spec['pairs'])) as pool:
                     jobs=[pool.submit(trial,i,p,size,rep) for i,p in enumerate(spec['pairs'])]
@@ -228,30 +297,102 @@ def execute(spec,c,topology,env,output,runner):
                 starts=[r['sender_loop_start_monotonic_ns'] for r in group]
                 ends=[start+r['sender_write_loop_ns'] for start,r in zip(starts,group)]
                 common.update(sender_common_window_ns=max(ends)-min(starts),
+                              sender_start_skew_ns=max(starts)-min(starts),
                               sender_loop_overlap_ns=max(0,min(ends)-max(starts)),
+                              synchronized=synchronized,
                               aggregate_sender_GBps=common['useful_bytes']/(max(ends)-min(starts)))
+                if spec.get('sample_queues'):
+                    common['sampled_progress']=sampled_progress(group, max(starts), min(ends))
             groups.append(common)
             (output/f'group-{group_id}.json').write_text(json.dumps(common,indent=2)+'\n')
             for row in group:
                 rows.append(row)
                 runner.say(f"[PASS] {row['direction']} {size} {spec['unit']}: {row['GBps']:.3f} GB/s")
     report=write_report(output,rows)
+    sender_groups=[]
+    if c.get('experiment_layout')=='colocated_pairs':
+        for size in spec['sizes']:
+            trials=[g for g in groups if g['block_bytes']==block_bytes(size,spec['unit'])]
+            rates=[g['aggregate_sender_GBps'] for g in trials]
+            sender_groups.append(dict(size=size,unit=spec['unit'],repetitions=len(trials),
+                weighted_GBps=sum(g['useful_bytes'] for g in trials)/
+                              sum(g['sender_common_window_ns'] for g in trials),
+                min_GBps=min(rates),median_GBps=statistics.median(rates),max_GBps=max(rates)))
     with (output/'groups.csv').open('x',newline='') as stream:
         writer=csv.DictWriter(stream,fieldnames=list(groups[0]))
         writer.writeheader(); writer.writerows(groups)
     with (output/'report.md').open('a') as stream:
+        if sender_groups:
+            stream.write('\n## Common sender transfer windows\n\n'
+                'Total completed payload divided by the earliest-to-latest sender loop span. '
+                'Submit, progress, wait and sender skew are timed. '
+                'Only the synchronized profile excludes peer preparation and verification from this span.\n\n'
+                f'Phase gates: {"synchronized" if synchronized else "independent"}.\n\n'
+                '| Block | Trials | Weighted GB/s | Min / median / max GB/s |\n'
+                '|---|---:|---:|---|\n')
+            for g in sender_groups:
+                stream.write(f"| {g['size']} {g['unit']} | {g['repetitions']} | {g['weighted_GBps']:.3f} | "
+                             f"{g['min_GBps']:.3f} / {g['median_GBps']:.3f} / {g['max_GBps']:.3f} |\n")
         stream.write('\n## Common controller windows\n\n')
         stream.write('These rates include control/CLI/result-return cost. They are not summed sender-loop bandwidth.\n\n')
         stream.write('| Group | Schedule | Wall time (ms) | Useful GiB | Protocol GB/s |\n|---|---|---:|---:|---:|\n')
         for g in groups:
             stream.write(f"| {g['group_id']} | {g['schedule']} | {g['controller_elapsed_ns']/1e6:.3f} | "
                          f"{g['useful_bytes']/2**30:g} | {g['aggregate_protocol_GBps']:.3f} |\n")
+        if driver:
+            stream.write(f'\n## Diagnostic runs — {driver} loop\n\n'
+                'Diagnostic tracing is not a final throughput measurement. Native wait includes RDMA progress.\n'
+                'Times are milliseconds; sender phases are not added to controller phases.\n\n'
+                '| Pair | MiB | Rep | Target prepare | Native checks | Submit | Wait | Between calls | In-call residual | Verification |\n'
+                '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n')
+            for r in rows:
+                p, ctime=r['diagnostic_phase_totals_ns'],r['controller_diagnostic_ns']
+                parts=[ctime['receiver_prepare'],p['check_ns'],p['submit_ns'],p['wait_ns'],
+                       p['between_calls_ns'],p['in_call_residual_ns'],ctime['verification']]
+                stream.write(f"| {r['direction']} | {r['block_bytes']/2**20:g} | {r['repetition']} | " +
+                             ' | '.join(f'{ns/1e6:.3f}' for ns in parts) + ' |\n')
     (output/'summary.json').write_text(json.dumps(dict(status='PASS',evidence_class='TRANSFER_ONLY',
-        report=report,results=rows,groups=groups,services_retained=True,
+        report=report,results=rows,groups=groups,sender_group_summary=sender_groups,
+        services_retained=True,
+        measurement_scope='DIAGNOSTIC_ONLY' if driver else 'TRANSPORT_BENCHMARK',
         experiment_layout=c.get('experiment_layout','standard'),
         multipath_object_assembly_proven=False),indent=2)+'\n')
     runner.say((output/'report.md').read_text())
     runner.say(f'[evidence] {output}')
+
+
+def sampled_progress(group, begin, end):
+    """Conservative completed-byte lower bound inside a shared middle window."""
+    if end<=begin or len(group)<2:
+        return dict(status='NO_PAIRED_OVERLAP')
+    trim=(end-begin)//5
+    begin,end=begin+trim,end-trim
+    results={}
+    port_deltas={}
+    for row in group:
+        usable=[s for s in row.get('sender_queue_samples',[]) if s.get('contexts') and
+                begin<=s['begin_ns']<=s['end_ns']<=end and all(x['tracked'] for x in s['contexts'])]
+        if len(usable)<2:
+            return dict(status='INSUFFICIENT_SAMPLES')
+        def counters(sample):
+            return {(x['device'],x['port']):x['completed_write_bytes'] for x in sample['contexts']}
+        first,last=counters(usable[0]),counters(usable[-1])
+        if first.keys()!=last.keys() or any(last[k]<first[k] for k in first):
+            return dict(status='COUNTER_CHANGED')
+        results[row['direction']]=sum(last[k]-first[k] for k in first)
+        # Use one observation series per hardware port, even when two engines
+        # both report it. These are port-wide counters, not per-pair payload.
+        for x in usable[0]['contexts']:
+            identity=f"{x['device']}/{x['port']}"
+            before=x.get('port_tx_counter_bytes')
+            after=next(y.get('port_tx_counter_bytes') for y in usable[-1]['contexts']
+                       if f"{y['device']}/{y['port']}"==identity)
+            if before is not None and after is not None and after>=before:
+                port_deltas.setdefault(identity,after-before)
+    return dict(status='BOTH_ADVANCED' if all(results.values()) else 'NOT_BOTH_OBSERVED_ADVANCING',
+                begin_ns=begin,end_ns=end,completed_bytes_lower_bound=results,
+                aggregate_GBps_lower_bound=sum(results.values())/(end-begin),
+                sender_port_tx_counter_deltas_bytes=port_deltas)
 
 
 def main():

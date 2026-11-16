@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from callosum_runtime import config, require, rpc, server
 from callosum_transport_benchmark import SIZES, TOTAL_BYTES, block_bytes, write_loop, ACCESS_PATTERNS, access_strategy, written_ranges, final_window_digest
+from callosum_transport_benchmark import diagnostic_write_loop
 from callosum_benchmark_report import write_report, write_request_csv, enrich_trial
 
 NUMA_BACKINGS = {'dram': 'anonymous_dram', 'cxl-system-ram': 'anonymous_cxl_system_ram'}
@@ -139,7 +140,7 @@ def require_remote_pages(placement, pages, capacity):
 
 
 def pair_barrier(directory, phase, ordinal, node, peer, timeout=300):
-    """Local M2 rendezvous. Never wait here with an exposed RDMA target."""
+    """Local sender rendezvous; an abort never releases an exposed target."""
     directory = Path(directory)
     deadline = time.monotonic()+timeout
     (directory/f'{phase}-{ordinal}-{node}').touch(exist_ok=False)
@@ -370,8 +371,6 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
         require(length <= health['capacity'], 'receiver window is smaller than the requested block')
         expected = memory.digest(length)
         for index in range(args.repetitions):
-            if getattr(args,'paired_gate',None):
-                pair_barrier(args.paired_gate,'ready',len(results),node['id'],args.local_partner)
             identity = secrets.token_hex(16)
             protocol_wall_start = time.time_ns()
             protocol_start = time.monotonic_ns()
@@ -395,14 +394,28 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                         'short warmup WRITE')
             samples = []
             try:
-                result = write_loop(write, memory.address, target['remote_base'], length,
-                                    getattr(args,'smoke_bytes',0) or TOTAL_BYTES, length,samples,
-                                    access_pattern=pattern,window_bytes=window,random_seed=seed)
+                target_ready = time.monotonic_ns()
+                if getattr(args,'paired_gate',None):
+                    pair_barrier(args.paired_gate,'ready',len(results),node['id'],args.local_partner)
+                released = time.monotonic_ns()
+                if getattr(args,'diagnose',None):
+                    result = diagnostic_write_loop(engine,target['segment'],memory.address,target['remote_base'],
+                        length,TOTAL_BYTES,length,samples,driver=args.diagnose,access_pattern=pattern,
+                        window_bytes=window,random_seed=seed)
+                else:
+                    result = write_loop(write, memory.address, target['remote_base'], length,
+                                        getattr(args,'smoke_bytes',0) or TOTAL_BYTES, length,samples,
+                                        access_pattern=pattern,window_bytes=window,random_seed=seed)
+                completed = time.monotonic_ns()
+                if getattr(args,'paired_gate',None):
+                    pair_barrier(args.paired_gate,'drained',len(results),node['id'],args.local_partner)
                 observed=dict(result,status='PENDING_VALIDATION',attempt=identity,path_mode=path_mode,
                               sender_backing=backing,receiver_backing=peer_backing)
                 save(output/f'observed-{identity}.json',observed)
                 write_request_csv(output/f'observed-{identity}.csv',observed)
             except BaseException:
+                if getattr(args,'paired_gate',None):
+                    (args.paired_gate/'abort').touch()
                 try:
                     partial=dict(status='FAIL',attempt=identity,requests=samples,
                                  path_mode=path_mode,block_bytes=length,
@@ -413,6 +426,7 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                     pass
                 raise
             after = snapshot(placement)
+            validation_start = time.monotonic_ns()
             local_placement = resident_pages(memory.address, memory.node, memory.capacity)
             coverage=written_ranges(samples,window)
             if pattern!='overwrite' or window!=length:
@@ -425,6 +439,10 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                 require_remote_pages(placement,local_placement,memory.capacity)
                 require_remote_pages(health['placement'],verified['placement'],health['capacity'])
             result['protocol_e2e_ns'] = time.monotonic_ns()-protocol_start
+            result['trial_phase_ns'] = dict(receiver_prepare=target_ready-protocol_start,
+                ready_gate=released-target_ready,
+                transfer=result['sender_write_loop_ns'], post_transfer_gate_and_evidence=validation_start-completed,
+                verification=time.monotonic_ns()-validation_start)
             result['controller_start_unix_ns'] = protocol_wall_start
             result['controller_end_unix_ns'] = time.time_ns()
             result.update(status='PASS', evidence_class='TRANSFER_ONLY', path_mode=path_mode,
@@ -440,7 +458,8 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                 sender_before=before, sender_after=after, sender_placement=local_placement,
                 store_compatible=False, gpu_delivery_proven=False, serving_proven=False)
             result.update(source=node['id'],receiver_node=peer['id'],mr_page_mode=page_mode,
-                          measurement_kind='CORRECTNESS_SMOKE' if getattr(args,'smoke_bytes',0) else 'PERFORMANCE',
+                          measurement_kind=('CORRECTNESS_SMOKE' if getattr(args,'smoke_bytes',0) else
+                                            'DIAGNOSTIC_ONLY' if getattr(args,'diagnose',None) else 'PERFORMANCE'),
                           mr_pages={node['id']:getattr(memory,'page_evidence',None),
                                     peer['id']:health.get('mr_pages')})
             if getattr(args,'require_remote_numa',False):
@@ -498,6 +517,7 @@ def main():
     parser.add_argument('--unit', choices=['MB', 'MiB'], default='MiB')
     parser.add_argument('--repetitions', type=int, default=3)
     parser.add_argument('--warmup-blocks', type=int, default=0)
+    parser.add_argument('--diagnose',choices=('python','native'))
     parser.add_argument('--smoke-bytes',type=int,default=0,
                         help='Explicit correctness-only byte count; not a performance trial')
     parser.add_argument('--output', required=True)
@@ -508,6 +528,8 @@ def main():
     output_created = False
     try:
         require(sys.platform == 'linux', 'real DRAM RDMA benchmark requires Linux')
+        require(not args.diagnose or (args.role=='sender' and not args.smoke_bytes and
+                not args.warmup_blocks), 'diagnostics require the full sender workload without warmup')
         args.peer_backing = args.peer_backing or args.backing
         require(args.require_remote_numa or args.backing==args.peer_backing=='dram',
                 'CXL system RAM requires explicit remote NUMA placement')

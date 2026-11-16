@@ -16,10 +16,79 @@ from types import SimpleNamespace
 
 import callosum_write_mini as mini
 from callosum_lab import Runner
-from callosum_transport_benchmark import write_loop, TOTAL_BYTES
+from callosum_transport_benchmark import write_loop, TOTAL_BYTES, diagnostic_write_loop, rdma_snapshot, rdma_trial_progress
 
 
 class MiniTest(unittest.TestCase):
+    def test_diagnostic_loops_submit_identical_bytes_and_offsets(self):
+        def run(driver):
+            posted = []
+            def one(segment, src, dst, length):
+                posted.append((segment,src,dst,length))
+                return (1,1,1)
+            def native(segment, sources, destinations, lengths):
+                return [(i*8,i*8+5,*one(segment,s,d,n))
+                        for i,(s,d,n) in enumerate(zip(sources,destinations,lengths))]
+            engine=SimpleNamespace(relay_write_block_profiled=one,relay_write_blocks_diagnostic=native)
+            row=diagnostic_write_loop(engine,'target',4096,8192,16,66,16,[],
+                access_pattern='sequential',window_bytes=32,random_seed=0,driver=driver)
+            self.assertEqual(row['bytes'],66)
+            self.assertEqual(row['native_calls'],5)
+            self.assertEqual(row['diagnostic_driver'],driver)
+            self.assertEqual(sum(row['diagnostic_requests'][0][k] for k in ('check_ns','submit_ns','wait_ns')),3)
+            keys=('check_ns','submit_ns','wait_ns','between_calls_ns','in_call_residual_ns')
+            self.assertEqual(sum(s[k] for s in row['diagnostic_requests'] for k in keys)+
+                             row['diagnostic_loop_tail_ns']+row.get('native_schedule_build_ns',0),
+                             row['sender_write_loop_ns'])
+            return posted
+        expected=[('target',4096+i%2*16,8192+i%2*16,min(16,66-i*16)) for i in range(5)]
+        self.assertEqual(run('python'),expected)
+        self.assertEqual(run('native'),expected)
+
+    def test_diagnostic_common_interval_does_not_sum_the_shared_port(self):
+        def samples(direction, completed):
+            return dict(direction=direction,sender_queue_samples=[
+                dict(begin_ns=t,end_ns=t+1,contexts=[dict(device='hca0',port=1,tracked=True,
+                     completed_write_bytes=b,port_tx_counter_bytes=tx)])
+                for t,b,tx in ((15,0,0),(25,0,0),(55,completed,100),(90,999,1000))])
+        rows=[samples('a1->b1',10),samples('a2->b2',20)]
+        result=mini.sampled_progress(rows,0,100)
+        self.assertEqual(result['status'],'BOTH_ADVANCED')
+        self.assertEqual((result['begin_ns'],result['end_ns']),(20,80))
+        self.assertEqual(result['completed_bytes_lower_bound'],{'a1->b1':10,'a2->b2':20})
+        self.assertEqual(result['sender_port_tx_counter_deltas_bytes'],{'hca0/1':100})
+        self.assertEqual(result['aggregate_GBps_lower_bound'],0.5)
+        self.assertEqual(mini.sampled_progress(rows,0,5)['status'],'INSUFFICIENT_SAMPLES')
+        self.assertEqual(mini.sampled_progress(rows[:1],0,100)['status'],'NO_PAIRED_OVERLAP')
+        self.assertEqual(mini.sampled_progress([rows[0],samples('a2->b2',0)],0,100)['status'],
+                         'NOT_BOTH_OBSERVED_ADVANCING')
+
+    def test_counter_snapshot_preserves_missing_and_converts_word_units(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            counters=root/'class/infiniband/hca0/ports/1/counters'
+            counters.mkdir(parents=True)
+            (counters/'port_xmit_data').write_text('123\n')
+            engine=SimpleNamespace(relay_rdma_snapshot=lambda:[dict(device='hca0',port=i) for i in (1,2)])
+            observed=rdma_snapshot(engine,root)
+            self.assertLessEqual(observed['begin_ns'],observed['end_ns'])
+            self.assertEqual([x['port_tx_counter_bytes'] for x in observed['contexts']],[492,None])
+
+    def test_native_progress_uses_per_trial_qp_deltas_and_rejects_incomplete_counters(self):
+        def snapshot(**fields):
+            context=dict(device='hca0',port=1,tracked=True,pending_write_wrs=0,
+                         qp_counters_truncated=False)
+            return dict(contexts=[dict(context,**fields)])
+        before=snapshot(qp_completed_bytes={11:128,12:64},completed_write_bytes=192,write_outstanding_ns=8)
+        after=snapshot(qp_completed_bytes={11:128,12:128,13:128},completed_write_bytes=384,write_outstanding_ns=16)
+        result=rdma_trial_progress(before,after,192)
+        self.assertEqual(result['status'],'ACCOUNTED')
+        self.assertEqual(result['contexts'][0]['qp_completed_bytes'],{12:64,13:128})
+        self.assertEqual(result['contexts'][0]['tracked_outstanding_ns'],8)
+        self.assertEqual(rdma_trial_progress(before,after,193)['status'],'INCOMPLETE')
+        after['contexts'][0]['pending_write_wrs']=1
+        self.assertEqual(rdma_trial_progress(before,after,192)['status'],'OBSERVATION_BOUNDARY_NOT_IDLE')
+
     def test_rotating_strategy_cli_payload_and_old_master_gate(self):
         for supported in (False,True,'old-agent'):
             with self.subTest(supported=supported),tempfile.TemporaryDirectory() as directory:

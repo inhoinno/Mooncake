@@ -3703,10 +3703,28 @@ auto MasterService::AllocateAndInsertMetadata(
             ssd_provider = &*ssd_access;
         }
 
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, value_length, config.replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY,
-            ssd_provider);
+        auto allocate = [&]() -> tl::expected<std::vector<Replica>, ErrorCode> {
+            if (!callosum_copy_retention_) {
+                return allocation_strategy_->Allocate(
+                    allocator_manager, value_length, config.replica_num,
+                    preferred_segments, std::set<std::string>(),
+                    ReplicaType::MEMORY, ssd_provider);
+            }
+            // In the dedicated serving campaign, an export is a local write
+            // to the producer's owned arena. A full arena must not spill to
+            // the peer and turn the initial placement into an RDMA PUT.
+            if (config.replica_num != 1 || config.nof_replica_num != 0 ||
+                config.preferred_segment.empty()) {
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            auto local = allocation_strategy_->AllocateFrom(
+                allocator_manager, value_length, config.preferred_segment);
+            if (!local) return tl::unexpected(local.error());
+            std::vector<Replica> allocated;
+            allocated.emplace_back(std::move(*local));
+            return allocated;
+        };
+        auto allocation_result = allocate();
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
@@ -10576,14 +10594,29 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
         LOG(ERROR) << "task_id=" << task_id << ", error=task_not_found";
         return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
     }
-    return QueryTaskResponse(task_option.value());
+    const auto& task = *task_option;
+    if (callosum_copy_retention_ && task.type == TaskType::REPLICA_COPY &&
+        task.status == TaskStatus::SUCCESS &&
+        task.dequeue_steady != std::chrono::steady_clock::time_point{} &&
+        task.complete_steady >= task.dequeue_steady) {
+        using namespace std::chrono;
+        const auto observed = steady_clock::now();
+        LOG(INFO) << "component=callosum_store event=master_task_success_query"
+                  << " task=" << UuidToString(task_id)
+                  << " dequeue_to_complete_ns="
+                  << duration_cast<nanoseconds>(task.complete_steady - task.dequeue_steady).count()
+                  << " complete_to_success_query_ns="
+                  << duration_cast<nanoseconds>(observed - task.complete_steady).count();
+    }
+    return QueryTaskResponse(task);
 }
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     const UUID& client_id, size_t batch_size) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto& tasks =
-        task_manager_.get_write_access().pop_tasks(client_id, batch_size);
+        task_manager_.get_write_access().pop_tasks(client_id, batch_size,
+                                                    callosum_copy_retention_);
     std::vector<TaskAssignment> assignments;
     for (const auto& task : tasks) {
         assignments.emplace_back(task);

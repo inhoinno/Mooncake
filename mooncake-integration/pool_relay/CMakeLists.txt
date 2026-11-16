@@ -16,6 +16,11 @@ set_tests_properties(callosum_mux_pipeline PROPERTIES
   LABELS "relay;multiplexer;functional;t0" TIMEOUT 30)
 add_subdirectory(../../mooncake-store/tests/callosum_store_standalone
                  callosum-store-adapter)
+foreach(category preflight function failure status)
+  add_test(NAME callosum_serving_${category}
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_serving.py" -k ${category})
+  set_tests_properties(callosum_serving_${category} PROPERTIES LABELS "serving;${category};t0" TIMEOUT 30)
+endforeach()
 add_test(NAME callosum_benchmark_preparation
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_benchmark_prepare.py")
 set_tests_properties(callosum_benchmark_preparation PROPERTIES LABELS "relay;benchmark;preflight;t0" TIMEOUT 60)
@@ -39,6 +44,7 @@ foreach(test_method
     status_progress_during_fetch
     transport_baseline_exact_bytes_and_units
     transport_baseline_reservation_and_final_validation
+    synchronized_transport_group_waits_for_ready_and_drain
     receiver_rejects_cross_plan_alias
     scatter_tensor_projection_and_hybrid_readiness
     source_dispatch_fcfs_and_idempotent_completion

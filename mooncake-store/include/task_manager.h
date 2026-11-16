@@ -76,18 +76,26 @@ struct Task {
     std::string message;
     UUID assigned_client;
     uint32_t max_retry_attempts;
+    // Process-local only; restored tasks have no monotonic enqueue sample.
+    std::chrono::steady_clock::time_point enqueue_steady{};
+    std::chrono::steady_clock::time_point dequeue_steady{};
+    std::chrono::steady_clock::time_point complete_steady{};
 
     bool is_finished() const { return is_finished_status(status); }
 
     void mark_processing() {
         status = TaskStatus::PROCESSING;
         last_updated_at = std::chrono::system_clock::now();
+        if (type == TaskType::REPLICA_COPY)
+            dequeue_steady = std::chrono::steady_clock::now();
     }
 
     void mark_complete(TaskStatus final_status, const std::string& msg) {
         status = final_status;
         message = msg;
         last_updated_at = std::chrono::system_clock::now();
+        if (type == TaskType::REPLICA_COPY)
+            complete_steady = std::chrono::steady_clock::now();
     }
 };
 
@@ -171,7 +179,8 @@ class ScopedTaskWriteAccess {
         return submit_task(client_id, Type, json);
     }
 
-    std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
+    std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size,
+                                bool trace_copy_pickup = false);
 
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
                             TaskStatus status, const std::string& message);

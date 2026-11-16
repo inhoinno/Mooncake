@@ -2,12 +2,27 @@
 import time
 import random
 import hashlib
+import stat
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 TOTAL_BYTES = 8 * 1024**3
 ACCESS_PATTERNS=('overwrite','sequential','uniform_random')
+MIXED_DEVICE = '/dev/cxl_mixed'
+MIXED_WRITE = 'direct_cxl_mixed_write'
+
+
+def mixed_device_info(path):
+    """Inventory the driver's character device, without opening or mapping it."""
+    path = Path(path)
+    if str(path) != MIXED_DEVICE:
+        raise ValueError(f'mixed CXL requires {MIXED_DEVICE}')
+    info = path.lstat()
+    if not stat.S_ISCHR(info.st_mode):
+        raise ValueError(f'{path} must be a character device, not a symlink or file')
+    return info
 
 
 class AccessStrategy(ABC):
@@ -118,18 +133,132 @@ def write_loop(write, source, destination, block, total, limit, samples_out=None
                 sender_start_offset_ns=request_start-start, sender_end_offset_ns=request_end-start,
                 write_request_e2e_ns=request_end-request_start, native_calls=request_calls, status=status))
         logical_blocks += 1
+    return _write_result(samples,completed,logical_blocks,calls,block,limit,strategy,
+                         access_pattern,random_seed,start,wall_start)
+
+
+def _write_result(samples, completed, logical_blocks, calls, block, limit, strategy,
+                  access_pattern, random_seed, start, wall_start, elapsed=None, wall_end=None):
     return dict(bytes=completed, logical_blocks=logical_blocks, native_calls=calls,
-                sender_write_loop_ns=time.monotonic_ns()-start,
+                sender_write_loop_ns=time.monotonic_ns()-start if elapsed is None else elapsed,
                 block_bytes=block, max_request_bytes=limit, requests=samples,
                 access_pattern=access_pattern,window_bytes=strategy.window,offset_slots=strategy.slots,
                 addressable_window_bytes=strategy.slots*block,unused_window_tail_bytes=strategy.window%block,
                 degenerate_one_slot=strategy.slots==1,
                 random_seed=random_seed,address_selection_scope='included in loop; excluded from per-request timer',
                 sender_loop_start_monotonic_ns=start,
-                sender_start_unix_ns=wall_start,sender_end_unix_ns=time.time_ns(),
+                sender_start_unix_ns=wall_start,sender_end_unix_ns=time.time_ns() if wall_end is None else wall_end,
                 request_timing_version=1,
                 latency_scope='sender logical WRITE call start through drain; excludes control and checksum',
                 instrumentation='offset selection (including random RNG), two monotonic reads and in-memory samples; no loop file I/O')
+
+
+def diagnostic_write_loop(engine, segment, source, destination, block, total, limit, samples,
+                          *, access_pattern, window_bytes, random_seed, driver):
+    """Same scatter/drain primitive, with Python or C++ driving the block loop."""
+    if not 0 < block <= limit or not 0 < total <= TOTAL_BYTES or driver not in ('python','native'):
+        raise ValueError('invalid diagnostic WRITE budget/driver')
+    phases = []
+    def submit(src, dst, length):
+        phases.append(engine.relay_write_block_profiled(segment,src,dst,length))
+        return length
+    strategy = access_strategy(access_pattern,block,window_bytes,random_seed)
+    schedule_ns = 0
+    if driver == 'python':
+        result = write_loop(submit,source,destination,block,total,limit,samples,
+                            access_pattern=access_pattern,window_bytes=window_bytes,random_seed=random_seed)
+    else:
+        wall_start, start = time.time_ns(), time.monotonic_ns()
+        lengths = [min(block,total-i) for i in range(0,total,block)]
+        offsets = [strategy.offset(i) for i in range(len(lengths))]
+        src, dst = ([base + offset for offset in offsets] for base in (source,destination))
+        schedule_ns = time.monotonic_ns()-start
+        native_samples = engine.relay_write_blocks_diagnostic(segment,src,dst,lengths)
+        elapsed, wall_end = time.monotonic_ns()-start, time.time_ns()
+        if len(native_samples)!=len(lengths):
+            raise RuntimeError('native diagnostic request sample count mismatch')
+        for i,(offset,length,(begin,end,*phase)) in enumerate(zip(offsets,lengths,native_samples)):
+            phases.append(phase)
+            samples.append(dict(request_index=i,request_bytes=length,
+                source_offset_bytes=offset,destination_offset_bytes=offset,
+                sender_start_offset_ns=begin,sender_end_offset_ns=end,
+                write_request_e2e_ns=end-begin,native_calls=1,status='PASS'))
+        result = _write_result(samples,total,len(lengths),len(lengths),block,limit,strategy,
+                               access_pattern,random_seed,start,wall_start,elapsed,wall_end)
+        result['native_schedule_build_ns'] = schedule_ns
+    previous_end = 0
+    diagnostics = []
+    if len(phases)!=len(samples):
+        raise RuntimeError('diagnostic phase sample count mismatch')
+    for req,(check,submit_ns,wait) in zip(samples,phases):
+        begin, end = req['sender_start_offset_ns'],req['sender_end_offset_ns']
+        if not (previous_end <= begin < end <= result['sender_write_loop_ns']-schedule_ns and
+                min(check,submit_ns,wait)>=0 and check+submit_ns+wait<=end-begin):
+            raise RuntimeError('invalid diagnostic phase timing')
+        diagnostics.append(dict(request_index=req['request_index'],check_ns=check,
+            submit_ns=submit_ns,wait_ns=wait,between_calls_ns=begin-previous_end,
+            in_call_residual_ns=end-begin-check-submit_ns-wait))
+        previous_end = end
+    result.update(diagnostic_driver=driver, diagnostic_requests=diagnostics,
+                  diagnostic_request_clock=('native steady-clock offsets within binding'
+                                            if driver=='native' else 'sender monotonic offsets'),
+                  diagnostic_loop_tail_ns=result['sender_write_loop_ns']-previous_end-schedule_ns,
+                  instrumentation='diagnostic only: native phase clocks and in-memory samples')
+    return result
+
+
+def rdma_snapshot(engine, sysroot=Path('/sys')):
+    """Timestamp one sender observation; port counters include unrelated traffic."""
+    start = time.monotonic_ns()
+    contexts = engine.relay_rdma_snapshot()
+    for row in contexts:
+        root = sysroot/'class/infiniband'/row['device']/'ports'/str(row['port'])
+        try:
+            # Standard InfiniBand port counters are in units of four octets.
+            row['port_tx_counter_bytes'] = 4*int((root/'counters/port_xmit_data').read_text())
+        except (OSError,ValueError):
+            row['port_tx_counter_bytes'] = None
+    return dict(begin_ns=start,end_ns=time.monotonic_ns(),contexts=contexts)
+
+
+def rdma_trial_progress(before, after, payload_bytes):
+    """Keep outstanding time per context; it overlaps submit/wait and other rails."""
+    names = lambda snapshot: {(x['device'],x['port']):x for x in snapshot['contexts']}
+    first,last = names(before),names(after)
+    if not first or first.keys()!=last.keys():
+        return dict(status='CONTEXTS_CHANGED')
+    rows = []
+    for key,start in first.items():
+        end = last[key]
+        if not start['tracked'] or not end['tracked']:
+            return dict(status='TRACKING_DISABLED')
+        if start['pending_write_wrs'] or end['pending_write_wrs']:
+            return dict(status='OBSERVATION_BOUNDARY_NOT_IDLE')
+        old,new = start['qp_completed_bytes'],end['qp_completed_bytes']
+        if (end['completed_write_bytes']<start['completed_write_bytes'] or
+                end['write_outstanding_ns']<start['write_outstanding_ns'] or
+                any(new.get(q,-1)<n for q,n in old.items())):
+            return dict(status='COUNTERS_CHANGED')
+        qp = {q:n-old.get(q,0) for q,n in new.items() if n>old.get(q,0)}
+        rows.append(dict(device=key[0],port=key[1],active_write_qps=len(qp),qp_completed_bytes=qp,
+            rdma_completed_write_bytes=end['completed_write_bytes']-start['completed_write_bytes'],
+            tracked_outstanding_ns=end['write_outstanding_ns']-start['write_outstanding_ns'],
+            qp_counters_truncated=end['qp_counters_truncated']))
+    full = (sum(x['rdma_completed_write_bytes'] for x in rows)==payload_bytes and
+            all(not x['qp_counters_truncated'] and
+                sum(x['qp_completed_bytes'].values())==x['rdma_completed_write_bytes'] for x in rows))
+    return dict(status='ACCOUNTED' if full else 'INCOMPLETE',contexts=rows)
+
+
+def sample_rdma(engine, stop, samples):
+    # Bound observer storage and do not print or write files in the loop.
+    while not stop.is_set() and len(samples)<4096:
+        try:
+            samples.append(rdma_snapshot(engine))
+        except Exception as error:
+            samples.append(dict(error=str(error)))
+            return
+        stop.wait(0.005)
 def dax_numa_evidence(path, hca, sysroot=Path('/sys'), *, require_remote=True):
     """Check device backing locality, not the caller's CPU binding."""
     dax = Path(path).name

@@ -39,6 +39,11 @@ constexpr size_t kLedgerLimit = 4096;
 constexpr size_t kChunk = 1024 * 1024;
 constexpr size_t kBatch = 32;
 
+int64_t elapsedNs(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
 void Require(bool valid, const char* message) {
     if (!valid) throw std::runtime_error(message);
 }
@@ -374,15 +379,18 @@ class CallosumStoreBridge::Impl {
                 // The authenticated sender sends verify only after all native
                 // WRITE batches drain. Read every byte before publication.
                 std::atomic_thread_fence(std::memory_order_seq_cst);
+                const auto checksum_start = std::chrono::steady_clock::now();
                 reply.ok =
                     ComputeCrcChecksum(reinterpret_cast<void*>(message.address),
                                        message.length) == message.checksum;
+                const auto checksum_ns = elapsedNs(checksum_start);
                 journal.Mark(message.id + "-rx", "VALIDATED");
                 it->second.phase = "validated";
                 LOG(INFO) << "component=callosum_store event=receiver_validated"
                           << " attempt=" << message.id
                           << " bytes=" << message.length
-                          << " content_ok=" << reply.ok << " epoch=" << epoch;
+                          << " content_ok=" << reply.ok << " epoch=" << epoch
+                          << " receiver_checksum_ns=" << checksum_ns;
             }
         }
         Send(peer, std::move(reply));
@@ -526,10 +534,14 @@ class CallosumStoreBridge::Impl {
         message.length = dst.size_;
         message.source_generation = source.id;
         message.target_generation = destinations[0].id;
+        const auto checksum_start = std::chrono::steady_clock::now();
         message.checksum = ComputeCrcChecksum(
             reinterpret_cast<void*>(src.buffer_address_), src.size_);
+        const auto checksum_ns = elapsedNs(checksum_start);
         try {
+            const auto prepare_start = std::chrono::steady_clock::now();
             const auto prepared = Exchange(dst.transport_endpoint_, message);
+            const auto prepare_ns = elapsedNs(prepare_start);
             message.epoch = prepared.epoch;
             message.pool_offset = prepared.pool_offset;
             LOG(INFO) << "component=callosum_store event=receiver_authorized"
@@ -545,7 +557,9 @@ class CallosumStoreBridge::Impl {
                       << " receiver_epoch=" << prepared.epoch
                       << " source_generation=" << message.source_generation
                       << " target_generation=" << message.target_generation
-                      << " bytes=" << src.size_ << " key_crc="
+                      << " bytes=" << src.size_
+                      << " source_checksum_ns=" << checksum_ns
+                      << " authorize_round_trip_ns=" << prepare_ns << " key_crc="
                       << ComputeCrcChecksum(key.data(), key.size());
             journal.Mark(message.id + "-tx", "PENDING");
             pool_relay::Plan plan;
@@ -591,12 +605,15 @@ class CallosumStoreBridge::Impl {
             }
             journal.Mark(message.id + "-tx", "DRAINED");
             message.phase = "verify";
+            const auto verify_start = std::chrono::steady_clock::now();
             Exchange(dst.transport_endpoint_, message);
+            const auto verify_ns = elapsedNs(verify_start);
             result.success = true;
             LOG(INFO) << "component=callosum_store event=copy_verified"
                       << " attempt=" << message.id << " key_crc="
                       << ComputeCrcChecksum(key.data(), key.size())
-                      << " bytes=" << src.size_;
+                      << " bytes=" << src.size_
+                      << " verify_round_trip_ns=" << verify_ns;
         } catch (...) {
             if (result.safe_to_revoke) {
                 journal.Mark(message.id + "-tx", "DRAINED");
@@ -664,6 +681,9 @@ class CallosumStoreBridge::Impl {
         // One worker/rank owns this narrow synchronous load seam. Serializing
         // materialization also joins repeated keys without a second directory.
         const auto began = std::chrono::steady_clock::now();
+        int64_t lookup_ns = 0, create_ns = 0, wait_ns = 0, status_rpc_ns = 0,
+                requery_ns = 0;
+        size_t polls = 0;
         const auto ready = [&](const char* phase) {
             const auto elapsed =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -673,29 +693,46 @@ class CallosumStoreBridge::Impl {
                       << phase << " key_crc="
                       << ComputeCrcChecksum(key.data(), key.size())
                       << " request_to_usable_replica_ns=" << elapsed
+                      << " initial_lookup_ns=" << lookup_ns
+                      << " create_copy_task_rpc_ns=" << create_ns
+                      << " wait_for_task_success_ns=" << wait_ns
+                      << " query_task_rpc_total_ns=" << status_rpc_ns
+                      << " query_task_calls=" << polls
+                      << " final_requery_ns=" << requery_ns
                       << " clock=requester_steady";
             return true;
         };
         std::lock_guard load_lock(load_mutex);
+        const auto lookup_start = std::chrono::steady_clock::now();
         auto query = client.Query(key);
+        lookup_ns = elapsedNs(lookup_start);
         if (!query) return false;
         for (const auto& replica : query->replicas)
             if (Owns(replica)) return ready("local");
         LOG(INFO) << "component=callosum_store event=initial_local_miss"
                   << " pool=" << config.pool_id
                   << " key_crc=" << ComputeCrcChecksum(key.data(), key.size());
+        const auto create_start = std::chrono::steady_clock::now();
         auto task = client.CreateCopyTask(key, {client.GetSegmentName()});
+        create_ns = elapsedNs(create_start);
         if (!task) return false;
         LOG(INFO) << "component=callosum_store event=remote_materialization"
                   << " task=" << UuidToString(*task)
                   << " key_crc=" << ComputeCrcChecksum(key.data(), key.size());
-        const auto deadline = std::chrono::steady_clock::now() +
+        const auto wait_start = std::chrono::steady_clock::now();
+        const auto deadline = wait_start +
                               std::chrono::milliseconds(config.wait_ms);
         while (std::chrono::steady_clock::now() < deadline) {
+            const auto poll_start = std::chrono::steady_clock::now();
             auto status = client.QueryTask(*task);
+            status_rpc_ns += elapsedNs(poll_start);
+            ++polls;
             if (!status || status->status == TaskStatus::FAILED) return false;
             if (status->status == TaskStatus::SUCCESS) {
+                wait_ns = elapsedNs(wait_start);
+                const auto requery_start = std::chrono::steady_clock::now();
                 auto local = client.Query(key);
+                requery_ns = elapsedNs(requery_start);
                 if (local)
                     for (const auto& replica : local->replicas)
                         if (Owns(replica)) return ready("remote");

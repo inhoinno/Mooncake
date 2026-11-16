@@ -19,6 +19,7 @@ import time
 import resource
 import subprocess
 import secrets
+import shutil
 import uuid
 
 EXTENT_CONFIRMATION_REQUIRED = 'operator_confirmation_required_at_run'
@@ -318,21 +319,31 @@ def prepare_resources(bridge, block_bytes, output, authorize=False, sysroot=Path
             subprocess.run(['sudo', '-v'], check=True)
             authenticated = True
     try:
-        info, size, alignment = dax_geometry(device, sysroot)
-        require(bridge['mapping_offset'] + bridge['capacity'] <= size and
-                bridge['mapping_offset'] % alignment == 0 and bridge['capacity'] % alignment == 0,
-                'approved mapping exceeds device geometry or alignment')
-        record.update(device_size=size, device_alignment=alignment, device_number=info.st_rdev)
+        if bridge.get('backend_kind') == 'cxl_mixed':
+            from callosum_transport_benchmark import mixed_device_info
+            info = mixed_device_info(device)
+            record.update(backing='cxl_mixed', device_number=info.st_rdev,
+                          approved_offset_bytes=bridge['mapping_offset'],
+                          approved_mapping_bytes=bridge['capacity'],
+                          geometry_status='OPERATOR_APPROVED_MMAP_RANGE')
+        else:
+            info, size, alignment = dax_geometry(device, sysroot)
+            require(bridge['mapping_offset'] + bridge['capacity'] <= size and
+                    bridge['mapping_offset'] % alignment == 0 and bridge['capacity'] % alignment == 0,
+                    'approved mapping exceeds device geometry or alignment')
+            record.update(device_size=size, device_alignment=alignment, device_number=info.st_rdev)
         try:
             fd = os.open(device, os.O_RDWR | os.O_NOFOLLOW)
             os.close(fd)
         except PermissionError:
             sudo()
+            require(all(shutil.which(t) for t in ('getfacl','setfacl')),
+                    'Device access denied and ACL tools are missing; install the acl package and retry')
             before = command(['getfacl', '-c', '-p', '-n', '--', str(device)])
             change = dax_acl_change(before, os.geteuid(), info.st_uid)
             current = device.lstat()
             require((current.st_rdev, current.st_ino, current.st_mode) ==
-                    (info.st_rdev, info.st_ino, info.st_mode), 'DAX identity changed before ACL grant')
+                    (info.st_rdev, info.st_ino, info.st_mode), 'Mapping device identity changed before ACL grant')
             record['changes'].append(dict(operation='dax_acl', requested=change,
                 scope='DEVICE_WIDE numeric-UID grant; not extent isolation', before=before))
             command(['sudo', '-n', 'setfacl', '--no-mask', '-m', change, '--', str(device)])

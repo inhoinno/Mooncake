@@ -2803,6 +2803,10 @@ TEST_F(MasterServiceTest, CallosumLookupAuthorizePublishRequery) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.preferred_segment = src_segment.name;
+    auto unavailable = config;
+    unavailable.preferred_segment = "missing-local-arena";
+    ASSERT_FALSE(service.PutStart(sender, "no-peer-spill", TenantId::Default(),
+                                  bytes, unavailable).has_value());
     ASSERT_TRUE(service.PutStart(sender, key, TenantId::Default(), bytes, config).has_value());
     ASSERT_TRUE(service.PutEnd(sender, key, TenantId::Default(), ReplicaType::MEMORY).has_value());
     auto initial = service.GetReplicaList(key, TenantId::Default());
@@ -2812,6 +2816,14 @@ TEST_F(MasterServiceTest, CallosumLookupAuthorizePublishRequery) {
 
     const auto before_pin=ReplicaReferencesForTest(service,key,initial->replicas[0].id);
     ASSERT_TRUE(before_pin.has_value());
+
+    const auto task = service.CreateCopyTask(key, TenantId::Default(),
+                                             {dst_segment.name});
+    ASSERT_TRUE(task.has_value());
+    const auto assigned = service.FetchTasks(sender, 1);
+    ASSERT_TRUE(assigned.has_value());
+    ASSERT_EQ(assigned->size(), 1);
+    EXPECT_EQ(assigned->front().id, *task);
 
     auto copy = service.CopyStart(sender, key, TenantId::Default(), src_segment.name, {dst_segment.name});
     ASSERT_TRUE(copy.has_value());
@@ -2839,6 +2851,13 @@ TEST_F(MasterServiceTest, CallosumLookupAuthorizePublishRequery) {
     ASSERT_TRUE(pending.has_value());
     EXPECT_EQ(pending->replicas.size(), 1);
     ASSERT_TRUE(service.CopyEnd(sender, key, TenantId::Default()).has_value());
+    TaskCompleteRequest completion;
+    completion.id = *task;
+    completion.status = TaskStatus::SUCCESS;
+    ASSERT_TRUE(service.MarkTaskToComplete(sender, completion).has_value());
+    const auto observed = service.QueryTask(*task);
+    ASSERT_TRUE(observed.has_value());
+    EXPECT_EQ(observed->status, TaskStatus::SUCCESS);
     EXPECT_EQ(ReplicaReferencesForTest(service,key,copy->source.id), before_pin);
     auto published = service.GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(published.has_value());

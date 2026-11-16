@@ -22,11 +22,14 @@ import stat
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from callosum_dispatch import SourceDispatcher, partition_source
 from callosum_initiation import CacheMiss
 from callosum_transport_benchmark import block_bytes, write_loop, TOTAL_BYTES, access_strategy, written_ranges, ACCESS_PATTERNS
+from callosum_transport_benchmark import MIXED_WRITE, mixed_device_info, diagnostic_write_loop, rdma_snapshot, sample_rdma
+from callosum_transport_benchmark import rdma_trial_progress
 
 RUNTIME_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 IMPLEMENTATION_SHA256 = hashlib.sha256(b''.join(
@@ -106,14 +109,16 @@ def config(path):
     require(page_mode in ('native', 'huge2MB'), 'mr_page_mode must be native or huge2MB')
     require(page_mode == 'native' or c['mode'] == 'rdma',
             'huge2MB requires real devdax/RDMA, not file or anonymous DRAM')
-    expected_path = 'direct_dax_write' if c['mode'] == 'rdma' else 'file_copy'
-    require(c.get('path_mode', expected_path) == expected_path,
+    mixed = c.get('path_mode') == MIXED_WRITE
+    expected_path = MIXED_WRITE if mixed else ('direct_dax_write' if c['mode'] == 'rdma' else 'file_copy')
+    require(c.get('path_mode', expected_path) == expected_path and (not mixed or c['mode'] == 'rdma'),
             'unsupported path_mode; staged WRITE is not implemented; no fallback')
     require(c.get('evidence_class', 'TRANSFER_ONLY') == 'TRANSFER_ONLY',
             'this runtime cannot serve as Store or GlobalMaster authority')
     colocated = c.get('experiment_layout') == 'colocated_pairs'
+    require(not mixed or colocated, 'Mixed CXL requires the colocated benchmark layout')
     require(c.get('experiment_layout') in (None, 'colocated_pairs'), 'unknown experiment layout')
-    require((len(c['nodes']) == 4 and len(c['pools']) in (3,4) and c['mode'] == 'rdma')
+    require((len(c['nodes']) == 4 and len(c['pools']) in ((2,) if mixed else (3,4)) and c['mode'] == 'rdma')
             if colocated else (len(c['nodes']) in (2, 4) and len(c['pools']) == 2),
             'require two/four workers in two pools, or four colocated endpoints in three/four RDMA pools')
     require(len({n['id'] for n in c['nodes']}) == len(c['nodes']), 'duplicate node')
@@ -146,7 +151,7 @@ def config(path):
                 'capabilities must be booleans')
     if c['mode'] == 'rdma':
         require(c.get('abi_version') == 2, 'RDMA manifest requires abi_version=2')
-        require(c.get('path_mode') == 'direct_dax_write', 'select direct_dax_write explicitly')
+        require(c.get('path_mode') in ('direct_dax_write', MIXED_WRITE), 'select the RDMA path explicitly')
         require(isinstance(c.get('metadata'), str) and c['metadata'], 'missing TE metadata endpoint')
         identities = []
         for p in c['pools'].values():
@@ -231,19 +236,33 @@ class Mapping:
         require(os.environ.get('CALLOSUM_DESTRUCTIVE_ACK') == '1',
                 'set CALLOSUM_DESTRUCTIVE_ACK=1 for dedicated-arena access')
         self.capacity = p['capacity']
-        self.fd = os.open(node['path'], os.O_RDWR)
+        mixed = c.get('path_mode') == MIXED_WRITE
+        approved = mixed_device_info(node['path']) if mixed else None
+        self.fd = os.open(node['path'], os.O_RDWR | (os.O_NOFOLLOW if mixed else 0))
         try:
             info = os.fstat(self.fd)
             offset = p.get('map_offset', 0)
             if c['mode'] == 'rdma':
-                require(stat.S_ISCHR(info.st_mode), 'RDMA mode requires explicit devdax character device')
+                require(stat.S_ISCHR(info.st_mode), 'RDMA mode requires a mapping character device')
             else:
                 require(stat.S_ISREG(info.st_mode) and info.st_size >= offset + self.capacity,
                         'test pool file too small')
+            if mixed:
+                require((info.st_ino, info.st_rdev) == (approved.st_ino, approved.st_rdev),
+                        'Mixed CXL character device changed before open')
+                require(offset % mmap.PAGESIZE == 0 and self.capacity % mmap.PAGESIZE == 0,
+                        'Mixed CXL mapping must align to the host base page size')
+            # TraCT extension point: adapt mapping here once the API is supplied.
             self.memory = mmap.mmap(self.fd, self.capacity, flags=mmap.MAP_SHARED,
                                     prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=offset)
             self.address = ctypes.addressof(ctypes.c_char.from_buffer(self.memory))
-            self.page_evidence = (mapping_page_evidence(self.address,self.capacity,node['path'],
+            if mixed:
+                self.page_evidence = dict(mode='native', backing='cxl_mixed', hugetlb=False,
+                    device=node['path'], device_number=info.st_rdev, map_offset_bytes=offset,
+                    mapping_bytes=self.capacity, kernel_page_size_bytes=None,
+                    rnic_page_size_status='UNVERIFIED_DRIVER_SELECTED')
+            else:
+                self.page_evidence = (mapping_page_evidence(self.address,self.capacity,node['path'],
                                   c.get('mr_page_mode','native')) if c['mode']=='rdma' else
                                   dict(mode='native',backing='file',hugetlb=False))
         except BaseException:
@@ -318,13 +337,16 @@ class Agent:
     def __init__(self, c, node_id, log):
         self.c, self.log = c, log
         self.dax_numa = None
+        self.sender_clock = None
         self.node = next(n for n in c['nodes'] if n['id'] == node_id)
         if c.get('experiment_layout') == 'colocated_pairs' and self.node['can_send']:
-            from callosum_transport_benchmark import dax_numa_evidence
-            self.dax_numa = dax_numa_evidence(self.node['path'], self.node['rdma_device'],
-                                             require_remote=c.get('require_remote_dax_numa',True))
-            self.dax_numa.update(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-                                 time_namespace=os.readlink('/proc/self/ns/time'))
+            self.sender_clock = dict(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                                     time_namespace=os.readlink('/proc/self/ns/time'))
+            if c.get('path_mode') != MIXED_WRITE:
+                from callosum_transport_benchmark import dax_numa_evidence
+                self.dax_numa = dax_numa_evidence(self.node['path'], self.node['rdma_device'],
+                                                 require_remote=c.get('require_remote_dax_numa',True))
+                self.dax_numa.update(self.sender_clock)
         self.mapping = Mapping(c, self.node)
         self.epoch = secrets.token_hex(16)
         self.lock = threading.Lock()
@@ -343,7 +365,7 @@ class Agent:
                         'rdma', self.node['rdma_device']) == 0, 'Transfer Engine init failed')
             require(self.engine.relay_rdma_available(), 'legacy RDMA unavailable; TCP fallback refused')
             require(self.engine.register_memory(self.mapping.address, self.mapping.capacity) == 0,
-                    'DAX RDMA registration failed; no DRAM/TCP fallback is allowed')
+                    'Device mapping RDMA registration failed; no DRAM/TCP fallback is allowed')
         self.segment = self.node.get('te_endpoint', self.node['id'])
         if c.get('metadata') == 'P2PHANDSHAKE' and self.engine:
             self.segment = self.segment.rsplit(':', 1)[0] + ':' + str(self.engine.get_rpc_port())
@@ -358,10 +380,15 @@ class Agent:
                     runtime_sha256=RUNTIME_SHA256,
                     implementation_sha256=IMPLEMENTATION_SHA256,
                     transport_request_timing_version=1,
+                    transport_diagnostic_version=int(hasattr(self.engine,'relay_write_blocks_diagnostic') and
+                                                     hasattr(self.engine,'relay_write_block_profiled') and
+                                                     hasattr(self.engine,'relay_rdma_snapshot')),
+                    transport_diagnostic_tracking=os.environ.get('MC_TRACK_RDMA_POSTED_SLICES','0').lower() in ('1','true'),
                     transport_access_patterns=list(ACCESS_PATTERNS),
                     transport_env={k:os.environ.get(k) for k in ('MC_MTU','MC_GID_INDEX')},
                     mr_pages=self.mapping.page_evidence,
                     configured_qps=os.environ.get('MC_NUM_QP_PER_EP', 'default'),
+                    **({'sender_clock': self.sender_clock} if self.sender_clock is not None else {}),
                     **({'dax_numa': self.dax_numa} if self.dax_numa is not None else {}))
 
     def handle(self, method, d):
@@ -392,7 +419,13 @@ class Agent:
                           senders=[g['sender'] for g in planned['senders']],
                           chunks=sum(len(g['writes']) for g in planned['senders']))
             return self.dispatcher.execute(planned)
+        if method == 'transport_diagnostic_inventory':
+            return dict(node=self.node['id'], pid=os.getpid(),
+                        cpu_affinity=sorted(os.sched_getaffinity(0)),
+                        mapped_device=self.node['path'], mr=self.mapping.page_evidence,
+                        contexts=self.engine.relay_rdma_snapshot())
         if method == 'transport_write_loop':
+            started = time.monotonic_ns()
             require(self.engine is not None and self.node['can_send'],
                     'transport baseline requires real RDMA engine')
             require(os.environ.get('MC_NUM_QP_PER_EP') == '16', 'baseline requires 16 configured QPs')
@@ -413,16 +446,59 @@ class Agent:
             with self.lock:
                 require(d['transfer_id'] not in self.jobs, 'benchmark replay refused')
                 self.jobs[d['transfer_id']] = 'RUNNING'
+            samples, queue = [], []
+            driver = d.get('diagnostic_driver')
             try:
-                samples = []
-                result = write_loop(lambda src,dst,n: self.engine.relay_write_batch_drained(
-                    [target['segment']], [src], [dst], [n])[0],
-                    self.mapping.address + extent['offset'], target['remote_base'],
-                    d['block_bytes'], TOTAL_BYTES, self.c.get('max_inflight_bytes',64*1024**2),samples,
-                    access_pattern=pattern,window_bytes=window,random_seed=d.get('random_seed',0))
+                source, destination = self.mapping.address + extent['offset'], target['remote_base']
+                limit = self.c.get('max_inflight_bytes',64*1024**2)
+                options = dict(access_pattern=pattern,window_bytes=window,random_seed=d.get('random_seed',0))
+                if driver:
+                    before = rdma_snapshot(self.engine)
+                    require(not d.get('sample_queues') or
+                            (before['contexts'] and all(x['tracked'] for x in before['contexts'])),
+                            'native queue diagnostics require MC_TRACK_RDMA_POSTED_SLICES=1 at sender startup')
+                    stop = threading.Event()
+                    monitor = threading.Thread(target=sample_rdma,args=(self.engine,stop,queue)) if d.get('sample_queues') else None
+                else:
+                    monitor = None
+                ready = time.monotonic_ns()
+                group = d.get('trial_group')
+                def rendezvous(phase):
+                    if group:
+                        rpc(self.c['master'],'transport_trial_phase',
+                            dict(group=group,node=self.node['id'],attempt=d['transfer_id'],phase=phase),
+                            timeout=120 if phase=='ready' else 900)
+                rendezvous('ready')
+                if driver:
+                    if monitor:
+                        monitor.start()
+                    try:
+                        result = diagnostic_write_loop(self.engine,target['segment'],source,destination,
+                            d['block_bytes'],TOTAL_BYTES,limit,samples,driver=driver,**options)
+                    finally:
+                        stop.set()
+                        if monitor:
+                            monitor.join()
+                    after = rdma_snapshot(self.engine)
+                    result.update(sender_prepare_ns=ready-started,sender_pid=os.getpid(),
+                        sender_thread_id=threading.get_native_id(),sender_rnic_before=before,
+                        sender_cpu_affinity=sorted(os.sched_getaffinity(0)),
+                        sender_rnic_after=after,sender_queue_samples=queue,
+                        queue_sample_cap_reached=len(queue)==4096)
+                    if d.get('sample_queues'):
+                        result['native_queue_progress']=rdma_trial_progress(before,after,result['bytes'])
+                else:
+                    result = write_loop(lambda src,dst,n: self.engine.relay_write_batch_drained(
+                        [target['segment']], [src], [dst], [n])[0],source,destination,
+                        d['block_bytes'],TOTAL_BYTES,limit,samples,**options)
+                # Hold artifact writes and checksum RPCs until every sender
+                # has positively drained, not merely the sender for this pair.
+                rendezvous('drained')
+                if group:
+                    result['trial_group'] = group
                 from callosum_benchmark_report import write_request_csv
                 observed = dict(result,status='PENDING_VALIDATION',transfer_id=d['transfer_id'],
-                                path_mode='direct_dax_write')
+                                path_mode=self.c.get('path_mode','direct_dax_write'))
                 artifact = Path(self.log.file.name).parent / ('transport-observed-'+d['transfer_id']+'.json')
                 with artifact.open('x') as stream:
                     json.dump(observed,stream)
@@ -430,7 +506,8 @@ class Agent:
                 self.jobs[d['transfer_id']] = 'DRAINED'
                 self.log.emit('transport_baseline_complete', transfer_id=d['transfer_id'],
                               opcode='WRITE', actual_transport='rdma',
-                              **{k:v for k,v in result.items() if k != 'requests'})
+                              **{k:v for k,v in result.items() if k not in
+                                 ('requests','diagnostic_requests','sender_queue_samples')})
                 return result
             except BaseException:
                 self.jobs[d['transfer_id']] = 'QUARANTINED'
@@ -438,7 +515,9 @@ class Agent:
                     artifact = Path(self.log.file.name).parent / ('transport-failed-'+d['transfer_id']+'.json')
                     with artifact.open('x') as stream:
                         partial=dict(status='FAIL',transfer_id=d['transfer_id'],requests=samples,
-                                     path_mode='direct_dax_write',block_bytes=d['block_bytes'])
+                                     path_mode=self.c.get('path_mode','direct_dax_write'),block_bytes=d['block_bytes'])
+                        if driver:
+                            partial.update(diagnostic_driver=driver,sender_queue_samples=queue)
                         json.dump(partial,stream)
                     from callosum_benchmark_report import write_request_csv
                     write_request_csv(artifact.with_suffix('.csv'),partial)
@@ -609,7 +688,7 @@ class Agent:
                 self.log.emit('batch_complete', transfer_id=transfer, sender=self.node['id'],
                     batch_id=batch_id, cardinality=len(batch), bytes=sum(counts), opcode='WRITE',
                     duration_ns=time.monotonic_ns()-start, mode=self.c['mode'],
-                    path_mode='direct_dax_write' if self.engine else 'file_copy',
+                    path_mode=self.c.get('path_mode','direct_dax_write') if self.engine else 'file_copy',
                     actual_transport='rdma' if self.engine else 'file-copy')
                 for (w,t,peer), count in zip(batch, counts):
                     completions.append(dict(chunk=w['chunk'], bytes=count,
@@ -625,6 +704,45 @@ class Agent:
             raise
 
 
+class TransportTrialGroup:
+    """Ephemeral rendezvous. A failed gate says nothing about DMA drain."""
+
+    def __init__(self, sources):
+        self.identity = secrets.token_hex(16)
+        self.attempts = dict.fromkeys(sources)
+        self.lock = threading.Lock()
+        self.arrived = {phase:set() for phase in ('ready','drained')}
+        self.all_drained = threading.Event()
+        self.gates = dict(ready=threading.Barrier(len(sources),timeout=90),
+                          drained=threading.Barrier(len(sources),action=self.all_drained.set,timeout=860))
+
+    def bind(self, source, attempt):
+        with self.lock:
+            require(source in self.attempts and self.attempts[source] is None,
+                    'duplicate or unknown transfer trial source')
+            self.attempts[source] = attempt
+
+    def arrive(self, d):
+        node, phase = d['node'],d['phase']
+        with self.lock:
+            require(node in self.attempts and self.attempts[node] is not None and
+                    d['attempt']==self.attempts[node] and phase in self.gates,
+                    'stale transfer trial participant or phase')
+            require(node not in self.arrived[phase] and (phase=='ready' or
+                    len(self.arrived['ready'])==len(self.attempts)),
+                    'duplicate or out-of-order transfer trial phase')
+            self.arrived[phase].add(node)
+        try:
+            self.gates[phase].wait()
+        except threading.BrokenBarrierError as error:
+            raise RuntimeError(f'transfer trial group {phase} aborted; no drain inferred') from error
+        return dict(group=self.identity,phase=phase)
+
+    def abort(self):
+        for gate in self.gates.values():
+            gate.abort()
+
+
 class Master:
     def __init__(self, c, database, log):
         self.c, self.log = c, log
@@ -632,6 +750,7 @@ class Master:
         self.fetch_locks = {}
         self.seed_locks = {}
         self.benchmark_windows = {}  # Dedicated scratch only; never published as objects.
+        self.transport_trial_group = None
         self.preflight_lock = threading.Lock()
         self.db = sqlite3.connect(database, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
@@ -702,6 +821,13 @@ class Master:
                 require(not self.startup_aborted, 'startup admission is closed; retain this journal')
         if method == 'transport_benchmark':
             return self.transport_benchmark(d)
+        if method == 'transport_benchmark_group':
+            return self.transport_benchmark_group(d['pairs'])
+        if method == 'transport_trial_phase':
+            with self.lock:
+                group = self.transport_trial_group
+                require(group and group.identity==d['group'],'unknown transfer trial group')
+            return group.arrive(d)
         if method == 'fetch':
             require(self.c.get('experiment_layout') != 'colocated_pairs',
                     'colocated direct profile supports paired transport sweeps only')
@@ -738,10 +864,17 @@ class Master:
                     registered_nodes=[row[0] for row in self.db.execute('SELECT id FROM members ORDER BY id')],
                     benchmark_request_timing_versions={i:json.loads(v).get('transport_request_timing_version',0)
                         for i,v in self.db.execute('SELECT id,descriptor FROM members')},
+                    synchronized_transport_version=1,
+                    benchmark_diagnostic_versions={i:json.loads(v).get('transport_diagnostic_version',0)
+                        for i,v in self.db.execute('SELECT id,descriptor FROM members')},
+                    benchmark_diagnostic_tracking={i:json.loads(v).get('transport_diagnostic_tracking',False)
+                        for i,v in self.db.execute('SELECT id,descriptor FROM members')},
                     mr_pages={i:json.loads(v).get('mr_pages')
                         for i,v in self.db.execute('SELECT id,descriptor FROM members')},
                     dax_numa={i:json.loads(v)['dax_numa'] for i,v in
                         self.db.execute('SELECT id,descriptor FROM members') if 'dax_numa' in json.loads(v)},
+                    sender_clocks={i:json.loads(v)['sender_clock'] for i,v in
+                        self.db.execute('SELECT id,descriptor FROM members') if 'sender_clock' in json.loads(v)},
                     remaining_capacity_bytes={p:self.c['pools'][p]['capacity']-n
                         for p,n in self.db.execute('SELECT id,next FROM pools')},
                     topology_verified=self.topology_ok,
@@ -796,7 +929,56 @@ class Master:
         return dict(record, initial_allocation_ns=allocation_ns,
                     initial_publication_ns=time.monotonic_ns()-publication_start)
 
-    def transport_benchmark(self, d):
+    def transport_benchmark_group(self, pairs):
+        require(self.c.get('experiment_layout')=='colocated_pairs' and
+                self.c['mode']=='rdma' and isinstance(pairs,list) and 1<=len(pairs)<=2 and
+                all(isinstance(p,dict) for p in pairs), 'invalid synchronized transport trial')
+        sources, receivers = ([p[k] for p in pairs] for k in ('node','receiver'))
+        nodes = {n['id']:n for n in self.c['nodes']}
+        require(all(isinstance(n,str) for n in sources+receivers) and
+                len(set(sources+receivers))==2*len(pairs) and
+                all(n in nodes and nodes[n]['can_send'] for n in sources) and
+                all(n in nodes and nodes[n]['can_receive'] for n in receivers), 'invalid trial participants')
+        match = ('block_size','block_unit','window_bytes','access_pattern','random_seed',
+                 'diagnostic_driver','sample_queues')
+        require(all(tuple(p.get(k) for k in match)==tuple(pairs[0].get(k) for k in match)
+                    for p in pairs), 'paired trial settings differ')
+        members = {n['id']:n for n in self.members()}
+        clocks = [members[n].get('sender_clock',{}) for n in sources]
+        require(all(clock.get('boot_id') and clock.get('time_namespace') and clock==clocks[0]
+                    for clock in clocks), 'synchronized trial needs one sender monotonic clock')
+        group = TransportTrialGroup(sources)
+        with self.lock:
+            require(self.transport_trial_group is None,'another synchronized trial is active')
+            self.transport_trial_group = group
+        first_failure = []
+        def trial(p):
+            try:
+                return self.transport_benchmark(p,group)
+            except Exception as error:
+                with group.lock:
+                    if not first_failure:
+                        first_failure.append((p['node'],error))
+                group.abort()
+                raise
+        try:
+            with ThreadPoolExecutor(max_workers=len(pairs)) as pool:
+                return list(pool.map(trial,pairs))
+        except Exception:
+            if first_failure:
+                node,error = first_failure[0]
+                raise RuntimeError(f'synchronized transfer failed on {node}: {error}') from error
+            raise
+        finally:
+            group.abort()
+            with self.lock:
+                self.transport_trial_group = None
+
+    def transport_benchmark(self, d, group=None):
+        started = time.monotonic_ns()
+        driver = d.get('diagnostic_driver')
+        require(driver in (None,'python','native') and
+                (not d.get('sample_queues') or driver), 'invalid transport diagnostic options')
         block = block_bytes(d['block_size'], d['block_unit'])
         pattern=d.get('access_pattern','overwrite')
         window=block if d.get('window_bytes') is None else d['window_bytes']
@@ -804,6 +986,9 @@ class Master:
         access_strategy(pattern,block,window,d.get('random_seed',0))
         scratch=None
         members=self.members()
+        if driver:
+            require(all(m.get('transport_diagnostic_version')==1 for m in members),
+                    'diagnostic requires the rebuilt native binding on every endpoint')
         require(all(m.get('configured_qps')=='16' for m in members),
                 'all endpoints must start with MC_NUM_QP_PER_EP=16')
         if fixed_window:
@@ -839,13 +1024,23 @@ class Master:
             self.operation(identity, 'RESERVED', dict(source=source,destination=destination,
                                                      benchmark=True))
         try:
+            if group:
+                group.bind(source_node['id'],identity)
+            prepare_start = time.monotonic_ns()
             target = rpc(receiver['url'], 'prepare', dict(transfer_id=plan_id, extent=destination,
                          clear_for_benchmark=fixed_window,benchmark_trial_id=identity))
+            send_start = time.monotonic_ns()
             result = rpc(source_node['url'], 'transport_write_loop', dict(
                 transfer_id=identity,target_plan_id=plan_id,source=source,target=target,block_bytes=block,
-                access_pattern=pattern,window_bytes=window,random_seed=d.get('random_seed',0)), timeout=900)
+                access_pattern=pattern,window_bytes=window,random_seed=d.get('random_seed',0),
+                diagnostic_driver=driver,sample_queues=d.get('sample_queues',False),
+                **({'trial_group':group.identity} if group else {})), timeout=1000 if group else 900)
+            verify_start = time.monotonic_ns()
             require(result['bytes'] == TOTAL_BYTES and result['block_bytes'] == block,
                     'baseline byte accounting mismatch')
+            if group:
+                require(result.get('trial_group')==group.identity and group.all_drained.is_set(),
+                        'sender has no synchronized drain evidence')
             if fixed_window:
                 require(result.get('access_pattern')==pattern and result.get('window_bytes')==window and
                         result.get('random_seed')==d.get('random_seed',0),
@@ -857,15 +1052,25 @@ class Master:
                 expected=rpc(source_node['url'],'digest',source_range,timeout=300)
                 require(rpc(receiver['url'],'digest',destination_range,timeout=300)==expected,
                         'baseline destination checksum mismatch')
+            verified = time.monotonic_ns()
+            receiver_inventory = (rpc(receiver['url'],'transport_diagnostic_inventory') if driver else None)
+            observed = time.monotonic_ns()
             with self.lock:
                 self.operation(identity, 'DRAINED_RETAINED', dict(source=source,
-                    destination=destination,benchmark=True,result={k:v for k,v in result.items() if k != 'requests'}))
+                    destination=destination,benchmark=True,result={k:v for k,v in result.items() if k not in
+                        ('requests','diagnostic_requests','sender_queue_samples')}))
                 if scratch is not None: scratch['busy']=False  # Only after positive drain + validation.
+            if driver or group:
+                result.update(receiver_inventory=receiver_inventory,
+                    controller_diagnostic_ns=dict(admission=prepare_start-started,
+                        receiver_prepare=send_start-prepare_start,sender_rpc=verify_start-send_start,
+                        verification=verified-verify_start,receiver_inventory=observed-verified,
+                        terminal_journal=time.monotonic_ns()-observed))
             return dict(result, status='PASS', transfer_id=identity,
                         evidence_class='TRANSFER_ONLY', block_unit=d['block_unit'],
                         configured_qps=16, active_qps_verified=False,
                         qp_gate='INCOMPLETE_REQUIRES_ENDPOINT_EVIDENCE',
-                        path_mode='direct_dax_write', actual_transport='rdma',
+                        path_mode=self.c.get('path_mode','direct_dax_write'), actual_transport='rdma',
                         mr_page_mode=self.c.get('mr_page_mode','native'),
                         mr_pages={m['id']:m.get('mr_pages') for m in members
                                   if m['id'] in (source_node['id'],receiver['id'])},
@@ -1038,7 +1243,8 @@ def server(url, service):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('role', choices=['check','master','agent','preflight','seed','consume','status','transport-benchmark'])
+    parser.add_argument('role', choices=['check','master','agent','preflight','seed','consume','status',
+                                        'transport-benchmark','transport-group'])
     parser.add_argument('--config', required=True)
     parser.add_argument('--node')
     parser.add_argument('--state-dir', default='./callosum-state')
@@ -1054,6 +1260,8 @@ def main():
     parser.add_argument('--access-pattern',choices=ACCESS_PATTERNS,default='overwrite')
     parser.add_argument('--access-window-bytes',type=int)
     parser.add_argument('--random-seed',type=int,default=0)
+    parser.add_argument('--diagnose',choices=('python','native'))
+    parser.add_argument('--sample-queues',action='store_true')
     args = parser.parse_args()
     c = config(args.config)
     import callosum_relay_native as native
@@ -1100,6 +1308,11 @@ def main():
     elif args.role == 'seed':
         print(json.dumps(rpc(c['master'], 'seed', dict(node=args.node, key=args.key, length=args.bytes),
                              timeout=600), indent=2))
+    elif args.role == 'transport-group':
+        # Read the bounded pair manifest from stdin. The master validates it
+        # against its registered topology and owns both reservations.
+        print(json.dumps(rpc(c['master'],'transport_benchmark_group',json.load(sys.stdin),
+                             timeout=1200),indent=2))
     elif args.role == 'transport-benchmark':
         require(args.node and args.receiver and args.block_size and args.block_unit,
                 'baseline requires --node source --receiver --block-size --block-unit')
@@ -1108,7 +1321,8 @@ def main():
         result = rpc(c['master'], 'transport_benchmark', dict(node=args.node,receiver=args.receiver,
             key=args.key,block_size=args.block_size,block_unit=args.block_unit,
             access_pattern=args.access_pattern,window_bytes=args.access_window_bytes,
-            random_seed=args.random_seed),timeout=1200)
+            random_seed=args.random_seed,diagnostic_driver=args.diagnose,
+            sample_queues=args.sample_queues),timeout=1200)
         result['requester_rpc_ns'] = time.monotonic_ns()-start
         result['controller_start_unix_ns'] = wall_start
         result['controller_end_unix_ns'] = time.time_ns()

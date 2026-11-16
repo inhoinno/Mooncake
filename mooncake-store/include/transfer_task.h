@@ -587,6 +587,10 @@ class TransferSubmitter {
 
     [[nodiscard]] bool canUseLocalMemcpy(const std::string& endpoint) const;
 
+    // Setup only, before the Callosum arena is exposed. Inter-process
+    // transfers still go through the engine because the endpoint must match.
+    void enableSameProcessCopy() { memcpy_enabled_ = true; }
+
     /**
      * @brief Pure comparison helper: returns true iff both endpoints are
      * non-empty and identical. Exposed for unit testing of the locality

@@ -49,6 +49,8 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
                  .assigned_client = client_id,
                  .max_retry_attempts = manager_->max_retry_attempts_};
     manager_->total_pending_tasks_++;
+    if (type == TaskType::REPLICA_COPY)
+        task.enqueue_steady = std::chrono::steady_clock::now();
     manager_->all_tasks_[task.id] = task;
     manager_->pending_tasks_[client_id].push(task.id);
 
@@ -56,7 +58,8 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
 }
 
 std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
-                                                   size_t batch_size) {
+                                                   size_t batch_size,
+                                                   bool trace_copy_pickup) {
     std::vector<Task> result;
 
     auto pit = manager_->pending_tasks_.find(client_id);
@@ -89,7 +92,14 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
 
         Task& task = it->second;
         task.mark_processing();
-
+        if (trace_copy_pickup && task.type == TaskType::REPLICA_COPY &&
+            task.enqueue_steady != std::chrono::steady_clock::time_point{}) {
+            const auto pickup_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                task.dequeue_steady - task.enqueue_steady).count();
+            LOG(INFO) << "component=callosum_store event=master_task_pickup"
+                      << " task=" << UuidToString(task.id)
+                      << " enqueue_to_dequeue_ns=" << pickup_ns;
+        }
         const auto [_, inserted] = processing_set.insert(task_id);
         if (!inserted) {
             LOG(WARNING) << "Task " << task_id

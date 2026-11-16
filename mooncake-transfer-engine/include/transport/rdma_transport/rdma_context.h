@@ -267,6 +267,14 @@ class RdmaContext {
     }
 
     int cqCount() const { return cq_list_.size(); }
+    // Observed in software, from the pre-doorbell tracker to CQ processing.
+    struct WriteSnapshot {
+        uint64_t pending_wrs = 0, pending_bytes = 0, completed_bytes = 0;
+        uint64_t outstanding_ns = 0;
+        std::unordered_map<uint32_t, uint64_t> qp_completed_bytes;
+        bool qp_counters_truncated = false;
+    };
+    WriteSnapshot snapshotWrites();
 
     int poll(int num_entries, ibv_wc *wc, int cq_index = 0);
 

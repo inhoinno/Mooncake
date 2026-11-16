@@ -357,6 +357,7 @@ class ProbeTest(unittest.TestCase):
         with patch.object(probe.Path, 'lstat', return_value=info), \
              patch.object(probe.os, 'open', side_effect=[PermissionError('denied'), 100]), \
              patch.object(probe.os, 'close'), \
+             patch.object(probe.shutil, 'which', return_value='/fixture/acl-tool'), \
              patch.object(probe.subprocess, 'run', side_effect=run), \
              patch.object(probe.resource, 'getrlimit', side_effect=[(8*1024**2, 8*1024**2), (needed, needed)]):
             result = probe.prepare_resources(b, self.c['block_bytes'], output, authorize=True, sysroot=sysroot)

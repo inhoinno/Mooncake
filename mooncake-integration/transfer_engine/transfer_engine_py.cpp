@@ -16,11 +16,15 @@
 #include "../pool_relay/relay_batch.h"
 
 #include <cassert>
+#include <array>
+#include <chrono>
 #include <numeric>
 #include <fstream>
 
 #include <pybind11/stl.h>
+#include "config.h"
 #include "transport/rpc_communicator/rpc_interface.h"
+#include "transport/rdma_transport/rdma_context.h"
 
 #ifdef USE_TENT
 #include "tent/common/types.h"
@@ -1117,6 +1121,71 @@ void bind_coro_rpc_interface(py::module_& m) {
 }
 
 // The same address/cardinality checks run in portable native relay tests.
+namespace {
+using WritePhases = std::array<int64_t, 3>;
+using Clock = std::chrono::steady_clock;
+
+int64_t elapsedNs(Clock::time_point begin, Clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
+        .count();
+}
+
+RdmaTransport& relayRdma(const std::shared_ptr<TransferEngine>& engine) {
+    auto* rdma = engine && !engine->isUsingTent()
+                     ? engine->getTransport("rdma")
+                     : nullptr;
+    if (!rdma) throw std::runtime_error("relay requires legacy RDMA");
+    return *static_cast<RdmaTransport*>(rdma);
+}
+
+void relayWriteBatch(TransferEnginePy& self,
+                     const std::vector<std::string>& segments,
+                     const std::vector<uintptr_t>& sources,
+                     const std::vector<uintptr_t>& destinations,
+                     const std::vector<size_t>& lengths,
+                     WritePhases* phases = nullptr) {
+    const auto begin = phases ? Clock::now() : Clock::time_point{};
+    mooncake::pool_relay::ValidateWriteBatch(segments, sources, destinations,
+                                            lengths);
+    auto engine = self.getEngine();
+    relayRdma(engine);
+    for (const auto& segment : segments) {
+        auto handle = engine->openSegment(segment);
+        if (handle == static_cast<Transport::SegmentHandle>(-1))
+            throw std::runtime_error("cannot open relay segment");
+        auto desc = engine->getMetadata()->getSegmentDescByID(handle);
+        engine->closeSegment(handle);
+        if (!desc || desc->protocol != "rdma")
+            throw std::runtime_error("relay refuses non-RDMA target");
+    }
+    const size_t zero = 0;
+    std::vector<TransferEngine::ScatterTransferRange> ranges;
+    ranges.reserve(segments.size());
+    for (size_t i = 0; i < segments.size(); ++i) {
+        ranges.push_back({
+            .opcode = TransferRequest::WRITE,
+            .remote_segment = segments[i],
+            .remote_base_offset = destinations[i],
+            .remote_size = lengths[i],
+            .local_buffer = reinterpret_cast<void*>(sources[i]),
+            .local_capacity = lengths[i],
+            .local_offsets = std::span<const size_t>(&zero, 1),
+            .remote_offsets = std::span<const size_t>(&zero, 1),
+            .lengths = std::span<const size_t>(&lengths[i], 1),
+            .on_fragment_complete = {}});
+    }
+    // The operation destructor also waits. No diagnostic deadline frees MRs.
+    const auto submit = phases ? Clock::now() : Clock::time_point{};
+    auto operation = engine->submitScatter(ranges);
+    const auto wait = phases ? Clock::now() : Clock::time_point{};
+    auto status = operation.wait();
+    if (phases)
+        *phases = {elapsedNs(begin, submit), elapsedNs(submit, wait),
+                   elapsedNs(wait, Clock::now())};
+    if (!status.ok()) throw std::runtime_error(status.ToString());
+}
+}  // namespace
+
 PYBIND11_MODULE(engine, m) {
 #ifdef USE_EFA
     m.attr("SUPPORT_EFA") = true;
@@ -1174,47 +1243,77 @@ PYBIND11_MODULE(engine, m) {
                     const std::vector<uintptr_t>& sources,
                     const std::vector<uintptr_t>& destinations,
                     const std::vector<size_t>& lengths) {
-                     mooncake::pool_relay::ValidateWriteBatch(
-                         segments, sources, destinations, lengths);
                      py::gil_scoped_release release;
-                     auto engine = self.getEngine();
-                     if (!engine || engine->isUsingTent() ||
-                         !engine->getTransport("rdma"))
-                         throw std::runtime_error("relay requires legacy RDMA");
-                     // Validate every target before submitting any payload.
-                     for (const auto& segment : segments) {
-                         auto handle = engine->openSegment(segment);
-                         if (handle == static_cast<Transport::SegmentHandle>(-1))
-                             throw std::runtime_error("cannot open relay segment");
-                         auto desc = engine->getMetadata()->getSegmentDescByID(handle);
-                         engine->closeSegment(handle);
-                         if (!desc || desc->protocol != "rdma")
-                             throw std::runtime_error("relay refuses non-RDMA target");
-                     }
-                     const size_t zero = 0;
-                     std::vector<TransferEngine::ScatterTransferRange> ranges;
-                     ranges.reserve(segments.size());
-                     for (size_t i = 0; i < segments.size(); ++i) {
-                         ranges.push_back({
-                             .opcode = TransferRequest::WRITE,
-                             .remote_segment = segments[i],
-                             .remote_base_offset = destinations[i],
-                             .remote_size = lengths[i],
-                             .local_buffer = reinterpret_cast<void*>(sources[i]),
-                             .local_capacity = lengths[i],
-                             .local_offsets = std::span<const size_t>(&zero, 1),
-                             .remote_offsets = std::span<const size_t>(&zero, 1),
-                             .lengths = std::span<const size_t>(&lengths[i], 1),
-                             .on_fragment_complete = {}});
-                     }
-                     // One scatter submission contains the entire bounded batch.
-                     // Its operation destructor also waits: no deadline frees MRs.
-                     auto operation = engine->submitScatter(ranges);
-                     auto status = operation.wait();
-                     if (!status.ok()) throw std::runtime_error(status.ToString());
+                     relayWriteBatch(self, segments, sources, destinations, lengths);
                      return lengths;
                  }, py::arg("segments"), py::arg("sources"),
                  py::arg("destinations"), py::arg("lengths"))
+            .def("relay_write_block_profiled",
+                 [](TransferEnginePy& self, const std::string& segment,
+                    uintptr_t src, uintptr_t dst, size_t length) {
+                     py::gil_scoped_release release;
+                     WritePhases phases{};
+                     relayWriteBatch(self, {segment}, {src}, {dst}, {length},
+                                     &phases);
+                     return phases;
+                 })
+            .def("relay_write_blocks_diagnostic",
+                 [](TransferEnginePy& self, const std::string& segment,
+                    const std::vector<uintptr_t>& src,
+                    const std::vector<uintptr_t>& dst,
+                    const std::vector<size_t>& lengths) {
+                     if (src.empty() || src.size() > 100000 ||
+                         src.size() != dst.size() || src.size() != lengths.size())
+                         throw std::invalid_argument("invalid diagnostic WRITE schedule");
+                     py::gil_scoped_release release;
+                     // Same per-block validation/submission/drain as the normal
+                     // binding. Only the loop and Python crossing change.
+                     const std::vector<std::string> segments{segment};
+                     std::vector<uintptr_t> source(1), destination(1);
+                     std::vector<size_t> length(1);
+                     std::vector<std::array<int64_t, 5>> samples;
+                     samples.reserve(src.size());
+                     const auto start = Clock::now();
+                     for (size_t i = 0; i < src.size(); ++i) {
+                         source[0] = src[i];
+                         destination[0] = dst[i];
+                         length[0] = lengths[i];
+                         WritePhases phases{};
+                         const auto begin = Clock::now();
+                         relayWriteBatch(self, segments, source, destination,
+                                         length, &phases);
+                         samples.push_back({elapsedNs(start, begin),
+                             elapsedNs(start, Clock::now()), phases[0],
+                             phases[1], phases[2]});
+                     }
+                     return samples;
+                 })
+            .def("relay_rdma_snapshot", [](TransferEnginePy& self) {
+                const auto& cfg = globalConfig();
+                py::list rows;
+                for (const auto& ctx : relayRdma(self.getEngine()).getContextList()) {
+                    auto diag = ctx->snapshotWrites();
+                    py::dict row;
+                    row["device"] = ctx->deviceName();
+                    row["port"] = ctx->portNum();
+                    row["gid_index"] = ctx->gidIndex();
+                    row["active_mtu_enum"] = static_cast<int>(ctx->activeMTU());
+                    row["slice_bytes"] = cfg.slice_size;
+                    row["qp_count"] = ctx->getTotalQPNumber();
+                    row["configured_qps_per_endpoint"] = cfg.num_qp_per_ep;
+                    row["configured_wr_depth"] = cfg.max_wr;
+                    row["workers"] = cfg.workers_per_ctx;
+                    row["tracked"] = cfg.track_rdma_posted_slices;
+                    row["pending_write_wrs"] = diag.pending_wrs;
+                    row["pending_write_bytes"] = diag.pending_bytes;
+                    row["completed_write_bytes"] = diag.completed_bytes;
+                    row["write_outstanding_ns"] = diag.outstanding_ns;
+                    row["qp_completed_bytes"] = py::cast(diag.qp_completed_bytes);
+                    row["qp_counters_truncated"] = diag.qp_counters_truncated;
+                    rows.append(row);
+                }
+                return rows;
+            })
             .def("relay_rdma_available",
                  [](TransferEnginePy& self) {
                      auto engine = self.getEngine();

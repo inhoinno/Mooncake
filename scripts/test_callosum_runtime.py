@@ -206,6 +206,108 @@ class RuntimeTest(unittest.TestCase):
                 master.db.close()
                 log.file.close()
 
+    def test_synchronized_transport_group_waits_for_ready_and_drain(self):
+        import ctypes
+        import threading
+        from contextlib import closing, ExitStack
+
+        block=1<<20
+        clock=dict(boot_id='source-host',time_namespace='fixture')
+        nodes=[dict(id=n,pool=n[0],url='http://'+n,can_send=n[0]=='a',can_receive=n[0]=='b',
+                    configured_qps='16',sender_clock=clock,transport_access_patterns=['sequential'])
+               for n in ('a1','a2','b1','b2')]
+        config=dict(mode='rdma',fingerprint='group',experiment_layout='colocated_pairs',
+                    master='http://master',nodes=nodes,
+                    pools={k:dict(capacity=6*block) for k in ('a','b')})
+        spec=[dict(node='a'+i,receiver='b'+i,key='key'+i,block_size=1,block_unit='MiB',
+                   access_pattern='sequential',window_bytes=block) for i in ('1','2')]
+        for scenario in ('success','failed_write','wrong_clock'):
+            with self.subTest(scenario=scenario),tempfile.TemporaryDirectory() as directory,ExitStack() as stack:
+                root=Path(directory)
+                agents={}
+                memory={p:bytearray(config['pools'][p]['capacity']) for p in config['pools']}
+                a1_ready,a1_drained=threading.Event(),threading.Event()
+                observed_ready,observed_drained=set(),set()
+                writes,checks=[],[]
+                log=runtime.Log(root/'master.jsonl','master')
+                stack.enter_context(closing(log.file))
+                master=runtime.Master(config,root/'state.sqlite',log)
+                stack.enter_context(closing(master.db))
+                master.topology_ok=True
+                master.members=lambda:[dict(n,sender_clock=dict(boot_id='elsewhere',time_namespace='other'))
+                    if scenario=='wrong_clock' and n['id']=='a2' else n for n in nodes]
+                for i in (1,2):
+                    offset=4096+(i-1)*block
+                    memory['a'][offset:offset+block]=bytes([42*i])*block
+                    source=dict(key=f'key{i}',pool='a',offset=offset,length=block,version='v1')
+                    master.db.execute('INSERT INTO objects VALUES (?,?,?)',(source['key'],'a',json.dumps(source)))
+                master.db.commit()
+                def native_write(segment, sources, targets, lengths):
+                    self.assertEqual(observed_ready,{'a1','a2'})
+                    writes.append(segment[0])
+                    if segment[0]=='b2':
+                        self.assertTrue(a1_drained.wait(2),'fast sender did not reach drain gate')
+                        self.assertFalse(checks,'verification ran while another sender was still active')
+                        if scenario=='failed_write':
+                            raise RuntimeError('injected native failure')
+                    ctypes.memmove(targets[0],sources[0],lengths[0])
+                    return lengths
+                for node in nodes:
+                    agent=runtime.Agent.__new__(runtime.Agent)
+                    agent.c, agent.node=config,node
+                    agent.log=runtime.Log(root/(node['id']+'.jsonl'),node['id'])
+                    stack.enter_context(closing(agent.log.file))
+                    agent.mapping=runtime.Mapping.__new__(runtime.Mapping)
+                    agent.mapping.memory=memory[node['pool']]
+                    agent.mapping.capacity=len(agent.mapping.memory)
+                    agent.mapping.address=ctypes.addressof(ctypes.c_char.from_buffer(agent.mapping.memory))
+                    agent.epoch,agent.segment='epoch-'+node['id'],node['id']
+                    agent.lock=threading.Lock()
+                    agent.jobs,agent.targets,agent.benchmark_resets={},{},{}
+                    agent.engine=SimpleNamespace(relay_write_batch_drained=native_write)
+                    agents[node['url']]=agent
+                def network(url,method,data=None,**kwargs):
+                    data=data or {}
+                    if url==config['master']:
+                        if method=='transport_trial_phase':
+                            if data['phase']=='ready':
+                                observed_ready.add(data['node'])
+                                if data['node']=='a1':
+                                    a1_ready.set()
+                            else:
+                                observed_drained.add(data['node'])
+                                if data['node']=='a1':
+                                    a1_drained.set()
+                        return master.handle(method,data)
+                    if url=='http://b2' and method=='prepare':
+                        self.assertTrue(a1_ready.wait(2),'fast sender did not reach ready gate')
+                        self.assertFalse(writes,'sender wrote before its peer was ready')
+                    if method=='digest':
+                        self.assertEqual(observed_drained,{'a1','a2'})
+                        checks.append(url)
+                    return agents[url].handle(method,data)
+                with patch.object(runtime,'rpc',side_effect=network),patch.object(runtime,'TOTAL_BYTES',block), \
+                     patch.dict(os.environ,{'MC_NUM_QP_PER_EP':'16'}):
+                    if scenario=='success':
+                        result=master.handle('transport_benchmark_group',dict(pairs=spec))
+                        self.assertEqual([r['bytes'] for r in result],[block,block])
+                        self.assertEqual(result[0]['trial_group'],result[1]['trial_group'])
+                        self.assertEqual(len(checks),4)
+                        self.assertEqual(set(master.db.execute('SELECT state FROM operations')),
+                                         {('DRAINED_RETAINED',)})
+                    elif scenario=='failed_write':
+                        with self.assertRaisesRegex(RuntimeError,'a2: injected native failure'):
+                            master.handle('transport_benchmark_group',dict(pairs=spec))
+                        self.assertFalse(checks)
+                        self.assertEqual(list(master.db.execute('SELECT state FROM operations')),
+                                         [('QUARANTINED',),('QUARANTINED',)])
+                    else:
+                        with self.assertRaisesRegex(RuntimeError,'one sender monotonic clock'):
+                            master.handle('transport_benchmark_group',dict(pairs=spec))
+                        self.assertFalse(writes)
+                        self.assertEqual(master.db.execute('SELECT count(*) FROM operations').fetchone(),(0,))
+                self.assertIsNone(master.transport_trial_group)
+
     def test_scatter_tensor_projection_and_hybrid_readiness(self):
         import ctypes
         from callosum_relay_native import project_scatter, ReadinessLedger

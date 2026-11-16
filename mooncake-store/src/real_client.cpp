@@ -6128,6 +6128,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     bool prefer_alloc_in_same_node) {
+    const auto store_start = std::chrono::steady_clock::now();
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() {
@@ -6151,6 +6152,15 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
 
     for (const auto &result : internal_results) {
         results.push_back(to_py_ret(result));
+    }
+    if (callosum_enabled_ && !keys.empty()) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - store_start).count();
+        LOG(INFO) << "component=callosum_store event=store_api_complete"
+                  << " key_count=" << keys.size()
+                  << " key_crc=" << ComputeCrcChecksum(keys.front().data(), keys.front().size())
+                  << " bytes=" << sum_positive_results(results)
+                  << " store_api_ns=" << elapsed;
     }
     return results;
 }
@@ -6181,6 +6191,20 @@ RealClient::batch_get_into_multi_buffers_internal(
     results.reserve(num_keys);
     if (num_keys == 0) {
         return results;
+    }
+    if (callosum_enabled_) {
+        // Reject malformed destination layouts before scheduling any WRITE.
+        std::unordered_set<std::string> unique_keys;
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (all_buffers[i].empty() ||
+                all_buffers[i].size() != all_sizes[i].size() ||
+                !unique_keys.insert(keys[i]).second ||
+                std::any_of(all_buffers[i].begin(), all_buffers[i].end(),
+                            [](void* p) { return p == nullptr; })) {
+                return std::vector<tl::expected<int64_t, ErrorCode>>(
+                    num_keys, tl::unexpected(ErrorCode::INVALID_PARAMS));
+            }
+        }
     }
     // Query metadata for all keys
     const auto query_results = client_->CallosumQuery(keys);
@@ -6244,10 +6268,16 @@ RealClient::batch_get_into_multi_buffers_internal(
         uint64_t total_size = calculate_total_size(replica);
         const auto& sizes = all_sizes[i];
         uint64_t dst_total_size = 0;
+        bool size_overflow = false;
         for (auto& size : sizes) {
+            if (size > std::numeric_limits<uint64_t>::max() - dst_total_size) {
+                size_overflow = true;
+                break;
+            }
             dst_total_size += size;
         }
-        if (dst_total_size < total_size) {
+        if (size_overflow || dst_total_size < total_size ||
+            (callosum_enabled_ && dst_total_size != total_size)) {
             LOG(ERROR) << "Buffer too small for key '" << key
                        << "': required=" << total_size
                        << ", available=" << dst_total_size;
@@ -6268,9 +6298,21 @@ RealClient::batch_get_into_multi_buffers_internal(
                     return runtime_accelerator.FindDeviceForPointer(buffer) !=
                            nullptr;
                 });
+            if (callosum_enabled_ &&
+                (!client_->CanUseLocalMemcpy(handle.transport_endpoint_) ||
+                 (destination_is_gpu &&
+                  (!query_result_values.object_checksum ||
+                   !Environ::Get().GetStoreChecksumEnabled())))) {
+                // The cross-pool WRITE has finished. Never let a local GPU
+                // load fall through to a NIC READ or an unverified GPU copy.
+                results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
+                continue;
+            }
             const auto gpu_path =
-                SelectGpuReadPath(handle.protocol_, destination_is_gpu,
-                                  RdmaGpuDirectEnabledFromEnvironment());
+                callosum_enabled_ && destination_is_gpu
+                    ? GpuReadPath::kCxlCudaCopy
+                    : SelectGpuReadPath(handle.protocol_, destination_is_gpu,
+                                        RdmaGpuDirectEnabledFromEnvironment());
             if (destination_is_gpu &&
                 GpuTransferTraceEnabledFromEnvironment()) {
                 LOG(INFO) << "component=mooncake_store "
@@ -6378,7 +6420,7 @@ RealClient::batch_get_into_multi_buffers_internal(
 
         auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                              prefer_alloc_in_same_node);
+                              !callosum_enabled_ && prefer_alloc_in_same_node);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto& op = valid_operations[j];
@@ -6403,6 +6445,23 @@ RealClient::batch_get_into_multi_buffers_internal(
                         break;
                     }
                     host_offset += op.copy_lengths[k];
+                }
+            }
+            if (callosum_enabled_) {
+                auto accelerator = device::GetAcceleratorRegistry().RuntimeAccelerators();
+                const bool all_gpu = std::all_of(
+                    op.slices.begin(), op.slices.end(), [&](const Slice& slice) {
+                        return accelerator.FindDeviceForPointer(slice.ptr) != nullptr;
+                    });
+                // BatchGet's checksum reads the destination GPU slices back
+                // synchronously. At this point it has waited for the local
+                // copy and validated those bytes, before vLLM can resume.
+                if (all_gpu) {
+                    LOG(INFO) << "component=callosum_store event=gpu_load_verified"
+                              << " key_crc=" << ComputeCrcChecksum(op.key.data(), op.key.size())
+                              << " bytes=" << op.total_size
+                              << " replica_generation=" << op.query_result.replicas.front().id
+                              << " path=local_cxl_copy";
                 }
             }
         }

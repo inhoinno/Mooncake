@@ -262,7 +262,8 @@ def write_report(output, rows):
         'Scope: TRANSFER_ONLY. Serial logical WRITE → terminal drain. No GPU/serving claim.',
         'Throughput = total measured bytes / summed sender-loop time. GB/s is decimal.',
         'Instrumented loop times include sample-collection overhead; legacy instrumentation is not established.',
-        'No file I/O occurs inside the instrumented loop.',
+        ('Diagnostic observer may read port counters during the loop; do not use these trials as final throughput.'
+         if any(r.get('diagnostic_driver') for r in rows) else 'No file I/O occurs inside the instrumented loop.'),
         'WRITE latency excludes preparation, metadata, verification and publication.',
         'Trial RPC/protocol time is separate; never assign it to individual WRITE requests.',
         'Percentiles use nearest rank over recorded requests. Serial samples are correlated;',

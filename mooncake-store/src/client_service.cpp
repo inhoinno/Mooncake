@@ -502,6 +502,7 @@ void Client::EnableCallosum(const CallosumStoreConfig& config) {
         capabilities->callosum_store_abi != 1 || callosum_bridge_) {
         throw std::runtime_error("Callosum requires RDMA and a retained-copy Store master");
     }
+    transfer_submitter_->enableSameProcessCopy();
     callosum_pool_ = config.Map();
     callosum_bridge_ = std::make_unique<CallosumStoreBridge>(
         *this, *transfer_engine_, config, callosum_pool_);
@@ -512,6 +513,7 @@ void Client::EnableCallosum(const CallosumStoreConfig& config) {
     if (!mounted) throw std::runtime_error("Callosum owned Store arena mount failed");
     LOG(INFO) << "component=callosum_store event=pool_mounted pool="
               << geometry.logical_pool_id << " segment=" << local_hostname_
+              << " te_endpoint=" << GetSegmentEndpoint()
               << " owned_offset=" << geometry.owned_offset
               << " owned_bytes=" << geometry.owned_capacity
               << " registration_bytes=" << geometry.owned_capacity
@@ -521,14 +523,29 @@ void Client::EnableCallosum(const CallosumStoreConfig& config) {
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::CallosumQuery(
     const std::vector<std::string>& keys) {
     if (!callosum_bridge_) return BatchQuery(keys);
+    // Materializing a prefix may take several source task polls. Refresh the
+    // leases together after all materializations, before any tensor copy.
+    std::vector<std::string> ready_keys;
+    std::vector<bool> ready;
+    ready.reserve(keys.size());
+    for (const auto& key : keys) {
+        ready.push_back(callosum_bridge_->Materialize(key));
+        if (ready.back()) ready_keys.push_back(key);
+    }
+    auto refreshed = BatchQuery(ready_keys);
+    if (refreshed.size() != ready_keys.size()) {
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
     std::vector<tl::expected<QueryResult, ErrorCode>> results;
     results.reserve(keys.size());
-    for (const auto& key : keys) {
-        if (!callosum_bridge_->Materialize(key)) {
+    size_t next = 0;
+    for (bool present : ready) {
+        if (!present) {
             results.emplace_back(tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
             continue;
         }
-        auto query = Query(key);
+        const auto& query = refreshed[next++];
         std::vector<Replica::Descriptor> local;
         if (query) for (const auto& replica : query->replicas)
             if (callosum_bridge_->Owns(replica)) local.push_back(replica);
@@ -3762,12 +3779,16 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
         }
         // Copy() returns success only after receiver validation. CopyEnd is
         // still Store's sole complete-replica publication point.
+        const auto publish_start = std::chrono::steady_clock::now();
         auto result = end_fn();
+        const auto publish_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - publish_start).count();
         if (!result) revoke_lambda();
         if (result) LOG(INFO) << "component=callosum_store event=replica_published"
                              << " key_crc=" << ComputeCrcChecksum(key.data(), key.size())
                              << " source_generation=" << source.id
-                             << " target_generation=" << targets[0].id;
+                             << " target_generation=" << targets[0].id
+                             << " copy_end_rpc_ns=" << publish_ns;
         return result;
     }
 
@@ -3809,8 +3830,16 @@ tl::expected<void, ErrorCode> Client::Copy(
               << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
+    const auto start_rpc = std::chrono::steady_clock::now();
     auto start_result =
         master_client_.CopyStart(key, tenant_id, source, targets);
+    if (callosum_bridge_ && start_result) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start_rpc).count();
+        LOG(INFO) << "component=callosum_store event=copy_reserved"
+                  << " key_crc=" << ComputeCrcChecksum(key.data(), key.size())
+                  << " copy_start_rpc_ns=" << elapsed;
+    }
     if (!start_result.has_value()) {
         ErrorCode error = start_result.error();
         LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key

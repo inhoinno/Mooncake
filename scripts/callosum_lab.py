@@ -44,6 +44,10 @@ SOURCE_FILES = (
     'mooncake-integration/pool_relay/relay_batch.h',
     'mooncake-integration/pool_relay/scatter_layout.h',
     'mooncake-integration/transfer_engine/transfer_engine_py.cpp',
+    'mooncake-transfer-engine/src/transport/rdma_transport/worker_pool.cpp',
+    'mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp',
+    'mooncake-transfer-engine/include/transport/rdma_transport/worker_pool.h',
+    'mooncake-transfer-engine/include/transport/rdma_transport/rdma_context.h',
 )
 DELIVERY_ROOT_FILES = (
     'scripts/callosum_lab.sh', 'scripts/capture_preflight.sh',
@@ -242,6 +246,7 @@ if n.ABI_VERSION != 2: raise RuntimeError('native ABI mismatch')
 if pathlib.Path(n.__file__).resolve().parent != pathlib.Path(os.environ['CALLOSUM_NATIVE_BUILD']).resolve(): raise RuntimeError('stale native import')
 t=e.TransferEngine()
 if t.relay_abi_version()!=2 or not hasattr(t,'relay_write_batch_drained') or not hasattr(t,'relay_rdma_available'): raise RuntimeError('engine relay ABI missing')
+if not all(hasattr(t, attr) for attr in ('relay_write_block_profiled','relay_write_blocks_diagnostic','relay_rdma_snapshot')): raise RuntimeError('engine transport diagnostic binding missing')
 print(json.dumps({'engine':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'native':n.__file__,'abi':2,'hardware_validated':False}))
 '''], dict(env, CALLOSUM_PACKAGE=str(package)))
     core = build / 'core'
@@ -574,7 +579,7 @@ def start_service(root, run, role, node, runner):
         selected = next(n for n in c['nodes'] if n['id']==node)
         required = c['pools'][selected['pool']]['capacity']
         require(os.geteuid()==0 or hard==resource.RLIM_INFINITY or hard>=required,
-                f'Memlock hard limit={hard} bytes is smaller than the approved mapping={required}. No DAX service started.')
+                f'Memlock hard limit={hard} bytes is smaller than the approved mapping={required}. No agent started.')
         (run / f'{node}-transport-env.json').write_text(json.dumps({
             key:env.get(key,'unset; native default') for key in
             ('MC_NUM_QP_PER_EP','MC_MTU','MC_GID_INDEX')},indent=2))
@@ -709,14 +714,20 @@ def remote_command(peer, command, tty=False, options=()):
 
 def validate_launch_config(config, node_id):
     """Validate data before package installation, builds or service launch."""
+    from callosum_transport_benchmark import MIXED_DEVICE, MIXED_WRITE
     require(isinstance(config, dict), 'CONFIG must contain a JSON object')
-    require(config.get('mode') == 'rdma' and config.get('path_mode') == 'direct_dax_write'
-            and config.get('evidence_class') == 'TRANSFER_ONLY', 'Explicit TRANSFER_ONLY direct-DAX RDMA config required')
+    mixed = config.get('path_mode') == MIXED_WRITE
+    require(config.get('mode') == 'rdma' and config.get('path_mode') in ('direct_dax_write', MIXED_WRITE)
+            and config.get('evidence_class') == 'TRANSFER_ONLY', 'Explicit TRANSFER_ONLY device-mapped RDMA config required')
+    require(not mixed or (config.get('experiment_layout') == 'colocated_pairs' and
+                          config.get('mr_page_mode', 'native') == 'native' and
+                          config.get('require_remote_dax_numa') is False),
+            'Mixed CXL requires colocated pairs, native mapping, and no devdax locality gate')
     require(config.get('abi_version') == 2 and type(config.get('abi_version')) is int,
             'abi_version must be integer 2')
     nodes, pools, launch = config.get('nodes'), config.get('pools'), config.get('lab_run')
     require(isinstance(nodes,list) and len(nodes) in (2,4) and all(isinstance(n,dict) for n in nodes)
-            and isinstance(pools,dict) and len(pools) in ((3,4) if config.get('experiment_layout')=='colocated_pairs' else (2,))
+            and isinstance(pools,dict) and len(pools) in ((3,4) if config.get('experiment_layout')=='colocated_pairs' and not mixed else (2,))
             and all(isinstance(p,dict) for p in pools.values()),
             'Require two/four node records and two pool records')
     def identity(value):
@@ -754,7 +765,7 @@ def validate_launch_config(config, node_id):
                 and type(node.get('can_receive')) is bool, 'Invalid pool membership/capabilities')
         require(isinstance(node.get('path'),str) and Path(node['path']).is_absolute()
                 and isinstance(node.get('rdma_device'),str) and node['rdma_device'].strip(),
-                'Absolute DAX path and RDMA device required per node')
+                'Absolute mapping path and RDMA device required per node')
         endpoint=control_endpoint(node.get('url'))
         endpoints.append((endpoint.hostname,endpoint.port))
         require(isinstance(node.get('te_endpoint'),str), 'Explicit TE IPv4:port required')
@@ -762,6 +773,9 @@ def validate_launch_config(config, node_id):
         require(te.hostname and te.port and not te.username and not te.password and not te.path
                 and not te.query and not te.fragment and ipaddress.ip_address(te.hostname).version==4,
                 'Invalid TE endpoint')
+        if mixed:
+            require(node['path']==MIXED_DEVICE and endpoint.hostname==te.hostname,
+                    'Mixed CXL requires /dev/cxl_mixed and matching per-node control/TE IPs')
     require(len(set(endpoints+[(master.hostname,master.port)]))==len(endpoints)+1
             and len({n['te_endpoint'] for n in nodes})==len(nodes), 'Duplicate service/TE endpoint')
     require(master.hostname==urlparse(by_id[launch['controller']]['url']).hostname,
@@ -770,7 +784,17 @@ def validate_launch_config(config, node_id):
         # Validate the relay-specific membership rules before starting any owner.
         senders=[n for n in nodes if n['can_send'] and not n['can_receive']]
         receivers=[n for n in nodes if n['can_receive'] and not n['can_send']]
-        require(len(senders)==len(receivers)==2 and
+        if mixed:
+            sender_pools={n['pool'] for n in senders}
+            receiver_pools={n['pool'] for n in receivers}
+            source_ips={urlparse(n['url']).hostname for n in senders}
+            receiver_ips={urlparse(n['url']).hostname for n in receivers}
+            require(len(senders)==len(receivers)==2 and len(sender_pools)==len(receiver_pools)==1
+                    and sender_pools.isdisjoint(receiver_pools) and len(source_ips)==len(receiver_ips)==1
+                    and source_ips.isdisjoint(receiver_ips) and by_id[launch['controller']] in senders,
+                    'Mixed CXL requires a shared source pool and a shared receiver pool on distinct hosts')
+        else:
+            require(len(senders)==len(receivers)==2 and
                 len({n['pool'] for n in receivers})==2 and
                 len({n['pool'] for n in nodes})==len(pools) and
                 len({n['path'] for n in senders})==len({n['pool'] for n in senders}) and
@@ -788,6 +812,9 @@ def validate_launch_config(config, node_id):
                 and offset>=0 and size>=4*1024**2 and offset+size<2**63
                 and align>=4096 and align & (align-1)==0 and offset%align==0 and size%align==0,
                 'Invalid exclusive extent/alignment')
+        if mixed:
+            require(align == 2**21 and size >= (512 << 20) + 4096,
+                    'Mixed CXL needs 2 MiB range alignment and space for both benchmark windows')
         if config.get('experiment_layout') != 'colocated_pairs':
             require(sum(n['pool']==pool_id for n in nodes)==len(nodes)//2, 'Each pool needs half the nodes')
     if config.get('experiment_layout') == 'colocated_pairs':
@@ -807,6 +834,7 @@ def validate_launch_config(config, node_id):
 
 
 def validate_node_extent(config, node_id, inv):
+    from callosum_transport_benchmark import MIXED_WRITE, mixed_device_info
     selected,_=validate_launch_config(config,node_id)
     path = selected['path']
     pool, geometry = config['pools'][selected['pool']], inv['geometry'].get(path, {})
@@ -814,14 +842,20 @@ def validate_node_extent(config, node_id, inv):
     require(type(offset) is int and type(size) is int and type(align) is int
             and offset >= 0 and size >= 4*1024**2 and align >= 4096 and align & (align-1) == 0
             and offset % align == 0 and size % align == 0, 'Invalid exclusive extent/alignment')
-    require(geometry.get('mode') == 'devdax' and type(geometry.get('size')) is int
+    if config.get('path_mode') == MIXED_WRITE:
+        try:
+            mixed_device_info(path)
+        except OSError as exc:
+            raise ValueError(f'{node_id}: {path} unavailable; load the authorized mixed-CXL driver first: {exc.strerror}') from exc
+    else:
+        require(geometry.get('mode') == 'devdax' and type(geometry.get('size')) is int
             and geometry.get('align') == align and offset + size <= geometry['size'],
             f'{node_id}: {path} geometry needs mode=devdax, alignment={align}, '
             f'and at least {offset + size} device bytes for [{offset}, {offset + size}); '
             f'daxctl reports mode={geometry.get("mode")}, alignment={geometry.get("align")}, '
             f'size={geometry.get("size")}. Do not reconfigure a live device.')
-    require(path in inv['devices'] and selected['rdma_device'] in inv['hcas'],
-            f'{node_id}: configured DAX character device {path} or HCA '
+    require((config.get('path_mode') == MIXED_WRITE or path in inv['devices']) and selected['rdma_device'] in inv['hcas'],
+            f'{node_id}: configured mapping device {path} or HCA '
             f'{selected["rdma_device"]} is absent from inventory')
     network=inv.get('network',{})
     require(network.get('status')=='PASS', 'Local IP inventory is unavailable')
@@ -889,13 +923,15 @@ def port_in_use(url):
 
 def startup_checks(config, node_id, runner):
     """Read/open-only checks before builds; no mmap, payload write or process kill."""
+    from callosum_transport_benchmark import MIXED_WRITE
     runner.stage='local-startup-validation'
     node,launch=validate_launch_config(config,node_id)
     issues=[]
     try:
-        descriptor=os.open(node['path'],os.O_RDWR | os.O_CLOEXEC)
+        descriptor=os.open(node['path'],os.O_RDWR | os.O_CLOEXEC |
+                           (os.O_NOFOLLOW if config.get('path_mode') == MIXED_WRITE else 0))
     except OSError as error:
-        issues.append(f'DAX read/write open denied or unavailable: {node["path"]}: {error.strerror}. Use an authorized device account; no mapping was made')
+        issues.append(f'Device read/write open denied or unavailable: {node["path"]}: {error.strerror}. Use an authorized device account; no mapping was made')
     else:
         os.close(descriptor)
         runner.device_open_checked=True
@@ -1051,6 +1087,7 @@ def check_source(root):
 
 def node_run(root, run, args, runner):
     """Independent terminals; configuration selects services and the smoke driver."""
+    from callosum_transport_benchmark import MIXED_WRITE
     runner.stage='configuration-validation'
     config,selected,launch,secret=configuration_inputs(root,args)
     require(sys.platform.startswith('linux'), 'Run the node launcher on the Linux lab host')
@@ -1064,7 +1101,8 @@ def node_run(root, run, args, runner):
     (run/'inventory.json').write_text(json.dumps(inv,indent=2))
     runner.stage='local-device-validation'
     node = validate_node_extent(config,args.node_id,inv)
-    if config.get('experiment_layout') == 'colocated_pairs' and node['can_send']:
+    mixed = config.get('path_mode') == MIXED_WRITE
+    if config.get('experiment_layout') == 'colocated_pairs' and node['can_send'] and not mixed:
         from callosum_transport_benchmark import dax_numa_evidence
         (run/'source-numa.json').write_text(json.dumps(
             dax_numa_evidence(node['path'],node['rdma_device'],
@@ -1076,7 +1114,8 @@ def node_run(root, run, args, runner):
         runner.stage='existing-coordinator-validation'
         check_peer_campaign(runtime.rpc(config['master'],'status',timeout=5),fingerprint,args.node_id)
     runner.call('host-preflight',['bash',root/'scripts/capture_preflight.sh','--output',run/'preflight',
-        '--checkout',source,'--python',args.python,'--dax',selected['path']],clean_env())
+        '--checkout',source,'--python',args.python,
+        *([] if mixed else ['--dax',selected['path']])],clean_env())
     if not (run/'setup.json').exists():
         prepare(root,run,args,runner)
     runner.say('[extent] '+json.dumps(dict(node_id=args.node_id,path=node['path'],pool=config['pools'][node['pool']])))

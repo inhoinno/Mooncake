@@ -17,6 +17,7 @@
 #include <sys/epoll.h>
 
 #include <cassert>
+#include <chrono>
 #include <functional>
 
 #include "config.h"
@@ -334,14 +335,54 @@ int WorkerPool::submitPreparedPostSend(
     return 0;
 }
 
+static uint64_t writeDiagnosticNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void WorkerPool::trackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {
     if (!globalConfig().track_rdma_posted_slices) return;
 
     std::lock_guard<std::mutex> lock(posted_slices_mutex_);
-    for (size_t i = first; i < first + count; ++i)
-        posted_slices_.insert(slice_list[i]);
+    for (size_t i = first; i < first + count; ++i) {
+        const auto inserted = posted_slices_.insert(slice_list[i]).second;
+        if (inserted && slice_list[i]->opcode == Transport::TransferRequest::WRITE) {
+            if (++write_diagnostics_.pending_wrs == 1)
+                writes_outstanding_since_ns_ = writeDiagnosticNowNs();
+            write_diagnostics_.pending_bytes += slice_list[i]->length;
+        }
+    }
+}
+
+RdmaContext::WriteSnapshot WorkerPool::snapshotWrites() {
+    std::lock_guard<std::mutex> lock(posted_slices_mutex_);
+    auto out = write_diagnostics_;
+    if (out.pending_wrs)
+        out.outstanding_ns += writeDiagnosticNowNs() - writes_outstanding_since_ns_;
+    return out;
+}
+
+void WorkerPool::removeTrackedSlice(Transport::Slice *slice, const ibv_wc *success) {
+    // The caller holds posted_slices_mutex_. Do not account for a retry or
+    // a failed post as a successful CQ completion.
+    if (!posted_slices_.erase(slice) || slice->opcode != Transport::TransferRequest::WRITE)
+        return;
+    if (--write_diagnostics_.pending_wrs == 0)
+        write_diagnostics_.outstanding_ns += writeDiagnosticNowNs() - writes_outstanding_since_ns_;
+    write_diagnostics_.pending_bytes -= slice->length;
+    if (success) {
+        write_diagnostics_.completed_bytes += slice->length;
+        auto &counts = write_diagnostics_.qp_completed_bytes;
+        auto qp = counts.find(success->qp_num);
+        if (qp != counts.end())
+            qp->second += slice->length;
+        else if (counts.size() < 4096)
+            counts.emplace(success->qp_num,slice->length);
+        else
+            write_diagnostics_.qp_counters_truncated = true;
+    }
 }
 
 void WorkerPool::untrackPostedSlices(
@@ -351,7 +392,7 @@ void WorkerPool::untrackPostedSlices(
 
     std::lock_guard<std::mutex> lock(posted_slices_mutex_);
     for (size_t i = first; i < first + count; ++i)
-        posted_slices_.erase(slice_list[i]);
+        removeTrackedSlice(slice_list[i],nullptr);
 }
 
 void WorkerPool::performPostSend(int thread_id) {
@@ -602,7 +643,7 @@ void WorkerPool::performPollCq(int thread_id) {
             std::lock_guard<std::mutex> lock(posted_slices_mutex_);
             for (int i = 0; i < nr_poll; ++i) {
                 auto *slice = reinterpret_cast<Transport::Slice *>(wc[i].wr_id);
-                posted_slices_.erase(slice);
+                removeTrackedSlice(slice,wc[i].status == IBV_WC_SUCCESS ? &wc[i] : nullptr);
             }
         }
 
