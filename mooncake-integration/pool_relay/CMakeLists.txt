@@ -9,6 +9,12 @@ target_include_directories(callosum_relay_native PRIVATE ../../mooncake-store/in
 target_compile_features(callosum_relay_native PRIVATE cxx_std_17)
 target_link_libraries(callosum_relay_native PRIVATE Threads::Threads)
 enable_testing()
+add_executable(callosum_write_pipeline_test ../../mooncake-transfer-engine/tests/write_pipeline_test.cpp)
+target_include_directories(callosum_write_pipeline_test PRIVATE ../../mooncake-transfer-engine/include)
+target_compile_features(callosum_write_pipeline_test PRIVATE cxx_std_17)
+target_compile_options(callosum_write_pipeline_test PRIVATE -UNDEBUG)
+add_test(NAME callosum_write_pipeline COMMAND callosum_write_pipeline_test)
+set_tests_properties(callosum_write_pipeline PROPERTIES LABELS "relay;pipeline;functional;failure;t0")
 add_test(NAME callosum_mux_pipeline
   COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=$<TARGET_FILE_DIR:callosum_relay_native>"
     "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_callosum_mux_pipeline.py")

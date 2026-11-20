@@ -10,9 +10,11 @@ import statistics
 from callosum_transport_benchmark import access_strategy
 
 REQUEST_FIELDS = ['trial_id','transfer_id','trial_status','path_mode','experiment_case','requested_page_mode','mr_page_mode','direction','block_bytes','repetition',
+                  'submission_mode','pipeline_depth','pipeline_max_bytes','descriptors_per_submit','pipeline_instrumentation','operation_id',
                   'access_pattern','window_bytes','random_seed','source_offset_bytes','destination_offset_bytes',
                   'request_index','request_bytes','native_calls','status',
                   'sender_start_offset_ns','sender_end_offset_ns','write_request_e2e_ns',
+                  'admission_blocked_ns',
                   'write_request_GBps','write_request_GiBps']
 
 
@@ -133,16 +135,18 @@ def enrich_trial(row):
                 len(samples) != (row['bytes']+row['block_bytes']-1)//row['block_bytes']):
             raise ValueError('missing request samples')
         cursor = 0
+        pipelined = row.get('submission_mode')=='batched'
         for index, sample in enumerate(samples):
             expected_offset=strategy.offset(index)
             begin, end = sample['sender_start_offset_ns'], sample['sender_end_offset_ns']
             if (any(type(sample.get(k)) is not int for k in ('request_index','request_bytes',
                     'sender_start_offset_ns','sender_end_offset_ns','write_request_e2e_ns')) or
                     sample['request_index'] != index or sample['status'] != 'PASS' or
-                    not cursor <= begin < end <= row['sender_write_loop_ns'] or
+                    not (0 if pipelined else cursor) <= begin < end <= row['sender_write_loop_ns'] or
                     sample['write_request_e2e_ns'] != end-begin or
                     sample['request_bytes'] != min(row['block_bytes'],row['bytes']-index*row['block_bytes']) or
-                    type(sample['native_calls']) is not int or sample['native_calls'] <= 0):
+                    type(sample['native_calls']) is not int or sample['native_calls'] <
+                    (0 if pipelined else 1)):
                 raise ValueError('invalid, incomplete or unordered request timing')
             if 'source_offset_bytes' in sample:
                 offset=sample['source_offset_bytes']
@@ -175,7 +179,8 @@ def enrich_trial(row):
         raise ValueError('protocol timer must be positive integer nanoseconds when present')
     row.update(schema_version=2,
         latency=dict(write_request_e2e=stats,scope='sender logical WRITE start through drain; not KV/GPU-ready',
-                     percentile_method='nearest_rank',correlated_serial_samples=True,
+                     percentile_method='nearest_rank',correlated_samples=True,
+                     correlated_serial_samples=not row.get('submission_mode')=='batched',
                      trial_protocol_e2e_ns=protocol),
         bandwidth=dict(sender_loop=dict(bytes_per_second=row['GBps']*1e9,
                         GB_per_second=row['GBps'],GiB_per_second=row['GiBps']),
@@ -218,6 +223,8 @@ def write_report(output, rows):
     if any(path.exists() for path in paths):
         raise FileExistsError('report files already exist; preserve them')
     trial_fields = ['trial_id','transfer_id','path_mode','experiment_case','requested_page_mode','mr_page_mode','direction','block_unit','block_bytes','repetition',
+                    'submission_mode','pipeline_depth','pipeline_max_bytes','descriptors_per_submit','pipeline_instrumentation',
+                    'sender_process_cpu_ns','binding_call_elapsed_ns','schedule_generation_ns',
                     'access_pattern','window_bytes','random_seed',
                     'bytes','logical_blocks','native_calls','loop_ms','GBps','GiBps',
                     'warmup_blocks','warmup_bytes','requester_rpc_ns','protocol_e2e_ns',
@@ -234,12 +241,19 @@ def write_report(output, rows):
     def group_key(row):
         return (row['path_mode'],row.get('experiment_case',''),row.get('requested_page_mode',''),
                 row.get('mr_page_mode','UNRECORDED'),row.get('direction',''),row['block_bytes'],
-                row['access_pattern'],row['window_bytes'],row['random_seed'])
-    for path,case,requested_mode,page_mode,direction,size,pattern,window,seed in sorted({group_key(r) for r in rows}):
-        group = [r for r in rows if group_key(r)==(path,case,requested_mode,page_mode,direction,size,pattern,window,seed)]
+                row['access_pattern'],row['window_bytes'],row['random_seed'],
+                row.get('submission_mode','legacy'),row.get('pipeline_depth',1),row.get('pipeline_instrumentation','off'),
+                row.get('pipeline_max_bytes',0),row.get('descriptors_per_submit',1),row.get('warmup_blocks',0))
+    for key in sorted({group_key(r) for r in rows}):
+        path,case,requested_mode,page_mode,direction,size,pattern,window,seed,mode,depth,instrumentation,max_bytes,descriptors,warmup=key
+        group = [r for r in rows if group_key(r)==key]
         latencies = [s['write_request_e2e_ns'] for r in group for s in r.get('requests') or []]
         complete = all(r['latency_available'] for r in group)
         item = dict(path_mode=path,experiment_case=case,requested_page_mode=requested_mode,
+            submission_mode=mode,pipeline_depth=depth,pipeline_instrumentation=instrumentation,
+            pipeline_max_bytes=max_bytes,descriptors_per_submit=descriptors,warmup_blocks=warmup,
+            cpu_core_equivalents=(sum(r['sender_process_cpu_ns'] for r in group)/
+                sum(r['sender_write_loop_ns'] for r in group)) if all(r.get('sender_process_cpu_ns') is not None for r in group) else None,
             mr_page_mode=page_mode,direction=direction,block_bytes=size,trials=len(group),
             access_pattern=pattern,window_bytes=window,random_seed=seed,
             offset_slots=window//size,degenerate_one_slot=window//size==1,
@@ -259,7 +273,9 @@ def write_report(output, rows):
         writer=csv.DictWriter(stream,fieldnames=list(aggregates[0]))
         writer.writeheader(); writer.writerows(aggregates)
     text = ['# WRITE benchmark result','',
-        'Scope: TRANSFER_ONLY. Serial logical WRITE → terminal drain. No GPU/serving claim.',
+        ('Scope: TRANSFER_ONLY. Native serialization versus bounded batched WRITE. Request completion is containing-operation gather, not individual WR latency.'
+         if any(r.get('submission_mode') for r in rows) else
+         'Scope: TRANSFER_ONLY. Serial logical WRITE → terminal drain. No GPU/serving claim.'),
         'Throughput = total measured bytes / summed sender-loop time. GB/s is decimal.',
         'Instrumented loop times include sample-collection overhead; legacy instrumentation is not established.',
         ('Diagnostic observer may read port counters during the loop; do not use these trials as final throughput.'
@@ -273,7 +289,7 @@ def write_report(output, rows):
         '|---|---:|---:|---:|---:|---:|---|']
     for r in aggregates:
         latency = ' / '.join(f"{r[k]:.3f}" for k in ('write_p50_us','write_p95_us','write_p99_us')) if r['latency_available'] else 'UNAVAILABLE'
-        text.append(f"| {r['experiment_case'] or r['path_mode']} / {r['mr_page_mode']} {r['direction']} [{r['access_pattern']}, W={r['window_bytes']} B, seed={r['random_seed']}] | {r['block_bytes']/2**20:g} | {r['trials']} | "
+        text.append(f"| {r['experiment_case'] or r['path_mode']} / {r['mr_page_mode']} {r['direction']} [{r['submission_mode']}, depth={r['pipeline_depth']}, {r['pipeline_instrumentation']}; {r['access_pattern']}, W={r['window_bytes']} B, seed={r['random_seed']}] | {r['block_bytes']/2**20:g} | {r['trials']} | "
                     f"{r['loop_ms_p50']:.2f} | {r['GBps']:.2f} | {r['request_samples']} | {latency} |")
     text.extend(['','Checksum scope: final validated window/covered ranges, not every transient overwrite.',
                  'Per-trial rate dispersion is in summary.csv; no confidence interval is inferred from correlated requests.',

@@ -1,5 +1,14 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+add_executable(write_diagnostics_test write_diagnostics_test.cpp)
+target_include_directories(write_diagnostics_test PRIVATE ../include)
+add_test(NAME write_diagnostics_test COMMAND write_diagnostics_test)
+add_executable(write_pipeline_test write_pipeline_test.cpp)
+target_include_directories(write_pipeline_test PRIVATE ../include)
+target_compile_features(write_pipeline_test PRIVATE cxx_std_17)
+target_compile_options(write_pipeline_test PRIVATE -UNDEBUG)
+add_test(NAME write_pipeline_test COMMAND write_pipeline_test)
+
 if(USE_HIP)
   file(GLOB TEST_SOURCES "*.cpp")
   hipify_files(TEST_SOURCES)

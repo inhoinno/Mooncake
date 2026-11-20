@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serial NUMA-memory RDMA WRITE. No device-DAX mmap or Store access."""
+"""Native NUMA-memory RDMA WRITE controls and bounded pipeline. No DAX mmap or Store access."""
 import argparse
 import ctypes
 import ctypes.util
@@ -20,10 +20,95 @@ from urllib.parse import urlparse
 
 from callosum_runtime import config, require, rpc, server
 from callosum_transport_benchmark import SIZES, TOTAL_BYTES, block_bytes, write_loop, ACCESS_PATTERNS, access_strategy, written_ranges, final_window_digest
-from callosum_transport_benchmark import diagnostic_write_loop
+from callosum_transport_benchmark import diagnostic_write_loop, rdma_snapshot, rdma_inventory, sample_rdma, rdma_trial_progress, pipeline_write_loop, sampled_slice_latencies
 from callosum_benchmark_report import write_report, write_request_csv, enrich_trial
 
 NUMA_BACKINGS = {'dram': 'anonymous_dram', 'cxl-system-ram': 'anonymous_cxl_system_ram'}
+
+
+def load_profile(path):
+    """Shared configuration for the existing launcher's native 1:1 workflow."""
+    p = json.loads(Path(path).read_text())
+    require(isinstance(p,dict) and all(isinstance(p.get(k),dict)
+            for k in ('nodes','benchmark','handoff')),'JSON requires nodes, benchmark and handoff objects')
+    require(all(isinstance(n,dict) for n in p['nodes'].values()),'node settings must be objects')
+    errors = []
+    def check(ok, message):
+        if not ok: errors.append(message)
+    check(p.get('schema_version') == 1 and p.get('experiment') in ('cxl_ddr_1to1','numa_rdma_1to1'),
+          'expected schema_version=1, experiment=numa_rdma_1to1 (or legacy cxl_ddr_1to1)')
+    source, receiver = p.get('source'), p.get('receiver')
+    nodes = p.get('nodes',{})
+    check(source in ('a1','a2','b1','b2') and receiver in ('a1','a2','b1','b2') and
+          source != receiver and set(nodes) == {source,receiver}, 'select exactly two distinct endpoint IDs')
+    from ipaddress import IPv4Address
+    import re
+    for name,n in nodes.items():
+        try: IPv4Address(n.get('ip',''))
+        except (ValueError,TypeError): errors.append(f'{name}.ip must be IPv4')
+        check(isinstance(n.get('rdma_device'),str) and bool(re.fullmatch(r'[A-Za-z0-9_.-]+',n['rdma_device'])),
+              f'{name}.rdma_device is required')
+        check(type(n.get('numa_node')) is int and n['numa_node'] >= 0,
+              f'{name}.numa_node must be an inventoried memory NUMA node number')
+        backing = n.get('backing','cxl-system-ram' if p.get('experiment')=='cxl_ddr_1to1' else None)
+        check(backing in NUMA_BACKINGS,f'{name}.backing must be dram or cxl-system-ram')
+        check(p.get('experiment')!='cxl_ddr_1to1' or backing=='cxl-system-ram',
+              'legacy cxl_ddr_1to1 cannot label ordinary DRAM as CXL; use numa_rdma_1to1')
+    check(len({str(n.get('ip')) for n in nodes.values()}) == 2,'two distinct host IPs required')
+    b = p.get('benchmark',{})
+    sizes = b.get('sizes_mib',[])
+    check(isinstance(sizes,list) and bool(sizes) and all(type(s) is int and s in SIZES for s in sizes) and
+          len(set(sizes)) == len(sizes),'sizes_mib must be unique supported powers of two')
+    for key,low,high in (('repetitions',1,4),('pipeline_depth',1,4096),
+                         ('descriptors_per_submit',1,1024),('warmup_blocks',0,16),
+                         ('control_port',1,65535),('te_port',1,65535),('random_seed',0,2**63-1)):
+        check(type(b.get(key)) is int and low <= b[key] <= high,f'benchmark.{key} outside bounds')
+    for key in ('window_bytes','pipeline_max_bytes'):
+        check(type(b.get(key)) is int and 4096 <= b[key] <= 1<<40 and b[key]%4096 == 0,
+              f'benchmark.{key} must be positive page-aligned bytes')
+    if sizes and all(type(s) is int for s in sizes):
+        check(all(type(b.get(k)) is int and b[k] >= max(sizes)*(1<<20)
+                  for k in ('window_bytes','pipeline_max_bytes')),'window and byte credit must fit the largest block')
+    check(b.get('control_port') != b.get('te_port'),'control and TE ports must differ')
+    check(b.get('access_pattern') in ACCESS_PATTERNS,'unsupported access_pattern')
+    check(b.get('instrumentation') in ('off','counters','sampled'),'unsupported instrumentation')
+    check(type(b.get('sample_queues')) is bool and
+          (not b['sample_queues'] or b.get('instrumentation') != 'off'),'queue samples need counters/sampled')
+    env = p.get('transport_env',{})
+    require(isinstance(env,dict),'transport_env must be an object')
+    check(set(env) <= {'MC_MTU','MC_GID_INDEX'},'transport_env supports only explicit MC_MTU/MC_GID_INDEX')
+    check(all(isinstance(v,str) and v.isdecimal() for v in env.values()),'transport settings must be decimal strings')
+    if 'MC_MTU' in env:
+        check(env['MC_MTU'] in ('512','1024','2048','4096'),'MC_MTU must be 512/1024/2048/4096')
+    if 'MC_GID_INDEX' in env:
+        check(isinstance(env['MC_GID_INDEX'],str) and env['MC_GID_INDEX'].isdecimal() and
+              int(env['MC_GID_INDEX']) < 256,'MC_GID_INDEX must be 0..255')
+    h = p.get('handoff',{})
+    check(isinstance(h.get('ssh_target'),str) and bool(re.fullmatch(r'[A-Za-z0-9_.@-]+',h['ssh_target'])) and
+          not h['ssh_target'].startswith('-'),'handoff.ssh_target must be an explicit authorized SSH target')
+    check(type(h.get('ssh_port')) is int and 1 <= h['ssh_port'] <= 65535,'handoff.ssh_port outside bounds')
+    check(isinstance(h.get('checkout'),str) and bool(re.fullmatch(r'[A-Za-z0-9_./-]+',h['checkout'])) and
+          not Path(h['checkout']).is_absolute() and '..' not in Path(h['checkout']).parts,
+          'handoff.checkout must be a safe path relative to the peer home')
+    check(set(p) <= {'schema_version','experiment','source','receiver','nodes','benchmark','transport_env','handoff'},
+          'unknown profile field')
+    check(set(b) <= {'sizes_mib','repetitions','window_bytes','access_pattern','random_seed',
+                    'pipeline_depth','pipeline_max_bytes','descriptors_per_submit','instrumentation',
+                    'sample_queues','warmup_blocks','control_port','te_port'},'unknown benchmark field')
+    check(set(h) <= {'ssh_target','ssh_port','checkout'},'unknown handoff field')
+    check(all(set(n) <= {'ip','rdma_device','numa_node','backing'} for n in nodes.values()),'unknown node field')
+    require(not errors,'Invalid NUMA transport JSON: ' + '; '.join(errors))
+    return p
+
+
+def profile_transport(p):
+    """Normalize endpoints only; do not invent DAX paths, pools or a master."""
+    b = p['benchmark']
+    return dict(mode='rdma',numa_profile=True,
+        fingerprint=hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest(),
+        nodes=[dict(id=k,pool=k,url=f"http://{n['ip']}:{b['control_port']}",
+                    te_endpoint=f"{n['ip']}:{b['te_port']}",rdma_device=n['rdma_device'],
+                    can_send=k==p['source'],can_receive=k==p['receiver']) for k,n in p['nodes'].items()])
 
 
 def numa_path(sender, receiver):
@@ -257,6 +342,7 @@ class Receiver:
         self.memory, self.output = memory, Path(output)
         self.lock = threading.Lock()
         self.state, self.attempt, self.sealed = 'IDLE', None, False
+        self.completed_trials, self.finished = 0, False
         self.seen = set()
         self.description = dict(node_id=node_id, peer_id=peer_id, fingerprint=fingerprint,
                                 epoch=secrets.token_hex(16), segment=segment,
@@ -275,6 +361,14 @@ class Receiver:
                 require(self.state=='IDLE','active/quarantined receiver cannot be sealed or stopped')
                 self.sealed=True
                 return dict(sealed=True,state='IDLE',epoch=self.description['epoch'])
+            if method == 'finish':
+                require(d.get('fingerprint')==self.description['fingerprint'] and
+                        d.get('sender')==self.description['peer_id'] and
+                        type(d.get('trials')) is int and d['trials']>0 and
+                        self.completed_trials==d['trials'] and self.state=='IDLE',
+                        'cleanup requires all expected verified trials and an idle receiver')
+                self.sealed, self.finished = True, True
+                return dict(sealed=True,state='IDLE',completed_trials=self.completed_trials)
             if method == 'prepare':
                 require(not self.sealed and self.state == 'IDLE', 'receiver is busy or quarantined')
                 require(d['fingerprint'] == self.description['fingerprint'] and
@@ -312,6 +406,7 @@ class Receiver:
                     self.state = 'QUARANTINED'
                     raise
                 self.state = 'IDLE'
+                self.completed_trials += 1
                 return result
             if method == 'quarantine':
                 self.state = 'QUARANTINED'
@@ -370,7 +465,9 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
         require(window<=min(memory.capacity,health['capacity']),'access window exceeds existing DRAM MR; no resize')
         require(length <= health['capacity'], 'receiver window is smaller than the requested block')
         expected = memory.digest(length)
-        for index in range(args.repetitions):
+        requested_mode=getattr(args,'submission_mode',None)
+        modes=['serialization','batched'] if requested_mode=='compare' else [requested_mode]
+        for index,mode in ((i,m) for i in range(args.repetitions) for m in modes):
             identity = secrets.token_hex(16)
             protocol_wall_start = time.time_ns()
             protocol_start = time.monotonic_ns()
@@ -393,12 +490,37 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                 require(write(memory.address, target['remote_base'], length) == length,
                         'short warmup WRITE')
             samples = []
+            tracking = bool(getattr(args,'sample_queues',False) or (mode and args.pipeline_instrumentation!='off'))
+            monitor = None
+            if tracking:
+                before_rdma = rdma_snapshot(engine)
+                require(before_rdma['contexts'] and all(x['tracked'] and x.get('diagnostic_version',0)>=2
+                        for x in before_rdma['contexts']),
+                        'queue samples require rebuilt diagnostic v2 and MC_TRACK_RDMA_POSTED_SLICES=1 at startup')
+                queue, stop = [], threading.Event()
+                monitor = threading.Thread(target=sample_rdma,args=(engine,stop,queue)) if getattr(args,'sample_queues',False) else None
             try:
                 target_ready = time.monotonic_ns()
-                if getattr(args,'paired_gate',None):
+                if getattr(args,'paired_gate',None) and not mode:
                     pair_barrier(args.paired_gate,'ready',len(results),node['id'],args.local_partner)
                 released = time.monotonic_ns()
-                if getattr(args,'diagnose',None):
+                if monitor:
+                    monitor.start()
+                if mode:
+                    def ready():
+                        if getattr(args,'paired_gate',None):
+                            pair_barrier(args.paired_gate,'ready',len(results),node['id'],args.local_partner)
+                    def drained():
+                        if getattr(args,'paired_gate',None):
+                            pair_barrier(args.paired_gate,'drained',len(results),node['id'],args.local_partner)
+                    result=pipeline_write_loop(engine,target['segment'],memory.address,target['remote_base'],
+                        length,TOTAL_BYTES,samples,owner=memory,mode=mode,
+                        depth=args.pipeline_depth,byte_limit=args.pipeline_max_bytes,
+                        descriptors=args.descriptors_per_submit,instrumentation=args.pipeline_instrumentation,
+                        access_pattern=pattern,window_bytes=window,random_seed=seed,
+                        source_backing='numa-source-'+node['id'],destination_backing='numa-target-'+peer['id'],
+                        ready=ready,drained=drained)
+                elif getattr(args,'diagnose',None):
                     result = diagnostic_write_loop(engine,target['segment'],memory.address,target['remote_base'],
                         length,TOTAL_BYTES,length,samples,driver=args.diagnose,access_pattern=pattern,
                         window_bytes=window,random_seed=seed)
@@ -407,13 +529,31 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                                         getattr(args,'smoke_bytes',0) or TOTAL_BYTES, length,samples,
                                         access_pattern=pattern,window_bytes=window,random_seed=seed)
                 completed = time.monotonic_ns()
-                if getattr(args,'paired_gate',None):
+                if monitor:
+                    stop.set()
+                    monitor.join()
+                if getattr(args,'paired_gate',None) and not mode:
                     pair_barrier(args.paired_gate,'drained',len(results),node['id'],args.local_partner)
+                if tracking:
+                    after_rdma = rdma_snapshot(engine)
+                    result.update(sender_rnic_before=before_rdma,sender_rnic_after=after_rdma,
+                        sender_queue_samples=queue,queue_sample_cap_reached=len(queue)==4096,
+                        native_queue_progress=rdma_trial_progress(before_rdma,after_rdma,result['bytes']))
+                if mode and args.pipeline_instrumentation!='off':
+                    result['sender_inventory']=rdma_inventory(engine)
+                    if args.pipeline_instrumentation=='sampled':
+                        begin=result['sender_loop_start_monotonic_ns']
+                        result['sampled_slice_latencies']=sampled_slice_latencies(
+                            result['sender_inventory'],begin,begin+result['sender_write_loop_ns'])
                 observed=dict(result,status='PENDING_VALIDATION',attempt=identity,path_mode=path_mode,
                               sender_backing=backing,receiver_backing=peer_backing)
                 save(output/f'observed-{identity}.json',observed)
                 write_request_csv(output/f'observed-{identity}.csv',observed)
             except BaseException:
+                if monitor:
+                    stop.set()
+                    if monitor.ident is not None:
+                        monitor.join()
                 if getattr(args,'paired_gate',None):
                     (args.paired_gate/'abort').touch()
                 try:
@@ -440,7 +580,7 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                 require_remote_pages(health['placement'],verified['placement'],health['capacity'])
             result['protocol_e2e_ns'] = time.monotonic_ns()-protocol_start
             result['trial_phase_ns'] = dict(receiver_prepare=target_ready-protocol_start,
-                ready_gate=released-target_ready,
+                ready_gate=result.get('native_ready_gate_ns',released-target_ready),
                 transfer=result['sender_write_loop_ns'], post_transfer_gate_and_evidence=validation_start-completed,
                 verification=time.monotonic_ns()-validation_start)
             result['controller_start_unix_ns'] = protocol_wall_start
@@ -469,8 +609,9 @@ def sweep(engine, memory, c, node, peer, placement, args, output, safety=None):
                               sender_clock=dict(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                                                 time_namespace=os.readlink('/proc/self/ns/time')))
             result = enrich_trial(result)
-            save(output / f'block-{size}{args.unit}-rep-{index}.json', result)
-            write_request_csv(output/f'requests-{size}{args.unit}-rep-{index}.csv',result,len(results))
+            prefix=(mode+'-') if mode else ''
+            save(output / f'{prefix}block-{size}{args.unit}-rep-{index}.json', result)
+            write_request_csv(output/f'{prefix}requests-{size}{args.unit}-rep-{index}.csv',result,len(results))
             results.append(result)
             print(f"[PASS] {size} {args.unit} rep={index}: {result['GBps']:.3f} GB/s", flush=True)
     return results
@@ -518,9 +659,17 @@ def main():
     parser.add_argument('--repetitions', type=int, default=3)
     parser.add_argument('--warmup-blocks', type=int, default=0)
     parser.add_argument('--diagnose',choices=('python','native'))
+    parser.add_argument('--sample-queues',action='store_true',help='Diagnostic only; requires native tracking at startup')
+    parser.add_argument('--submission-mode',choices=('serialization','batched','compare'))
+    parser.add_argument('--pipeline-depth',type=int,default=4)
+    parser.add_argument('--pipeline-max-bytes',type=int,default=256<<20)
+    parser.add_argument('--descriptors-per-submit',type=int,default=1)
+    parser.add_argument('--pipeline-instrumentation',choices=('off','counters','sampled'),default='off')
     parser.add_argument('--smoke-bytes',type=int,default=0,
                         help='Explicit correctness-only byte count; not a performance trial')
     parser.add_argument('--output', required=True)
+    parser.add_argument('--auto-cleanup',action='store_true',
+                        help='After verified sender report, seal the idle receiver and release owned MRs')
     args = parser.parse_args()
     output = Path(args.output)
     stage = 'configuration'
@@ -528,6 +677,15 @@ def main():
     output_created = False
     try:
         require(sys.platform == 'linux', 'real DRAM RDMA benchmark requires Linux')
+        require(not args.sample_queues or args.diagnose or
+                (args.submission_mode and args.pipeline_instrumentation!='off'), 'queue samples require diagnostic instrumentation')
+        require(not args.submission_mode or (not args.diagnose and not args.smoke_bytes),
+                'native comparison uses full payload without legacy diagnostics/smoke')
+        require(0<args.pipeline_depth<=4096 and 0<args.pipeline_max_bytes<=1<<40 and
+                0<args.descriptors_per_submit<=1024,'invalid pipeline limits')
+        if args.submission_mode:
+            os.environ['MC_TRACK_RDMA_POSTED_SLICES']='0' if args.pipeline_instrumentation=='off' else '1'
+            os.environ['MC_SAMPLE_RDMA_WRITE_TRACE']='1' if args.pipeline_instrumentation=='sampled' else '0'
         require(not args.diagnose or (args.role=='sender' and not args.smoke_bytes and
                 not args.warmup_blocks), 'diagnostics require the full sender workload without warmup')
         args.peer_backing = args.peer_backing or args.backing
@@ -547,15 +705,17 @@ def main():
             require(args.role=='sender' and args.require_remote_numa and args.paired_gate.is_dir() and
                     args.local_partner!=args.node,'invalid paired sender rendezvous')
         receipt = setup_environment(args.setup_run)
-        c = config(args.config)
+        raw = json.loads(Path(args.config).read_text())
+        c = (profile_transport(load_profile(args.config))
+             if raw.get('experiment') in ('cxl_ddr_1to1','numa_rdma_1to1') else config(args.config))
         require(c['mode'] == 'rdma', 'DRAM control requires an RDMA manifest')
         nodes = {n['id']: n for n in c['nodes']}
         node, peer = nodes[args.node], nodes[args.peer]
         require(node['id'] != peer['id'] and node['pool'] != peer['pool'], 'select a cross-pool pair')
         require(node['can_receive' if args.role == 'receiver' else 'can_send'], 'capability disabled')
         control = f"http://{urlparse(node['url']).hostname}:{args.control_port}"
-        occupied = {urlparse(c['master']).port, *(urlparse(n['url']).port for n in c['nodes'])}
-        te_ports = {int(n['te_endpoint'].rsplit(':', 1)[1]) for n in c['nodes']}
+        occupied = set() if c.get('numa_profile') else {urlparse(c['master']).port, *(urlparse(n['url']).port for n in c['nodes'])}
+        te_ports = set() if c.get('numa_profile') else {int(n['te_endpoint'].rsplit(':', 1)[1]) for n in c['nodes']}
         require(args.control_port not in occupied | te_ports and args.te_port not in occupied | te_ports
                 and args.control_port != args.te_port, 'benchmark ports overlap campaign ports')
         secret = Path(args.token_file).read_text().strip()
@@ -587,6 +747,8 @@ def main():
         import mooncake.engine as engine_module
         import callosum_relay_native as native
         require(native.ABI_VERSION == 2, 'native relay ABI mismatch')
+        require(not args.submission_mode or hasattr(engine_module.TransferEngine,'relay_write_pipeline'),
+                'rebuild native pipeline binding before starting this experiment')
         require(Path(native.__file__).resolve().parent == Path(os.environ['CALLOSUM_NATIVE_BUILD']).resolve(),
                 'stale native module')
         require(Path(engine_module.__file__).resolve() ==
@@ -603,7 +765,7 @@ def main():
                 'engine initialization failed')
         require(engine.relay_rdma_available(), 'RDMA unavailable; no TCP fallback')
         require(engine.register_memory(memory.address, capacity) == 0, f'{args.backing} registration failed')
-        if args.backing=='cxl-system-ram':
+        if args.require_remote_numa:
             # Long-term pinning can migrate pages out of ZONE_MOVABLE. Verify
             # the registered mapping before exposing any receiver target.
             try:
@@ -612,7 +774,7 @@ def main():
                 require_remote_pages(placement,memory.page_evidence,capacity)
             except BaseException:
                 require(engine.unregister_memory(memory.address) == 0,
-                        'CXL residency failed after registration; local unregister also failed (no target exposed)')
+                        'NUMA residency failed after registration; local unregister also failed (no target exposed)')
                 memory.memory.close()
                 raise
         segment = endpoint.rsplit(':', 1)[0] + ':' + str(engine.get_rpc_port())
@@ -626,10 +788,14 @@ def main():
              software_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
              loop_sha256=hashlib.sha256(Path(__file__).with_name('callosum_transport_benchmark.py').read_bytes()).hexdigest(),
              transport_env={k:os.environ.get(k) for k in ('MC_MTU','MC_GID_INDEX','MC_NUM_QP_PER_EP')}))
+        if args.diagnose or args.sample_queues or (args.submission_mode and args.pipeline_instrumentation!='off'):
+            save(output/'transport-inventory.json',rdma_inventory(engine))
         if args.role == 'receiver':
             service = Receiver(memory, segment, node['id'], peer['id'], c['fingerprint'], placement, output,
                                peer_backing=args.peer_backing)
             http = server(control, service)
+            # Join request handlers before unregistering memory or exiting.
+            http.daemon_threads = False
             stopped = threading.Event()
             signal.signal(signal.SIGINT, lambda *_: stopped.set())
             signal.signal(signal.SIGTERM, lambda *_: stopped.set())
@@ -637,7 +803,9 @@ def main():
             threading.Thread(target=http.serve_forever, daemon=True).start()
             print(f'[READY] NUMA receiver {node["id"]} ({args.backing}) at {control}; evidence={output}', flush=True)
             while True:
-                stopped.wait()
+                stopped.wait(0.25)
+                if not stopped.is_set() and not service.finished:
+                    continue
                 if service.seal_if_idle():
                     http.shutdown()
                     http.server_close()
@@ -656,8 +824,13 @@ def main():
                 report = write_report(output,results)
                 save(output/'summary.json', dict(status='PASS', evidence_class='TRANSFER_ONLY',
                      path_mode=numa_path(args.backing,args.peer_backing), results=results, active_qps_verified=False,
-                     report=report,interpretation='Serial drained WRITE control; no saturation or serving claim.'))
+                     report=report,interpretation=(
+                         'Native serialization/batched comparison; no saturation or serving claim.'
+                         if args.submission_mode else 'Serial drained WRITE control; no saturation or serving claim.')))
                 print((output/'report.md').read_text(),flush=True)
+                if args.auto_cleanup:
+                    rpc(f"http://{urlparse(peer['url']).hostname}:{args.control_port}",'finish',
+                        dict(sender=node['id'],fingerprint=c['fingerprint'],trials=len(results)))
             except BaseException as error:
                 if safety.get('exposed'):
                     retain_uncertain(error, output)
@@ -665,6 +838,8 @@ def main():
         # Only normal, drained completion permits local unregister/free.
         require(engine.unregister_memory(memory.address) == 0, 'DRAM unregister failed')
         memory.memory.close()
+        if args.auto_cleanup:
+            print('[CLEANUP PASS] Owned memory unregistered; no active target retained.',flush=True)
     except Exception as error:
         if service is not None and not service.seal_if_idle():
             retain_uncertain(error, output)

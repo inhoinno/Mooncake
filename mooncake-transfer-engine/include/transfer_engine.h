@@ -161,6 +161,9 @@ class TransferEngine {
             delete;
 
         Status wait();
+        // Progress operation accounting, not the worker-owned hardware CQ.
+        // True means all tasks drained, including on terminal failure.
+        bool tryComplete(Status& status);
 
         // A wait timeout does not cancel the transfer. Keep this operation and
         // its CPU/GPU buffers alive until a later wait reaches completion.
@@ -175,6 +178,9 @@ class TransferEngine {
 
     ScatterTransferOperation submitScatter(
         const std::vector<ScatterTransferRange>& ranges);
+    ScatterTransferOperation submitScatterWithIds(
+        const std::vector<ScatterTransferRange>& ranges,
+        const std::vector<uint64_t>& request_ids);
     Status transferScatter(const std::vector<ScatterTransferRange>& ranges);
 
     Status submitTransferWithNotify(BatchID batch_id,

@@ -15,6 +15,8 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 
 #include <glog/logging.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <cassert>
 #include <cerrno>
@@ -986,8 +988,29 @@ int RdmaEndPoint::submitPostSend(
         cq_outstanding_->fetch_add(wr_count, std::memory_order_acq_rel);
         // Register before ringing the doorbell. A fast completion may otherwise
         // be polled before the diagnostic registry sees the slice.
-        context_.trackPostedSlices(slice_list, start, wr_count);
+        context_.trackPostedSlices(slice_list, start, wr_count, qp_list_[qp_index]->qp_num);
+        const auto post_begin=globalConfig().track_rdma_posted_slices ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
+        const auto post_end=globalConfig().track_rdma_posted_slices ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (globalConfig().track_rdma_posted_slices) {
+            // WR/SGE arrays remain owned here even if the poller has already
+            // completed and released a slice. Never inspect posted slices here.
+            const size_t accepted = !rc ? static_cast<size_t>(wr_count) :
+                (bad_wr ? static_cast<size_t>(bad_wr - wr_list.data()) : 0);
+            uint64_t wrs = 0, bytes = 0, rejected = 0, unknown = 0;
+            for (int i = 0; i < wr_count; ++i) {
+                if (wr_list[i].opcode != IBV_WR_RDMA_WRITE) continue;
+                if (static_cast<size_t>(i) < accepted) {
+                    ++wrs;
+                    bytes += sge_list[i].length;
+                } else if (bad_wr) ++rejected;
+                else ++unknown;
+            }
+            context_.recordWritePost(qp_list_[qp_index]->qp_num, wrs, bytes,
+                                      rejected, unknown, static_cast<uint64_t>(syscall(SYS_gettid)),
+                                      peer_nic_path_,std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          post_end-post_begin).count());
+        }
         if (rc) {
             LOG(ERROR) << "Failed to ibv_post_send: " << strerror(rc);
             const size_t first_failed =

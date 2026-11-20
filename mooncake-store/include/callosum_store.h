@@ -30,6 +30,10 @@ struct CallosumStoreConfig {
     uint64_t wait_ms = 30000;
     uint64_t mux_capacity = 2;
     uint64_t mux_queue_limit = 32;
+    // Opt-in transport pipeline. Zero preserves the existing drained batches.
+    uint64_t write_pipeline_depth = 0;
+    uint64_t write_pipeline_bytes = 64ULL << 20;
+    uint64_t write_pipeline_descriptors = 1;
 
     static std::unique_ptr<CallosumStoreConfig> Load();
     std::shared_ptr<CxlPoolBackend> Map() const;

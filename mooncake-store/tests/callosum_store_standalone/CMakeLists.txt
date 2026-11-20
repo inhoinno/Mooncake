@@ -14,11 +14,12 @@ target_compile_features(callosum_store_adapter_test PRIVATE cxx_std_20)
 target_include_directories(callosum_store_adapter_test BEFORE PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/fixtures" fixtures ../../include
   ../../../mooncake-common/include
+  ../../../mooncake-transfer-engine/include
   ../../../extern/yalantinglibs/include
   ../../../extern/yalantinglibs/include/ylt/thirdparty
   ../../../extern/yalantinglibs/include/ylt/standalone)
 target_link_libraries(callosum_store_adapter_test PRIVATE Threads::Threads)
-foreach(category preflight function request_lifecycle store_mux_integration native_mux_function native_mux_fifo native_mux_progress_cancel queued_target_revalidation failure status)
+foreach(category preflight function request_lifecycle store_mux_integration native_mux_function native_mux_fifo native_mux_progress_cancel queued_target_revalidation bidirectional failure status)
   add_test(NAME callosum_store_${category}
     COMMAND callosum_store_adapter_test ${category})
   set_tests_properties(callosum_store_${category} PROPERTIES

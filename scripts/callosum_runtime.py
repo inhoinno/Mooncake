@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 from callosum_dispatch import SourceDispatcher, partition_source
 from callosum_initiation import CacheMiss
 from callosum_transport_benchmark import block_bytes, write_loop, TOTAL_BYTES, access_strategy, written_ranges, ACCESS_PATTERNS
-from callosum_transport_benchmark import MIXED_WRITE, mixed_device_info, diagnostic_write_loop, rdma_snapshot, sample_rdma
+from callosum_transport_benchmark import MIXED_WRITE, mixed_device_info, diagnostic_write_loop, rdma_snapshot, sample_rdma, rdma_inventory, pipeline_write_loop, sampled_slice_latencies
 from callosum_transport_benchmark import rdma_trial_progress
 
 RUNTIME_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -384,6 +384,8 @@ class Agent:
                                                      hasattr(self.engine,'relay_write_block_profiled') and
                                                      hasattr(self.engine,'relay_rdma_snapshot')),
                     transport_diagnostic_tracking=os.environ.get('MC_TRACK_RDMA_POSTED_SLICES','0').lower() in ('1','true'),
+                    native_pipeline_version=int(hasattr(self.engine,'relay_write_pipeline')) if self.engine else 0,
+                    native_slice_trace=os.environ.get('MC_SAMPLE_RDMA_WRITE_TRACE','0').lower() in ('1','true'),
                     transport_access_patterns=list(ACCESS_PATTERNS),
                     transport_env={k:os.environ.get(k) for k in ('MC_MTU','MC_GID_INDEX')},
                     mr_pages=self.mapping.page_evidence,
@@ -423,7 +425,8 @@ class Agent:
             return dict(node=self.node['id'], pid=os.getpid(),
                         cpu_affinity=sorted(os.sched_getaffinity(0)),
                         mapped_device=self.node['path'], mr=self.mapping.page_evidence,
-                        contexts=self.engine.relay_rdma_snapshot())
+                        contexts=self.engine.relay_rdma_snapshot(),
+                        inventory=rdma_inventory(self.engine))
         if method == 'transport_write_loop':
             started = time.monotonic_ns()
             require(self.engine is not None and self.node['can_send'],
@@ -452,6 +455,7 @@ class Agent:
                 source, destination = self.mapping.address + extent['offset'], target['remote_base']
                 limit = self.c.get('max_inflight_bytes',64*1024**2)
                 options = dict(access_pattern=pattern,window_bytes=window,random_seed=d.get('random_seed',0))
+                pipeline_mode = d.get('submission_mode')
                 if driver:
                     before = rdma_snapshot(self.engine)
                     require(not d.get('sample_queues') or
@@ -461,6 +465,18 @@ class Agent:
                     monitor = threading.Thread(target=sample_rdma,args=(self.engine,stop,queue)) if d.get('sample_queues') else None
                 else:
                     monitor = None
+                warmup=d.get('warmup_blocks',0)
+                require(type(warmup) is int and 0<=warmup<=16,'invalid warmup count')
+                for _ in range(warmup):
+                    require(self.engine.relay_write_batch_drained([target['segment']],[source],[destination],
+                            [d['block_bytes']])[0]==d['block_bytes'],'short warmup WRITE')
+                pipeline_observe = bool(pipeline_mode and d.get('pipeline_instrumentation','off')!='off')
+                if pipeline_observe:
+                    before=rdma_snapshot(self.engine)
+                    require(before['contexts'] and all(x['tracked'] and x.get('diagnostic_version',0)>=2
+                            for x in before['contexts']),'pipeline counters require rebuilt tracked sender')
+                    stop=threading.Event()
+                    monitor=threading.Thread(target=sample_rdma,args=(self.engine,stop,queue)) if d.get('sample_queues') else None
                 ready = time.monotonic_ns()
                 group = d.get('trial_group')
                 def rendezvous(phase):
@@ -468,8 +484,26 @@ class Agent:
                         rpc(self.c['master'],'transport_trial_phase',
                             dict(group=group,node=self.node['id'],attempt=d['transfer_id'],phase=phase),
                             timeout=120 if phase=='ready' else 900)
-                rendezvous('ready')
-                if driver:
+                if not pipeline_mode:
+                    rendezvous('ready')
+                if pipeline_mode:
+                    def pipeline_ready():
+                        rendezvous('ready')
+                        if monitor: monitor.start()
+                    try:
+                        result = pipeline_write_loop(self.engine,target['segment'],source,destination,
+                            d['block_bytes'],TOTAL_BYTES,samples,owner=self.mapping,mode=pipeline_mode,
+                            depth=d.get('pipeline_depth',4),byte_limit=d.get('pipeline_max_bytes',256<<20),
+                            descriptors=d.get('descriptors_per_submit',1),
+                            instrumentation=d.get('pipeline_instrumentation','off'),
+                            source_backing=extent['pool'],destination_backing=target['extent']['pool'],
+                            source_offset=extent['offset'],destination_offset=target['extent']['offset'],
+                            ready=pipeline_ready,drained=lambda:rendezvous('drained'),**options)
+                    finally:
+                        if monitor:
+                            stop.set()
+                            if monitor.ident is not None: monitor.join()
+                elif driver:
                     if monitor:
                         monitor.start()
                     try:
@@ -493,7 +527,19 @@ class Agent:
                         d['block_bytes'],TOTAL_BYTES,limit,samples,**options)
                 # Hold artifact writes and checksum RPCs until every sender
                 # has positively drained, not merely the sender for this pair.
-                rendezvous('drained')
+                if not pipeline_mode:
+                    rendezvous('drained')
+                result.update(warmup_blocks=warmup,warmup_bytes=warmup*d['block_bytes'])
+                if pipeline_observe:
+                    after=rdma_snapshot(self.engine)
+                    result.update(sender_rnic_before=before,sender_rnic_after=after,sender_queue_samples=queue,
+                        native_queue_progress=rdma_trial_progress(before,after,result['bytes']))
+                if driver or pipeline_observe:
+                    result['sender_inventory'] = rdma_inventory(self.engine)
+                    if d.get('pipeline_instrumentation')=='sampled':
+                        begin=result['sender_loop_start_monotonic_ns']
+                        result['sampled_slice_latencies']=sampled_slice_latencies(
+                            result['sender_inventory'],begin,begin+result['sender_write_loop_ns'])
                 if group:
                     result['trial_group'] = group
                 from callosum_benchmark_report import write_request_csv
@@ -865,6 +911,10 @@ class Master:
                     benchmark_request_timing_versions={i:json.loads(v).get('transport_request_timing_version',0)
                         for i,v in self.db.execute('SELECT id,descriptor FROM members')},
                     synchronized_transport_version=1,
+                    benchmark_pipeline_versions={i:json.loads(v).get('native_pipeline_version',0)
+                        for i,v in self.db.execute('SELECT id,descriptor FROM members')},
+                    benchmark_slice_trace={i:json.loads(v).get('native_slice_trace',False)
+                        for i,v in self.db.execute('SELECT id,descriptor FROM members')},
                     benchmark_diagnostic_versions={i:json.loads(v).get('transport_diagnostic_version',0)
                         for i,v in self.db.execute('SELECT id,descriptor FROM members')},
                     benchmark_diagnostic_tracking={i:json.loads(v).get('transport_diagnostic_tracking',False)
@@ -940,7 +990,8 @@ class Master:
                 all(n in nodes and nodes[n]['can_send'] for n in sources) and
                 all(n in nodes and nodes[n]['can_receive'] for n in receivers), 'invalid trial participants')
         match = ('block_size','block_unit','window_bytes','access_pattern','random_seed',
-                 'diagnostic_driver','sample_queues')
+                 'diagnostic_driver','sample_queues','submission_mode','pipeline_depth',
+                 'pipeline_max_bytes','descriptors_per_submit','pipeline_instrumentation','warmup_blocks')
         require(all(tuple(p.get(k) for k in match)==tuple(pairs[0].get(k) for k in match)
                     for p in pairs), 'paired trial settings differ')
         members = {n['id']:n for n in self.members()}
@@ -1034,6 +1085,8 @@ class Master:
                 transfer_id=identity,target_plan_id=plan_id,source=source,target=target,block_bytes=block,
                 access_pattern=pattern,window_bytes=window,random_seed=d.get('random_seed',0),
                 diagnostic_driver=driver,sample_queues=d.get('sample_queues',False),
+                **{k:d[k] for k in ('submission_mode','pipeline_depth','pipeline_max_bytes',
+                    'descriptors_per_submit','pipeline_instrumentation','warmup_blocks') if k in d},
                 **({'trial_group':group.identity} if group else {})), timeout=1000 if group else 900)
             verify_start = time.monotonic_ns()
             require(result['bytes'] == TOTAL_BYTES and result['block_bytes'] == block,
@@ -1053,7 +1106,8 @@ class Master:
                 require(rpc(receiver['url'],'digest',destination_range,timeout=300)==expected,
                         'baseline destination checksum mismatch')
             verified = time.monotonic_ns()
-            receiver_inventory = (rpc(receiver['url'],'transport_diagnostic_inventory') if driver else None)
+            receiver_inventory = (rpc(receiver['url'],'transport_diagnostic_inventory') if driver or
+                (d.get('submission_mode') and d.get('pipeline_instrumentation','off')!='off') else None)
             observed = time.monotonic_ns()
             with self.lock:
                 self.operation(identity, 'DRAINED_RETAINED', dict(source=source,
@@ -1262,6 +1316,12 @@ def main():
     parser.add_argument('--random-seed',type=int,default=0)
     parser.add_argument('--diagnose',choices=('python','native'))
     parser.add_argument('--sample-queues',action='store_true')
+    parser.add_argument('--submission-mode',choices=('serialization','batched'))
+    parser.add_argument('--pipeline-depth',type=int,default=4)
+    parser.add_argument('--pipeline-max-bytes',type=int,default=256<<20)
+    parser.add_argument('--descriptors-per-submit',type=int,default=1)
+    parser.add_argument('--pipeline-instrumentation',choices=('off','counters','sampled'),default='off')
+    parser.add_argument('--warmup-blocks',type=int,default=0)
     args = parser.parse_args()
     c = config(args.config)
     import callosum_relay_native as native
@@ -1322,7 +1382,9 @@ def main():
             key=args.key,block_size=args.block_size,block_unit=args.block_unit,
             access_pattern=args.access_pattern,window_bytes=args.access_window_bytes,
             random_seed=args.random_seed,diagnostic_driver=args.diagnose,
-            sample_queues=args.sample_queues),timeout=1200)
+            sample_queues=args.sample_queues,**({k:getattr(args,k) for k in ('submission_mode',
+                'pipeline_depth','pipeline_max_bytes','descriptors_per_submit','pipeline_instrumentation','warmup_blocks')}
+                if args.submission_mode else {})),timeout=1200)
         result['requester_rpc_ns'] = time.monotonic_ns()-start
         result['controller_start_unix_ns'] = wall_start
         result['controller_end_unix_ns'] = time.time_ns()

@@ -17,6 +17,17 @@ import callosum_dram_benchmark as bench
 import callosum_runtime as runtime
 
 
+def profile_fixture():
+    return dict(schema_version=1,experiment='cxl_ddr_1to1',source='a1',receiver='b1',
+        nodes={n:dict(ip=ip,rdma_device='fake0',numa_node=None)
+               for n,ip in [('a1','192.0.2.1'),('b1','192.0.2.2')]},
+        benchmark=dict(sizes_mib=[128],repetitions=3,window_bytes=256<<20,
+            access_pattern='sequential',random_seed=0,pipeline_depth=2,pipeline_max_bytes=256<<20,
+            descriptors_per_submit=1,instrumentation='off',sample_queues=False,warmup_blocks=1,
+            control_port=19201,te_port=19401),transport_env={},
+        handoff=dict(ssh_target=None,ssh_port=22,checkout='project/callosum'))
+
+
 class FakeMemory:
     def __init__(self, capacity=8192, node=0, page_mode='native', *, backing='dram'):
         self.capacity, self.node, self.placement = capacity, node, {}
@@ -29,6 +40,85 @@ class FakeMemory:
 
 
 class DramBenchmarkTest(unittest.TestCase):
+    def test_json_profile_has_real_numa_endpoints_without_fake_dax(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'profile.json'
+            p=profile_fixture()
+            path.write_text(json.dumps(p))
+            with self.assertRaisesRegex(RuntimeError,'a1.numa_node.*b1.numa_node.*ssh_target'):
+                bench.load_profile(path)
+            for node in p['nodes'].values(): node['numa_node']=2
+            p['handoff']['ssh_target']='operator@receiver'
+            path.write_text(json.dumps(p))
+            c=bench.profile_transport(bench.load_profile(path))
+            self.assertNotIn('pools',c)
+            self.assertNotIn('master',c)
+            self.assertTrue(all('path' not in n for n in c['nodes']))
+            for key,value in (('pipeline_depth',True),('window_bytes',4096),('instrumentation','bogus')):
+                bad=json.loads(json.dumps(p));bad['benchmark'][key]=value
+                path.write_text(json.dumps(bad))
+                with self.assertRaises(RuntimeError): bench.load_profile(path)
+            p['experiment']='numa_rdma_1to1'
+            for node in p['nodes'].values(): node['backing']='dram'
+            path.write_text(json.dumps(p))
+            self.assertEqual(bench.load_profile(path)['nodes']['a1']['backing'],'dram')
+            p['nodes']['a1']['backing']='devdax'
+            path.write_text(json.dumps(p))
+            with self.assertRaisesRegex(RuntimeError,'backing must be'): bench.load_profile(path)
+
+    def test_receiver_cleanup_requires_verified_count_and_idle_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory=FakeMemory()
+            try:
+                service=bench.Receiver(memory,'segment','b1','a1','fp',{},directory)
+                finish=dict(sender='a1',fingerprint='fp',trials=1)
+                with self.assertRaises(RuntimeError): service.handle('finish',finish)
+                self.assertFalse(service.sealed)
+                service.completed_trials=1
+                service.state='QUARANTINED'
+                with self.assertRaises(RuntimeError): service.handle('finish',finish)
+                service.state='ACTIVE'
+                with self.assertRaises(RuntimeError): service.handle('finish',finish)
+                service.state='IDLE'
+                with self.assertRaises(RuntimeError): service.handle('finish',dict(finish,fingerprint='old'))
+                self.assertTrue(service.handle('finish',finish)['sealed'])
+                self.assertTrue(service.handle('finish',finish)['sealed'])
+                self.assertTrue(service.finished)
+            finally:memory.memory.close()
+
+    def test_native_comparison_crosses_real_sweep_receiver_and_reports_both_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=FakeMemory(2<<20);target=FakeMemory(2<<20)
+            service=bench.Receiver(target,'target','a1','b1','fp',{},root)
+            modes=[]
+            def native(segment,sources,destinations,lengths,so,do,sb,db,mode,depth,budget,descriptors,instrumentation,owner,ready,drained):
+                self.assertIs(owner,source)
+                ready();modes.append(mode);start=bench.time.monotonic_ns();samples=[]
+                for i,(src,dst,length) in enumerate(zip(sources,destinations,lengths)):
+                    begin=bench.time.monotonic_ns()-start
+                    ctypes.memmove(dst,src,length)
+                    samples.append((i,i,begin,bench.time.monotonic_ns()-start,True))
+                elapsed=bench.time.monotonic_ns()-start
+                drained()
+                return dict(success=True,bytes=sum(lengths),start_ns=start,duration_ns=elapsed,
+                            operations=len(lengths),samples=samples,trace=[],process_cpu_ns=1)
+            args=SimpleNamespace(control_port=19201,page_mode='native',sizes=[1],unit='MiB',repetitions=1,
+                warmup_blocks=0,access_pattern='sequential',access_window_bytes=2<<20,random_seed=0,
+                submission_mode='compare',pipeline_depth=2,pipeline_max_bytes=2<<20,
+                descriptors_per_submit=1,pipeline_instrumentation='off')
+            try:
+                with patch.object(bench,'rpc',side_effect=lambda url,method,data=None,**kw:service.handle(method,data or {})), \
+                     patch.object(bench,'snapshot',return_value={}),patch.object(bench,'resident_pages',return_value={}), \
+                     patch.object(bench,'TOTAL_BYTES',(2<<20)+1),contextlib.redirect_stdout(io.StringIO()):
+                    rows=bench.sweep(SimpleNamespace(relay_write_pipeline=native),source,dict(fingerprint='fp'),
+                                     dict(id='b1'),dict(id='a1',url='http://a1'),{},args,root)
+                self.assertEqual(modes,['serialization','batched'])
+                self.assertEqual([r['bytes'] for r in rows],[(2<<20)+1]*2)
+                self.assertTrue(all(r['receiver']['status']=='PASS' for r in rows))
+                self.assertEqual(service.state,'IDLE')
+                self.assertEqual(len(list(root.glob('*block-*.json'))),2)
+            finally:source.memory.close();target.memory.close()
+
     def test_dram_sweep_strategies_use_fixed_mr_and_verify_random_holes_and_tail(self):
         for pattern in ('overwrite','sequential','uniform_random'):
             with self.subTest(pattern=pattern),tempfile.TemporaryDirectory() as directory:
@@ -422,7 +512,7 @@ class DramBenchmarkTest(unittest.TestCase):
             argv = ['dram-benchmark','--role','sender','--node','b1','--peer','a1',
                     '--config',str(config),'--token-file',str(private),'--setup-run',str(root),
                     '--control-port',str(http.server_address[1]),'--sizes','1','--repetitions','1',
-                    '--output',str(root/'output')]
+                    '--output',str(root/'output'),'--auto-cleanup']
             try:
                 with patch.dict(os.environ, CALLOSUM_NATIVE_BUILD=str(native_path.parent)), \
                      patch.dict(bench.sys.modules, {'mooncake':package,'mooncake.engine':engine_module,
@@ -441,10 +531,69 @@ class DramBenchmarkTest(unittest.TestCase):
                         self.assertEqual(bench.main(), 1)
                     self.assertEqual(previous, {p.name:p.read_bytes() for p in (root/'output').iterdir()})
                 self.assertTrue(instances[0].unregistered)
+                self.assertTrue(service.finished and service.sealed)
                 summary = json.loads((root/'output/summary.json').read_text())
                 self.assertEqual(summary['results'][0]['native_calls'],1)
                 self.assertTrue((root/'output/summary.csv').is_file())
                 self.assertNotIn(private.read_text(), (root/'output/environment.json').read_text())
+                # Exercise the NEW profile -> actual CLI/main -> both native modes
+                # -> real receiver verification/finish, replacing only hardware/RPC seams.
+                for backing in ('cxl-system-ram','dram'):
+                    profile=profile_fixture()
+                    profile.update(experiment='numa_rdma_1to1',source='b1',receiver='a1')
+                    for name,node in profile['nodes'].items():
+                        node.update(ip='127.0.0.1' if name=='a1' else '127.0.0.2',numa_node=0,backing=backing)
+                    profile['handoff']['ssh_target']='operator@receiver'
+                    profile['benchmark'].update(sizes_mib=[1],repetitions=1,window_bytes=1<<20,
+                        pipeline_max_bytes=1<<20,warmup_blocks=0,control_port=http.server_address[1])
+                    profile_path=root/'profile.json';profile_path.write_text(json.dumps(profile))
+                    (root/('profile-receiver-'+backing)).mkdir()
+                    memory.page_evidence['backing']=bench.NUMA_BACKINGS[backing]
+                    new_service=bench.Receiver(memory,'segment','a1','b1',bench.profile_transport(profile)['fingerprint'],
+                        {'memory_backing':backing},root/('profile-receiver-'+backing),peer_backing=backing)
+                    def pipeline(self,segment,sources,targets,lengths,so,do,sb,db,mode,depth,budget,
+                                 descriptors,instrumentation,owner,ready,drained):
+                        ready();start=bench.time.monotonic_ns();samples=[]
+                        for i,(src,dst,length) in enumerate(zip(sources,targets,lengths)):
+                            begin=bench.time.monotonic_ns()-start
+                            ctypes.memmove(dst,src,length)
+                            samples.append((i,i,begin,bench.time.monotonic_ns()-start,True))
+                        duration=bench.time.monotonic_ns()-start;drained()
+                        return dict(success=True,bytes=sum(lengths),start_ns=start,duration_ns=duration,
+                                    operations=len(samples),samples=samples,trace=[])
+                    Engine.relay_write_pipeline=pipeline
+                    profile_argv=list(argv)
+                    profile_argv[profile_argv.index('--config')+1]=str(profile_path)
+                    profile_argv[profile_argv.index('--output')+1]=str(root/('profile-output-'+backing))
+                    profile_argv+=['--require-remote-numa','--backing',backing,'--numa-node','0',
+                        '--access-window-bytes',str(1<<20),'--submission-mode','compare',
+                        '--pipeline-max-bytes',str(1<<20)]
+                    read_text,readlink=Path.read_text,os.readlink
+                    with patch.dict(os.environ,CALLOSUM_NATIVE_BUILD=str(native_path.parent)), \
+                         patch.dict(bench.sys.modules,{'mooncake':package,'mooncake.engine':engine_module,
+                                                      'callosum_relay_native':native}), \
+                         patch.object(bench.sys,'argv',profile_argv),patch.object(bench.sys,'platform','linux'), \
+                         patch.object(bench,'setup_environment',return_value={'build':str(root/'build')}), \
+                         patch.object(bench,'nic_placement',return_value={'memory_numa_node':0,'memory_backing':backing}), \
+                         patch.object(bench,'Memory',FakeMemory),patch.object(bench,'TOTAL_BYTES',1<<20), \
+                         patch.object(bench,'snapshot',return_value={}),patch.object(bench,'resident_pages',return_value={}), \
+                         patch.object(bench,'require_remote_pages') as residency_check,patch.object(bench.signal,'signal'), \
+                         patch.object(bench.Path,'read_text',autospec=True,side_effect=lambda p,*a,**kw:
+                             'fixture-boot' if str(p)=='/proc/sys/kernel/random/boot_id' else read_text(p,*a,**kw)), \
+                         patch.object(bench.os,'readlink',side_effect=lambda p,*a,**kw:
+                             'time:[fixture]' if str(p)=='/proc/self/ns/time' else readlink(p,*a,**kw)), \
+                         patch.object(bench,'rpc',side_effect=lambda url,method,data=None,**kw:new_service.handle(method,data or {})), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(bench.main(),0)
+                    self.assertTrue(new_service.finished and new_service.sealed)
+                    self.assertTrue(instances[-1].unregistered)
+                    summary=json.loads((root/('profile-output-'+backing)/'summary.json').read_text())
+                    self.assertEqual([r['submission_mode'] for r in summary['results']],['serialization','batched'])
+                    self.assertEqual(new_service.completed_trials,2)
+                    self.assertEqual(summary['results'][0]['sender_backing'],backing)
+                    self.assertEqual(summary['results'][0]['receiver_backing'],backing)
+                    self.assertTrue(any(c.args[1].get('backing')==bench.NUMA_BACKINGS[backing]
+                                        for c in residency_check.call_args_list))
             finally:
                 http.shutdown()
                 http.server_close()

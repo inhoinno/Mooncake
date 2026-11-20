@@ -23,6 +23,7 @@ import sys
 import sysconfig
 import time
 import urllib.request
+from collections import Counter
 from contextlib import contextmanager
 
 from callosum_lab import process_stamp
@@ -39,6 +40,7 @@ NATIVE_SOURCES = ("mooncake-store/src/callosum_store.cpp", "mooncake-store/src/c
                   "mooncake-store/src/task_manager.cpp", "mooncake-transfer-engine/src/transfer_engine.cpp",
                   "mooncake-transfer-engine/src/transfer_engine_impl.cpp",
                   "mooncake-common/src/cxl_pool_backend.cpp", "mooncake-common/src/crc_checksum.cpp")
+RELATIVE_CLOCK_DRIFT_PPM = 2000
 
 
 def require(condition, message):
@@ -93,10 +95,13 @@ def private_token(path):
 def validate_spec(spec):
     require(spec.get("schema") == 1 and re.fullmatch(r"[A-Za-z0-9_-]{8,64}", spec.get("campaign") or ""),
             "spec needs schema=1 and a fresh campaign ID (8..64 safe characters)")
+    require(spec.get("profile", "one_way") in ("one_way", "bidirectional"),
+            "profile must be one_way or bidirectional")
     nodes = spec.get("nodes", {})
     require(len(nodes) == 2 and {n.get("role") for n in nodes.values()} == {"source", "requester"},
             "exactly two explicit source/requester nodes are required")
     for name, node in nodes.items():
+        require(re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name), "invalid serving node ID")
         for field in ("hostname", "ip", "pool_id", "physical_pool_id", "dax_path", "owner",
                       "hca", "cuda_devices", "authorization"):
             require(isinstance(node.get(field), str) and node[field], f"{name}.{field} is required")
@@ -385,8 +390,10 @@ def command(setup, role):
               "--enable-request-id-headers", "--host", node.get("control_ip", node["ip"]),
               "--port", str(node["api_port"])]
     if role == "worker":
+        kv_role = ("kv_both" if spec.get("profile") == "bidirectional" else
+                   "kv_producer" if node["role"] == "source" else "kv_consumer")
         result += ["--kv-transfer-config", json.dumps(dict(kv_connector="MooncakeStoreConnector",
-                       kv_role="kv_producer" if node["role"] == "source" else "kv_consumer",
+                       kv_role=kv_role,
                        kv_connector_extra_config={"load_async": True}))]
     return result
 
@@ -481,7 +488,26 @@ def start(setup, role, peer_path=None, prepare=False):
     raise RuntimeError(f"readiness timed out; retain {receipt} and {log}; no process was killed")
 
 
-def stop(setup, role, peer_retired=None):
+def drain(setup):
+    """Close campaign request admission and record each observed terminal task."""
+    run = Path(setup["run"])
+    require(not (run / "request.inflight.json").exists(), "resolve the uncertain HTTP request before drainage")
+    transfer_snapshot_ready(setup, "worker")
+    rows = events(run / "worker.log")
+    misses = Counter(r["key_crc"] for r in rows if r.get("event") == "initial_local_miss")
+    requests = [r for r in rows if r.get("event") == "remote_materialization"]
+    require(misses == Counter(r["key_crc"] for r in requests),
+            "a remote lookup lacks a Store task receipt; inspect the master before retirement")
+    tasks = {r["task"] for r in requests}
+    terminal = {r["task"] for r in rows if r.get("event") == "materialization_terminal"}
+    require(tasks <= terminal, f"Store terminal status missing for tasks {sorted(tasks - terminal)}")
+    receipt = run / "worker.drained.json"
+    save(receipt, dict(node_id=setup["node_id"], tasks=sorted(tasks), token_sha256=setup["token_sha256"],
+                       spec_sha256=hashlib.sha256(encoded(setup["spec"]).encode()).hexdigest()))
+    return str(receipt)
+
+
+def stop(setup, role, peer_retired=None, peer_drained=None):
     run = Path(setup["run"])
     path = run / f"{role}.process.json"
     receipt = json.loads(path.read_text())
@@ -490,6 +516,18 @@ def stop(setup, role, peer_retired=None):
     require(role == "cold" or not (run / "request.inflight.json").exists(),
             "request outcome is not recorded; inspect the retained service and journal")
     source = setup["spec"]["nodes"][setup["node_id"]]["role"] == "source"
+    duplex = setup["spec"].get("profile") == "bidirectional"
+    if role == "worker" and (duplex or not source):
+        local_receipt = run / "worker.drained.json"
+        require(local_receipt.is_file(), "run the drain stage for this worker before retirement")
+    if role == "worker" and duplex:
+        require(peer_drained is not None, "supply the peer worker.drained.json before retirement")
+        local = json.loads(local_receipt.read_text())
+        peer = json.loads(Path(peer_drained).read_text())
+        expected = next(node for node in setup["spec"]["nodes"] if node != setup["node_id"])
+        require(peer.get("node_id") == expected and
+                all(peer.get(key) == local[key] for key in ("spec_sha256", "token_sha256")),
+                "peer drain receipt belongs to a different node or campaign")
     if role == "master" or (role == "worker" and source):
         require(peer_retired is not None, "retire the requester before stopping the source or master")
         if role == "master":
@@ -591,18 +629,37 @@ print(json.dumps(dict(binding=store.__file__, engine=engine.__file__,
     return report
 
 
-def request(setup, phase, source_run=None):
-    node = setup["spec"]["nodes"][setup["node_id"]]
-    require((phase == "produce" and node["role"] == "source") or
-            (phase in ("reuse", "local", "cold") and node["role"] == "requester"), "request phase does not match node role")
+def request_identity(spec, phase, node_id):
+    identity = spec["campaign"] + "-" + phase
+    return identity + "-" + node_id if spec.get("profile") == "bidirectional" else identity
+
+
+def request(setup, phase, source_run=None, start_at=None):
+    spec = setup["spec"]
+    node_id = setup["node_id"]
+    node = spec["nodes"][node_id]
+    duplex = spec.get("profile") == "bidirectional"
+    if duplex:
+        require(phase in ("produce", "reuse", "local"), "use the one_way profile for the cold control")
+    else:
+        require((phase == "produce" and node["role"] == "source") or
+                (phase in ("reuse", "local", "cold") and node["role"] == "requester"),
+                "request phase does not match node role")
+    require((start_at is not None) == (duplex and phase == "reuse"),
+            "pass --start-at Unix seconds on both hosts for bidirectional reuse")
     role = "cold" if phase == "cold" else "worker"
     model = setup["spec"]["model"]
     prompt = [model["token_id"]] * (model["block_size"] * model["prefix_blocks"] + 1)
-    identity = setup["spec"]["campaign"] + "-" + phase
+    identity = request_identity(spec, phase, node_id)
     run = Path(setup["run"])
     path = run / f"{phase}.response.json"
     if path.exists():
-        return json.loads(path.read_text())
+        saved = json.loads(path.read_text())
+        require(saved.get("scheduled_unix_s") == start_at,
+                "the retained request used another start time; use a new campaign")
+        return saved
+    require(role == "cold" or not (run / "worker.drained.json").exists(),
+            "this run has closed request admission for retirement")
     process_receipt = run / f"{role}.process.json"
     ready_receipt = run / f"{role}.ready.json"
     require(process_receipt.is_file() and ready_receipt.is_file(), "start the owned ready service first")
@@ -612,11 +669,13 @@ def request(setup, phase, source_run=None):
             owner["pid"] == ready["pid"] and owner["stamp"] == ready["stamp"] and
             owner["stamp"] is not None and owner["stamp"] == process_stamp(owner["pid"]),
             "owned service changed after readiness; no request sent")
-    if phase == "reuse":
-        require(source_run is not None, "reuse requires B's export evidence via --source-evidence")
+    producer_id = node_id
+    if phase == "reuse" or (duplex and phase == "local"):
+        require(source_run is not None, "request requires peer export evidence via --source-evidence")
         source_run = Path(source_run)
         _, peer = preflight_pair(setup, source_run / "preflight.json")
-        source_identity = setup["spec"]["campaign"] + "-produce"
+        producer_id = peer["node_id"]
+        source_identity = request_identity(spec, "produce", producer_id)
         receipt = json.loads((source_run / "produce.response.json").read_text())
         require(receipt["request_id"] == source_identity, "source response belongs to another campaign")
         prefix = model["block_size"] * model["prefix_blocks"]
@@ -626,24 +685,33 @@ def request(setup, phase, source_run=None):
         source = setup["spec"]["nodes"][peer["node_id"]]
         source_endpoint = mounted_endpoint(events(source_log), source)
         require(all(row["replica_endpoints"] == [source_endpoint] for row in exported),
-                "B must have exported every claimed full block to its own pool")
+                "peer must have exported every claimed full block to its own pool")
+        if duplex and phase == "reuse":
+            require((run / "produce.response.json").is_file(), "produce this worker's distinct KV first")
     if phase == "local":
         require((run / "reuse.response.json").is_file(), "run the remote-reuse request first")
     inflight = run / "request.inflight.json"
     require(not inflight.exists(), "a request already started; inspect the logs before any retry")
+    if start_at is not None:
+        delay = start_at - time.time()
+        require(0 < delay <= 300, "choose a shared Unix start time within the next five minutes")
+        time.sleep(delay)
     with inflight.open("x") as stream:
         stream.write(encoded(dict(phase=phase, request_id=identity)))
+    salt = spec["campaign"] + "-" + producer_id if duplex else spec["campaign"]
+    launch_unix_ns = time.time_ns()
     started = time.monotonic_ns()
     response = http(api_url(node) + "/v1/completions",
                     dict(model="callosum-test", prompt=prompt, max_tokens=1, temperature=0,
-                         stream=False, seed=0, cache_salt=setup["spec"]["campaign"]), identity,
+                         stream=False, seed=0, cache_salt=salt), identity,
                     timeout=300)
     require(response.get("usage", {}).get("prompt_tokens") == len(prompt) and response.get("choices"),
             "inference response is incomplete or prompt accounting differs")
     require(response.get("id") == "cmpl-" + identity and response["usage"].get("completion_tokens") == 1,
             "completion ID or generated token count differs from the requested experiment")
     report = dict(phase=phase, request_id=identity, prompt_tokens=len(prompt), response=response,
-                  elapsed_ns=time.monotonic_ns() - started, status="INFERENCE_ONLY")
+                  elapsed_ns=time.monotonic_ns() - started, status="INFERENCE_ONLY",
+                  scheduled_unix_s=start_at, launch_unix_ns=launch_unix_ns)
     save(path, report)
     inflight.rename(run / f"{phase}.request.json")
     return report
@@ -707,7 +775,7 @@ def load_window(rows, prefix, prompt_tokens):
     return ready["timestamp_ns"] - wait["timestamp_ns"]
 
 
-def verify_transfer(tx, rx, key_crc, size, source, requester, source_endpoint, requester_endpoint):
+def verify_transfer(tx, rx, key_crc, size, source, requester, source_endpoint, requester_endpoint, timing=False):
     match = dict(key_crc=key_crc)
     auth = one(tx, "receiver_authorized", **match)
     attempt = auth["attempt"]
@@ -752,33 +820,41 @@ def verify_transfer(tx, rx, key_crc, size, source, requester, source_endpoint, r
             r["replica_generation"] == gens["target_generation"] for _, r in gpu) and
             rx.index(missed) < rx.index(requested) < rx.index(validated) < rx.index(remote) < gpu[0][0] <
             rx.index(local) < gpu[1][0], "missing ordered GPU copy/checksum or local reuse evidence")
-    return dict(attempt=attempt, task=requested["task"], bytes=size, native_batches=len(writes), **gens)
+    result = dict(attempt=attempt, task=requested["task"], bytes=size, native_batches=len(writes), **gens)
+    if timing:
+        start, end, peer = (int(auth[k]) for k in
+                            ("authorize_start_ns", "authorize_end_ns", "receiver_steady_ns"))
+        samples = [(int(row["native_start_ns"]), int(row["native_end_ns"])) for row in writes]
+        require(0 < start < end <= samples[0][0] and peer > 0 and
+                all(lo < hi for lo, hi in samples) and
+                all(x[1] <= y[0] for x, y in zip(samples, samples[1:])),
+                "invalid sender timing or receiver clock bracket")
+        result.update(clock_sample=(start, end, peer), write_windows=samples,
+                      source_offset=int(auth["source_offset"]), target_offset=int(auth["destination_offset"]))
+    return result
 
 
-def verify(setup, source_run):
-    run = Path(setup["run"])
-    source_run = Path(source_run)
-    requester = setup["spec"]["nodes"][setup["node_id"]]
-    require(requester["role"] == "requester", "verify on requester A or with its local receipt")
-    source = next(n for n in setup["spec"]["nodes"].values() if n["role"] == "source")
-    preflight_pair(setup, source_run / "preflight.json")
-    require((source_run / "host-preflight/summary.json").is_file() and
-            (run / "host-preflight/summary.json").is_file(), "retain both host diagnostic bundles")
-    spec = setup["spec"]
+def phase_evidence(spec, directory, phase, node_id):
+    identity = request_identity(spec, phase, node_id)
+    response = json.loads((directory / f"{phase}.response.json").read_text())
+    prompt = spec["model"]["block_size"] * spec["model"]["prefix_blocks"] + 1
+    require(response["phase"] == phase and response["request_id"] == identity and
+            response["response"]["id"] == "cmpl-" + identity and
+            response["response"]["usage"]["prompt_tokens"] == prompt and
+            response["response"]["usage"]["completion_tokens"] == 1 and response["response"]["choices"],
+            f"invalid inference response for {identity}")
+    log = directory / ("cold.log" if phase == "cold" else "worker.log")
+    return response, trace_rows(log, identity)
+
+
+def verify_direction(spec, source_id, source_run, requester_id, run, timing=False):
+    source, requester = (spec["nodes"][node_id] for node_id in (source_id, requester_id))
     model = spec["model"]
     prefix = model["block_size"] * model["prefix_blocks"]
     prompt = prefix + 1
-    evidence = {}
-    for phase in ("produce", "reuse", "local", "cold"):
-        directory = source_run if phase == "produce" else run
-        identity = spec["campaign"] + "-" + phase
-        response = json.loads((directory / f"{phase}.response.json").read_text())
-        require(response["phase"] == phase and response["request_id"] == identity and
-                response["response"]["id"] == "cmpl-" + identity and
-                response["response"]["usage"]["prompt_tokens"] == prompt and
-                response["response"]["usage"]["completion_tokens"] == 1 and response["response"]["choices"],
-                f"invalid inference response for {phase}")
-        evidence[phase] = (response, trace_rows(directory / ("cold.log" if phase == "cold" else "worker.log"), identity))
+    evidence = {phase: phase_evidence(spec, run, phase, requester_id)
+                for phase in ("reuse", "local")}
+    evidence["produce"] = phase_evidence(spec, source_run, "produce", source_id)
     exported = objects(evidence["produce"][1], "callosum_connector_export", prefix, model["block_size"])
     ready = {}
     for phase in ("reuse", "local"):
@@ -786,11 +862,8 @@ def verify(setup, source_run):
         loaded = objects(rows, "external_kv_chunk_complete", prefix, model["block_size"])
         for saved, received in zip(exported, loaded, strict=True):
             require(all(saved[k] == received[k] for k in ("object_key", "tensor_bytes", "bytes")) and
-                    received["result_code"] == received["bytes"], "legacy GPU load does not match B's exported block")
+                    received["result_code"] == received["bytes"], "legacy GPU load differs from peer's exported block")
         ready[phase] = load_window(rows, prefix, prompt)
-    verify_compute(evidence["cold"][1], 0, prompt)
-    require(not any(r["event"].startswith("external_kv_") for r in evidence["cold"][1]),
-            "cold control had external reuse enabled")
     verify_compute(evidence["produce"][1], 0, prompt)
     tx, rx = events(source_run / "worker.log"), events(run / "worker.log")
     source_endpoint = mounted_endpoint(tx, source)
@@ -799,15 +872,81 @@ def verify(setup, source_run):
     for row in exported:
         require(row["replica_endpoints"] == [source_endpoint], "initial complete placement was not source-only")
         transfers.append(verify_transfer(tx, rx, str(crc64(row["object_key"].encode())), row["bytes"],
-                                         source, requester, source_endpoint, requester_endpoint))
+                                         source, requester, source_endpoint, requester_endpoint, timing))
     require(len({r["attempt"] for r in transfers}) == len(transfers), "transfer attempt reused across objects")
-    report = dict(status="SERVING_REUSE_PROVEN", campaign=spec["campaign"], export_origin="ordinary_prefill_save",
-                  source=source_endpoint, requester=requester_endpoint, scope="CXL_FIRST_LEGACY_STORE",
+    report = dict(source_node=source_id, requester_node=requester_id,
+                  source=source_endpoint, requester=requester_endpoint,
                   reused_blocks=len(transfers), reused_prefix_tokens=prefix, reused_compute_tokens=1,
-                  local_compute_tokens=1, cold_compute_tokens=prompt, transfer_bytes=sum(r["bytes"] for r in transfers),
+                  local_compute_tokens=1, transfer_bytes=sum(r["bytes"] for r in transfers),
                   requester_gpu_ready_ns=ready, requests={phase: row[0]["elapsed_ns"] for phase, row in evidence.items()},
-                  output_text_matches_cold=evidence["reuse"][0]["response"]["choices"][0]["text"] ==
-                    evidence["cold"][0]["response"]["choices"][0]["text"], transfers=transfers)
+                  transfers=transfers)
+    return report, evidence["reuse"][0]
+
+
+def native_overlap(first, second):
+    """Conservative WRITE call-window overlap on the first sender's clock."""
+    best = None
+    duration = 0
+
+    def drift(distance_ns):
+        return (distance_ns * RELATIVE_CLOCK_DRIFT_PPM + 999_999) // 1_000_000
+
+    for left in first:
+        lo_a, hi_a, mark_b = left["clock_sample"]
+        for right in second:
+            lo_b, hi_b, mark_a = right["clock_sample"]
+            for start_b, end_b in right["write_windows"]:
+                # Allow 2,000 ppm relative drift from each B-side anchor.
+                drift_left = drift(max(abs(start_b - mark_b), abs(end_b - mark_b)))
+                drift_right = drift(max(abs(start_b - hi_b), abs(end_b - lo_b)))
+                low = max(lo_a - mark_b - drift_left, mark_a - hi_b - drift_right)
+                high = min(hi_a - mark_b + drift_left, mark_a - lo_b + drift_right)
+                require(low <= high, "receiver clock brackets disagree under the relative drift bound")
+                for start_a, end_a in left["write_windows"]:
+                    start, end = max(start_a, start_b + high), min(end_a, end_b + low)
+                    if end - start > duration:
+                        duration, best = end - start, [start, end]
+    return duration, best
+
+
+def verify(setup, source_run):
+    run, source_run = Path(setup["run"]), Path(source_run)
+    local, peer = preflight_pair(setup, source_run / "preflight.json")
+    require(all((directory / "host-preflight/summary.json").is_file() for directory in (run, source_run)),
+            "retain both host diagnostic bundles")
+    node_id, peer_id = local["node_id"], peer["node_id"]
+    spec = setup["spec"]
+    duplex = spec.get("profile") == "bidirectional"
+    require(spec["nodes"][node_id]["role"] == "requester", "consolidate verification on requester A")
+    forward, reuse = verify_direction(spec, peer_id, source_run, node_id, run, timing=duplex)
+    report = dict(campaign=spec["campaign"], export_origin="ordinary_prefill_save", scope="CXL_FIRST_LEGACY_STORE")
+    if duplex:
+        reverse, other = verify_direction(spec, node_id, run, peer_id, source_run, timing=True)
+        require(reuse.get("scheduled_unix_s") and reuse["scheduled_unix_s"] == other.get("scheduled_unix_s"),
+                "opposite requests did not use the same scheduled start")
+        for first, second in ((forward, reverse), (reverse, forward)):
+            for a in first["transfers"]:
+                for b in second["transfers"]:
+                    require(a["source_offset"] + a["bytes"] <= b["target_offset"] or
+                            b["target_offset"] + b["bytes"] <= a["source_offset"],
+                            "outgoing source and incoming destination ranges overlap")
+        overlap, window = native_overlap(forward["transfers"], reverse["transfers"])
+        report.update(status=("BIDIRECTIONAL_NATIVE_CALL_OVERLAP_PROVEN" if overlap else
+                              "BIDIRECTIONAL_REUSE_NO_OVERLAP"),
+                      spec_sha256=local["spec_sha256"], directions=[forward, reverse],
+                      native_call_overlap_lower_bound_ns=overlap, relative_clock_drift_ppm=RELATIVE_CLOCK_DRIFT_PPM,
+                      native_call_common_window_ns=window, common_window_clock_node=peer_id,
+                      scheduled_unix_s=reuse["scheduled_unix_s"], measured_network_bytes="UNAVAILABLE",
+                      physical_device_overlap="UNVERIFIED")
+        save(run / "bidirectional-verification.json", report)
+        return report
+    cold, rows = phase_evidence(spec, run, "cold", node_id)
+    prompt = cold["response"]["usage"]["prompt_tokens"]
+    verify_compute(rows, 0, prompt)
+    require(not any(r["event"].startswith("external_kv_") for r in rows), "cold control had external reuse enabled")
+    report.update(forward, status="SERVING_REUSE_PROVEN", cold_compute_tokens=prompt,
+                  output_text_matches_cold=reuse["response"]["choices"][0]["text"] == cold["response"]["choices"][0]["text"])
+    report["requests"]["cold"] = cold["elapsed_ns"]
     save(run / "serving-verification.json", report)
     return report
 
@@ -860,7 +999,7 @@ def build(setup):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("token", "init", "build", "instrument", "preflight", "start", "request", "verify", "stop"))
+    parser.add_argument("stage", choices=("token", "init", "build", "instrument", "preflight", "start", "request", "verify", "drain", "stop"))
     parser.add_argument("--run", type=Path)
     parser.add_argument("--spec", type=Path)
     parser.add_argument("--node")
@@ -869,7 +1008,9 @@ def main(argv=None):
     parser.add_argument("--phase", choices=("produce", "reuse", "local", "cold"))
     parser.add_argument("--peer-preflight", type=Path)
     parser.add_argument("--peer-retired", type=Path)
+    parser.add_argument("--peer-drained", type=Path)
     parser.add_argument("--source-evidence", type=Path)
+    parser.add_argument("--start-at", type=int, help="shared Unix start second for bidirectional reuse")
     parser.add_argument("--prepare-resources", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -896,16 +1037,18 @@ def main(argv=None):
                         if args.stage == "start":
                             result = start(setup, args.role, args.peer_preflight, args.prepare_resources)
                         else:
-                            result = stop(setup, args.role, args.peer_retired)
+                            result = stop(setup, args.role, args.peer_retired, args.peer_drained)
                     elif args.stage == "verify":
                         require(args.source_evidence, "verify requires --source-evidence")
                         result = verify(setup, args.source_evidence)
+                    elif args.stage == "drain":
+                        result = drain(setup)
                     else:
                         require(args.phase, "request requires --phase")
-                        result = request(setup, args.phase, args.source_evidence)
-        status = "SERVING_REUSE_PROVEN" if args.stage == "verify" else "PREPARATION_OR_INFERENCE_ONLY"
+                        result = request(setup, args.phase, args.source_evidence, args.start_at)
+        status = result["status"] if args.stage == "verify" else "PREPARATION_OR_INFERENCE_ONLY"
         print(encoded(dict(status=status, result=result)), end="")
-        return 0
+        return int(status == "BIDIRECTIONAL_REUSE_NO_OVERLAP")
     except Exception as error:
         status = "REUSE_NOT_PROVEN" if args.stage == "verify" else "BLOCKED"
         print(encoded(dict(status=status, stage=args.stage, cause=str(error),

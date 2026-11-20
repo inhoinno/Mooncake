@@ -110,6 +110,13 @@ def validate_config(c, path):
         require(type(b.get('mux_capacity',2)) is int and 0 < b.get('mux_capacity',2) <= 32 and
                 type(b.get('mux_queue_limit',32)) is int and 0 < b.get('mux_queue_limit',32) <= 4096,
                 'mux capacity/queue limit outside native bounds')
+        require(type(b.get('write_pipeline_depth',0)) is int and
+                0 <= b.get('write_pipeline_depth',0) <= 4096 and
+                type(b.get('write_pipeline_bytes',64<<20)) is int and
+                0 < b.get('write_pipeline_bytes',64<<20) <= 2**64-1 and
+                type(b.get('write_pipeline_descriptors',1)) is int and
+                0 < b.get('write_pipeline_descriptors',1) <= 1024,
+                'native WRITE pipeline limits outside native bounds')
         require(node.get('expected_store_sha256') and
                 re.fullmatch(r'[0-9a-f]{64}', node['expected_store_sha256']),
                 'expected_store_sha256 must identify the built Store module')

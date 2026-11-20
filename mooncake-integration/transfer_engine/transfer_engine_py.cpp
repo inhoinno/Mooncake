@@ -13,6 +13,12 @@
 // limitations under the License.
 
 #include "transfer_engine_py.h"
+#include "write_pipeline_engine.h"
+#ifdef __linux__
+#include <sys/auxv.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include "../pool_relay/relay_batch.h"
 
 #include <cassert>
@@ -1237,6 +1243,119 @@ PYBIND11_MODULE(engine, m) {
             .def("initialize_ext", &TransferEnginePy::initializeExt)
             .def("get_rpc_port", &TransferEnginePy::getRpcPort)
             .def("relay_abi_version", [](TransferEnginePy&) { return 2; })
+            .def("relay_clock_probe", [](TransferEnginePy&) {
+                namespace wp=mooncake::write_pipeline;
+                constexpr size_t count=4096;
+                uint64_t total=0,minimum=UINT64_MAX;
+                for(size_t i=0;i<count;++i) {
+                    const auto start=wp::monotonicNowNs();
+                    const auto duration=wp::monotonicNowNs()-start;
+                    total+=duration;minimum=std::min(minimum,duration);
+                }
+                py::dict out;
+                out["clock"]="CLOCK_MONOTONIC";
+                out["samples"]=count;
+                out["consecutive_read_delta_mean_ns"]=double(total)/count;
+                out["consecutive_read_delta_min_ns"]=minimum;
+#ifdef __linux__
+                out["vdso_mapping_present"]=getauxval(AT_SYSINFO_EHDR)!=0;
+                timespec value{};
+                const auto start=wp::monotonicNowNs();
+                for(size_t i=0;i<count;++i) syscall(SYS_clock_gettime,CLOCK_MONOTONIC,&value);
+                out["forced_syscall_loop_mean_ns"]=double(wp::monotonicNowNs()-start)/count;
+#endif
+                out["interpretation"]="Probe outside transfer; includes observation/loop overhead. vDSO mapping is not proof libc used it.";
+                return out;
+            })
+            .def("relay_write_pipeline",
+                 [](TransferEnginePy& self, const std::string& segment,
+                    const std::vector<uintptr_t>& sources,
+                    const std::vector<uintptr_t>& destinations,
+                    const std::vector<size_t>& lengths,
+                    const std::vector<uint64_t>& source_offsets,
+                    const std::vector<uint64_t>& destination_offsets,
+                    const std::string& source_backing, const std::string& destination_backing,
+                    const std::string& mode, size_t depth, uint64_t byte_limit,
+                    size_t descriptors, const std::string& instrumentation,
+                    py::object owner, py::object ready, py::object drained) {
+                     namespace wp = mooncake::write_pipeline;
+                     if (sources.empty() || sources.size()>100000 ||
+                         destinations.size()!=sources.size() || lengths.size()!=sources.size() ||
+                         source_offsets.size()!=sources.size() || destination_offsets.size()!=sources.size() ||
+                         owner.is_none() || (mode!="serialization" && mode!="batched") ||
+                         (instrumentation!="off" && instrumentation!="counters" && instrumentation!="sampled"))
+                         throw std::invalid_argument("invalid native WRITE pipeline schedule/options/owner");
+                     auto engine = self.getEngine();
+                     relayRdma(engine);
+                     auto handle = engine->openSegment(segment);
+                     auto target = engine->getMetadata()->getSegmentDescByID(handle);
+                     engine->closeSegment(handle);
+                     if (!target || target->protocol!="rdma")
+                         throw std::runtime_error("pipeline refuses non-RDMA target");
+                     // Both Python backing owner and all operation handles remain
+                     // alive until the entire native call drains, including errors.
+                     auto lifetime = std::make_shared<py::object>(std::move(owner));
+                     std::vector<wp::Request> requests;
+                     requests.reserve(sources.size());
+                     for (size_t i=0; i<sources.size(); ++i)
+                         requests.push_back({i,sources[i],destinations[i],lengths[i],segment,
+                             {source_backing,source_offsets[i],lengths[i]},
+                             {destination_backing,destination_offsets[i],lengths[i]},lifetime});
+                     wp::Options options;
+                     options.max_operations = mode=="serialization" ? 1 : depth;
+                     options.max_bytes = byte_limit;
+                     options.descriptors_per_operation = mode=="serialization" ? 1 : descriptors;
+                     options.instrumentation = instrumentation=="off" ? wp::Instrumentation::Off :
+                         instrumentation=="counters" ? wp::Instrumentation::Counters : wp::Instrumentation::Sampled;
+                     wp::Result result;
+                     {
+                         py::gil_scoped_release release;
+                         result = wp::run(*engine,requests,options,{},[&] {
+                             if (!ready.is_none()) {
+                                 py::gil_scoped_acquire acquire;
+                                 ready();
+                             }
+                         });
+                         if (!drained.is_none()) {
+                             py::gil_scoped_acquire acquire;
+                             drained();
+                         }
+                     }
+                     py::dict out;
+                     out["success"] = result.success;
+                     out["bytes"] = result.bytes;
+                     out["duration_ns"] = result.duration_ns;
+                     out["start_ns"] = result.start_ns;
+                     out["process_cpu_ns"] = result.process_cpu_ns;
+                     out["operations"] = result.operations;
+                     out["peak_operations"] = result.peak_operations;
+                     out["peak_bytes"] = result.peak_bytes;
+                     out["poll_passes"] = result.poll_passes;
+                     out["idle_passes"] = result.idle_passes;
+                     out["depth_wait_passes"] = result.depth_wait_passes;
+                     out["byte_wait_passes"] = result.byte_wait_passes;
+                     out["conflict_wait_passes"] = result.conflict_wait_passes;
+                     out["admission_blocked_ns"] = result.admission_blocked_ns;
+                     out["submission_ns"] = result.submission_ns;
+                     out["completion_scan_ns"] = result.completion_scan_ns;
+                     out["trace_overflow"] = result.trace_overflow;
+                     out["phase_timing_available"] = instrumentation!="off";
+                     py::list samples,trace,admission;
+                     for (const auto& s : result.samples)
+                         samples.append(py::make_tuple(s.request,s.operation,s.begin_ns,s.end_ns,s.success));
+                     for (const auto& e : result.trace)
+                         trace.append(py::make_tuple(e.ns,e.operation,e.request,e.kind));
+                     for (const auto& s : result.samples)
+                         admission.append(py::make_tuple(s.request,s.admission_wait_ns));
+                     out["samples"] = samples;
+                     out["trace"] = trace;
+                     out["admission_samples"] = instrumentation=="off" ? py::object(py::none()) : py::object(admission);
+                     return out;
+                 }, py::arg("segment"),py::arg("sources"),py::arg("destinations"),py::arg("lengths"),
+                    py::arg("source_offsets"),py::arg("destination_offsets"),py::arg("source_backing"),
+                    py::arg("destination_backing"),py::arg("mode"),py::arg("depth"),py::arg("byte_limit"),
+                    py::arg("descriptors"),py::arg("instrumentation"),py::arg("owner"),
+                    py::arg("ready")=py::none(),py::arg("drained")=py::none())
             .def("relay_write_batch_drained",
                  [](TransferEnginePy& self,
                     const std::vector<std::string>& segments,
@@ -1288,7 +1407,7 @@ PYBIND11_MODULE(engine, m) {
                      }
                      return samples;
                  })
-            .def("relay_rdma_snapshot", [](TransferEnginePy& self) {
+            .def("relay_rdma_snapshot", [](TransferEnginePy& self, bool include_trace) {
                 const auto& cfg = globalConfig();
                 py::list rows;
                 for (const auto& ctx : relayRdma(self.getEngine()).getContextList()) {
@@ -1302,6 +1421,8 @@ PYBIND11_MODULE(engine, m) {
                     row["qp_count"] = ctx->getTotalQPNumber();
                     row["configured_qps_per_endpoint"] = cfg.num_qp_per_ep;
                     row["configured_wr_depth"] = cfg.max_wr;
+                    row["configured_cq_capacity"] = cfg.max_cqe;
+                    row["cq_count"] = ctx->cqCount();
                     row["workers"] = cfg.workers_per_ctx;
                     row["tracked"] = cfg.track_rdma_posted_slices;
                     row["pending_write_wrs"] = diag.pending_wrs;
@@ -1310,10 +1431,74 @@ PYBIND11_MODULE(engine, m) {
                     row["write_outstanding_ns"] = diag.outstanding_ns;
                     row["qp_completed_bytes"] = py::cast(diag.qp_completed_bytes);
                     row["qp_counters_truncated"] = diag.qp_counters_truncated;
+                    row["diagnostic_version"] = 2;
+                    row["slice_trace_enabled"] = cfg.sample_rdma_write_trace && cfg.track_rdma_posted_slices;
+                    if (include_trace) {
+                        auto [events,overflow]=ctx->snapshotWriteTrace();
+                        py::list trace;
+                        for(const auto& e:events)
+                            trace.append(py::make_tuple(e.ns,e.request,e.slice_offset,e.bytes,e.qp,e.kind));
+                        row["slice_trace"] = trace;
+                        row["slice_trace_overflow"] = overflow;
+                    }
+                    row["all_wrs_signaled"] = true;
+                    row["peak_pending_write_wrs"] = diag.peak_pending_wrs;
+                    row["peak_pending_write_bytes"] = diag.peak_pending_bytes;
+                    py::dict qps;
+                    py::dict qp_mapping;
+                    py::dict qp_outstanding;
+                    for (const auto& [number, q] : diag.qp_statistics) {
+                        py::dict counts;
+                        counts["post_calls"] = q.post_calls;
+                        counts["post_ns"] = q.post_ns;
+                        counts["posted_wrs"] = q.posted_wrs;
+                        counts["posted_bytes"] = q.posted_bytes;
+                        counts["rejected_wrs"] = q.rejected_wrs;
+                        counts["unknown_wrs"] = q.unknown_wrs;
+                        counts["completed_wrs"] = q.completed_wrs;
+                        counts["completed_bytes"] = q.completed_bytes;
+                        counts["completion_errors"] = q.completion_errors;
+                        qps[py::int_(number)] = counts;
+                        py::dict mapping;
+                        mapping["posting_tid"] = q.posting_tid;
+                        mapping["completion_worker_index"] = q.completion_worker;
+                        mapping["peer_nic"] = q.peer_nic;
+                        qp_mapping[py::int_(number)] = mapping;
+                        py::dict pending;
+                        pending["pending_wrs"] = q.pending_wrs;
+                        pending["pending_bytes"] = q.pending_bytes;
+                        pending["lifetime_peak_wrs"] = q.peak_wrs;
+                        pending["lifetime_peak_bytes"] = q.peak_bytes;
+                        qp_outstanding[py::int_(number)] = pending;
+                    }
+                    row["qp_statistics"] = qps;
+                    row["qp_mapping"] = qp_mapping;
+                    row["qp_outstanding"] = qp_outstanding;
+                    py::dict pollers;
+                    for (const auto& [worker, p] : diag.pollers) {
+                        py::dict counts;
+                        counts["polls"] = p.polls;
+                        counts["empty_polls"] = p.empty_polls;
+                        counts["errors"] = p.errors;
+                        counts["cqes"] = p.cqes;
+                        counts["poll_ns"] = p.poll_ns;
+                        pollers[py::int_(worker)] = counts;
+                    }
+                    row["poll_workers"] = pollers;
+                    const auto mr = ctx->snapshotRegistration();
+                    py::dict registrations;
+                    registrations["calls"] = mr[0];
+                    registrations["successful_calls"] = mr[1];
+                    registrations["registered_bytes"] = mr[2];
+                    registrations["register_ns"] = mr[3];
+                    registrations["deregister_calls"] = mr[4];
+                    registrations["deregister_successful_calls"] = mr[5];
+                    registrations["deregister_ns"] = mr[6];
+                    row["registration"] = registrations;
                     rows.append(row);
                 }
                 return rows;
-            })
+            },py::arg("include_trace")=false)
             .def("relay_rdma_available",
                  [](TransferEnginePy& self) {
                      auto engine = self.getEngine();

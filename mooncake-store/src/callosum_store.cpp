@@ -30,6 +30,7 @@
 #include "client_service.h"
 #include "crc_checksum.h"
 #include "transfer_engine.h"
+#include "write_pipeline_engine.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -42,6 +43,11 @@ constexpr size_t kBatch = 32;
 int64_t elapsedNs(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count();
+}
+
+int64_t steadyNs(std::chrono::steady_clock::time_point point) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               point.time_since_epoch()).count();
 }
 
 void Require(bool valid, const char* message) {
@@ -146,6 +152,7 @@ struct Message {
     uint64_t address = 0, length = 0, checksum = 0;
     uint64_t pool_offset = 0;
     uint64_t source_generation = 0, target_generation = 0;
+    int64_t receiver_steady_ns = 0;
     bool ok = false;
 };
 
@@ -174,6 +181,9 @@ std::unique_ptr<CallosumStoreConfig> CallosumStoreConfig::Load() {
             "incomplete Callosum Store configuration");
     Require(result->backend_kind == "devdax" || result->backend_kind == "file",
             "Callosum requires an explicit devdax or file mapping");
+    Require(result->write_pipeline_depth <= 4096 && result->write_pipeline_bytes > 0 &&
+                result->write_pipeline_descriptors > 0 && result->write_pipeline_descriptors <= 1024,
+            "invalid native WRITE pipeline limits");
     return result;
 }
 
@@ -376,6 +386,12 @@ class CallosumStoreBridge::Impl {
             auto it = targets.find(message.id);
             if (it != targets.end() && it->second.phase != "aborted" &&
                 SameTarget(it->second, message) && it->second.sender == peer) {
+                if (it->second.phase == "validated") {
+                    // The replica may already be published, evicted or reused.
+                    reply.ok = it->second.ok;
+                    Send(peer, std::move(reply));
+                    return;
+                }
                 // The authenticated sender sends verify only after all native
                 // WRITE batches drain. Read every byte before publication.
                 std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -386,6 +402,7 @@ class CallosumStoreBridge::Impl {
                 const auto checksum_ns = elapsedNs(checksum_start);
                 journal.Mark(message.id + "-rx", "VALIDATED");
                 it->second.phase = "validated";
+                it->second.ok = reply.ok;
                 LOG(INFO) << "component=callosum_store event=receiver_validated"
                           << " attempt=" << message.id
                           << " bytes=" << message.length
@@ -393,6 +410,8 @@ class CallosumStoreBridge::Impl {
                           << " receiver_checksum_ns=" << checksum_ns;
             }
         }
+        if (message.phase == "prepare")
+            reply.receiver_steady_ns = steadyNs(std::chrono::steady_clock::now());
         Send(peer, std::move(reply));
     }
     void Progress() {
@@ -439,6 +458,42 @@ class CallosumStoreBridge::Impl {
             }
         }
         std::vector<pool_relay::Completion> completed;
+        if (config.write_pipeline_depth) {
+            namespace wp = write_pipeline;
+            std::vector<wp::Request> requests;
+            requests.reserve(group.writes.size());
+            for (const auto& w : group.writes) {
+                const auto& target = plan.targets[w.target_index];
+                const auto relative = w.destination.offset-target.extent.offset;
+                Require(relative<=target.extent.length && w.destination.length<=target.extent.length-relative &&
+                        target.remote_base<=UINT64_MAX-relative,"pipeline target overflow");
+                requests.push_back({w.chunk,
+                    reinterpret_cast<uintptr_t>(pool->resolve(w.source.offset,w.source.length)),
+                    target.remote_base+relative,w.source.length,target.segment,
+                    {w.source.pool,w.source.offset,w.source.length},
+                    {w.destination.pool,w.destination.offset,w.destination.length},pool});
+            }
+            wp::Options options;
+            options.max_operations=config.write_pipeline_depth;
+            options.max_bytes=config.write_pipeline_bytes;
+            options.descriptors_per_operation=config.write_pipeline_descriptors;
+            const auto result=wp::run(engine,requests,options);
+            if (!result.success)
+                throw pool_relay::MuxFailure("pipelined native WRITE failed after drain",true);
+            const auto& authorization=*std::static_pointer_cast<Message>(plan.targets[0].registration);
+            LOG(INFO) << "component=callosum_store event=write_drained attempt=" << plan.transfer_id
+                      << " submission_mode=batched native_operations=" << result.operations
+                      << " batch=" << requests.size() << " batch_bytes=" << result.bytes
+                      << " source_generation=" << authorization.source_generation
+                      << " target_generation=" << authorization.target_generation
+                      << " completed_end=" << result.bytes
+                      << " native_write_ns=" << result.duration_ns
+                      << " native_start_ns=" << result.start_ns
+                      << " native_end_ns=" << result.start_ns+result.duration_ns
+                      << " sender=" << group.sender << " protocol=rdma opcode=WRITE";
+            for (const auto& w : group.writes) completed.push_back({w.chunk,w.source.length,true});
+            return completed;
+        }
         size_t done = 0;
         for (size_t start = 0; start < group.writes.size();) {
             const size_t count = std::min(kBatch, group.writes.size() - start);
@@ -538,10 +593,11 @@ class CallosumStoreBridge::Impl {
         message.checksum = ComputeCrcChecksum(
             reinterpret_cast<void*>(src.buffer_address_), src.size_);
         const auto checksum_ns = elapsedNs(checksum_start);
+        bool verify_sent = false;
         try {
             const auto prepare_start = std::chrono::steady_clock::now();
             const auto prepared = Exchange(dst.transport_endpoint_, message);
-            const auto prepare_ns = elapsedNs(prepare_start);
+            const auto prepare_end = std::chrono::steady_clock::now();
             message.epoch = prepared.epoch;
             message.pool_offset = prepared.pool_offset;
             LOG(INFO) << "component=callosum_store event=receiver_authorized"
@@ -559,7 +615,12 @@ class CallosumStoreBridge::Impl {
                       << " target_generation=" << message.target_generation
                       << " bytes=" << src.size_
                       << " source_checksum_ns=" << checksum_ns
-                      << " authorize_round_trip_ns=" << prepare_ns << " key_crc="
+                      << " authorize_round_trip_ns="
+                      << steadyNs(prepare_end) - steadyNs(prepare_start)
+                      << " authorize_start_ns=" << steadyNs(prepare_start)
+                      << " authorize_end_ns=" << steadyNs(prepare_end)
+                      << " receiver_steady_ns=" << prepared.receiver_steady_ns
+                      << " key_crc="
                       << ComputeCrcChecksum(key.data(), key.size());
             journal.Mark(message.id + "-tx", "PENDING");
             pool_relay::Plan plan;
@@ -603,10 +664,11 @@ class CallosumStoreBridge::Impl {
                 result.safe_to_revoke = e.drained;
                 throw;
             }
-            journal.Mark(message.id + "-tx", "DRAINED");
             message.phase = "verify";
             const auto verify_start = std::chrono::steady_clock::now();
+            verify_sent = true;
             Exchange(dst.transport_endpoint_, message);
+            journal.Mark(message.id + "-tx", "DRAINED");
             const auto verify_ns = elapsedNs(verify_start);
             result.success = true;
             LOG(INFO) << "component=callosum_store event=copy_verified"
@@ -616,14 +678,16 @@ class CallosumStoreBridge::Impl {
                       << " verify_round_trip_ns=" << verify_ns;
         } catch (...) {
             if (result.safe_to_revoke) {
-                journal.Mark(message.id + "-tx", "DRAINED");
                 try {
                     message.phase = "abort";
                     Exchange(dst.transport_endpoint_, message);
                 } catch (...) {
-                    // Receiver retains its pending authorization if the abort
-                    // receipt is unavailable. A later retry cannot clear it.
+                    // After verify was sent the receiver may still be reading
+                    // the target. Keep the Store reservation and journal live.
+                    if (verify_sent) result.safe_to_revoke = false;
                 }
+                if (result.safe_to_revoke)
+                    journal.Mark(message.id + "-tx", "DRAINED");
             }
             LOG(ERROR) << "component=callosum_store event=copy_failed"
                        << " attempt=" << message.id
@@ -678,8 +742,8 @@ class CallosumStoreBridge::Impl {
     }
 
     bool Materialize(const std::string& key) {
-        // One worker/rank owns this narrow synchronous load seam. Serializing
-        // materialization also joins repeated keys without a second directory.
+        // Serialize remote materialization so repeated misses recheck Store
+        // placement before creating another copy task. Local hits need no lock.
         const auto began = std::chrono::steady_clock::now();
         int64_t lookup_ns = 0, create_ns = 0, wait_ns = 0, status_rpc_ns = 0,
                 requery_ns = 0;
@@ -702,10 +766,18 @@ class CallosumStoreBridge::Impl {
                       << " clock=requester_steady";
             return true;
         };
+        const auto lookup = [&] {
+            const auto start = std::chrono::steady_clock::now();
+            auto result = client.Query(key);
+            lookup_ns += elapsedNs(start);
+            return result;
+        };
+        auto query = lookup();
+        if (!query) return false;
+        for (const auto& replica : query->replicas)
+            if (Owns(replica)) return ready("local");
         std::lock_guard load_lock(load_mutex);
-        const auto lookup_start = std::chrono::steady_clock::now();
-        auto query = client.Query(key);
-        lookup_ns = elapsedNs(lookup_start);
+        query = lookup();
         if (!query) return false;
         for (const auto& replica : query->replicas)
             if (Owns(replica)) return ready("local");
@@ -727,7 +799,12 @@ class CallosumStoreBridge::Impl {
             auto status = client.QueryTask(*task);
             status_rpc_ns += elapsedNs(poll_start);
             ++polls;
-            if (!status || status->status == TaskStatus::FAILED) return false;
+            if (!status) return false;
+            if (status->status == TaskStatus::SUCCESS || status->status == TaskStatus::FAILED) {
+                LOG(INFO) << "component=callosum_store event=materialization_terminal"
+                          << " task=" << UuidToString(*task);
+            }
+            if (status->status == TaskStatus::FAILED) return false;
             if (status->status == TaskStatus::SUCCESS) {
                 wait_ns = elapsedNs(wait_start);
                 const auto requery_start = std::chrono::steady_clock::now();

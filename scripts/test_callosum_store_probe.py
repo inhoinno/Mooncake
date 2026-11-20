@@ -89,6 +89,22 @@ class ProbeTest(unittest.TestCase):
         self.path.write_text(json.dumps(self.config))
         self.c = probe.load_config(self.path)
 
+    def test_pipeline_options_validate_before_store_start(self):
+        bridge = self.config['nodes']['sender']['bridge']
+        bridge.update(write_pipeline_depth=2,write_pipeline_bytes=64<<20,
+                      write_pipeline_descriptors=1)
+        self.path.write_text(json.dumps(self.config))
+        self.assertEqual(probe.load_config(self.path)['nodes']['sender']['bridge']
+                         ['write_pipeline_depth'],2)
+        for key,value in (('write_pipeline_depth',True),('write_pipeline_depth',4097),
+                          ('write_pipeline_bytes',0),('write_pipeline_bytes',2**64),
+                          ('write_pipeline_descriptors',1025)):
+            invalid=copy.deepcopy(self.config)
+            invalid['nodes']['sender']['bridge'][key]=value
+            self.path.write_text(json.dumps(invalid))
+            with self.assertRaisesRegex(ValueError,'pipeline limits'):
+                probe.load_config(self.path)
+
     def test_init_collects_and_assembles_without_manual_json_or_token_overwrite(self):
         template = copy.deepcopy(self.config)
         for node in template['nodes'].values():

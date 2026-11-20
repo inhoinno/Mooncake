@@ -24,6 +24,7 @@
 #endif
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <cstdint>
 #include <list>
@@ -38,6 +39,7 @@
 #include "rdma_gid_probe.h"
 #include "rdma_transport.h"
 #include "transport/rdma_transport/connect_pause_tracker.h"
+#include "transport/rdma_transport/write_diagnostics.h"
 #include "transport/transport.h"
 
 namespace mooncake {
@@ -268,13 +270,18 @@ class RdmaContext {
 
     int cqCount() const { return cq_list_.size(); }
     // Observed in software, from the pre-doorbell tracker to CQ processing.
-    struct WriteSnapshot {
-        uint64_t pending_wrs = 0, pending_bytes = 0, completed_bytes = 0;
-        uint64_t outstanding_ns = 0;
-        std::unordered_map<uint32_t, uint64_t> qp_completed_bytes;
-        bool qp_counters_truncated = false;
-    };
+    using WriteSnapshot = WriteDiagnostics;
     WriteSnapshot snapshotWrites();
+    std::pair<std::vector<WriteDiagnostics::Trace>,bool> snapshotWriteTrace();
+    void recordWritePost(uint32_t qp, uint64_t wrs, uint64_t bytes,
+                         uint64_t rejected, uint64_t unknown, uint64_t tid,
+                         const std::string& peer, uint64_t post_ns);
+    std::array<uint64_t, 7> snapshotRegistration() const {
+        return {registration_calls_.load(), registration_successes_.load(),
+                registration_bytes_.load(), registration_ns_.load(),
+                deregistration_calls_.load(), deregistration_successes_.load(),
+                deregistration_ns_.load()};
+    }
 
     int poll(int num_entries, ibv_wc *wc, int cq_index = 0);
 
@@ -295,7 +302,7 @@ class RdmaContext {
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
 
     void trackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
-                           size_t first, size_t count);
+                           size_t first, size_t count, uint32_t qp);
     void untrackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
                              size_t first, size_t count);
 
@@ -325,6 +332,10 @@ class RdmaContext {
 
     RWSpinlock memory_regions_lock_;
     MemoryRegionMap memory_region_map_;
+    std::atomic<uint64_t> registration_calls_{0}, registration_successes_{0};
+    std::atomic<uint64_t> registration_bytes_{0}, registration_ns_{0};
+    std::atomic<uint64_t> deregistration_calls_{0}, deregistration_successes_{0};
+    std::atomic<uint64_t> deregistration_ns_{0};
     std::vector<RdmaCq> cq_list_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;

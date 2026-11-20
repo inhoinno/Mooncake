@@ -951,15 +951,23 @@ class TransferEngine::ScatterTransferOperation::Impl {
     };
 
     Impl(TransferEngine& engine, Backend backend,
-         const std::vector<ScatterTransferRange>& ranges)
+         const std::vector<ScatterTransferRange>& ranges,
+         const std::vector<uint64_t>& request_ids)
         : backend_(std::move(backend)) {
         callbacks_.reserve(ranges.size());
         for (const auto& range : ranges)
             callbacks_.push_back(range.on_fragment_complete);
-        build(engine, ranges);
+        build(engine, ranges,request_ids);
     }
 
     ~Impl() { wait(); }
+
+    bool tryComplete(Status& status) {
+        if (!completed_) poll();
+        if (!completed_) return false;
+        status = aggregate_status_;
+        return true;
+    }
 
     Status wait() {
         while (!completed_) {
@@ -1104,7 +1112,8 @@ class TransferEngine::ScatterTransferOperation::Impl {
     }
 
     void build(TransferEngine& engine,
-               const std::vector<ScatterTransferRange>& ranges) {
+               const std::vector<ScatterTransferRange>& ranges,
+               const std::vector<uint64_t>& request_ids) {
         for (size_t range_index = 0; range_index < ranges.size();
              ++range_index) {
             const auto& range = ranges[range_index];
@@ -1165,7 +1174,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     .target_id = segment->second,
                     .target_offset = range.remote_base_offset + remote_offset,
                     .length = length,
-                    .task_group_id = range_index + 1,
+                    .task_group_id = request_ids.empty() ? range_index + 1 : request_ids[range_index],
                 });
                 request_fragments_.emplace_back(range_index, fragment_index);
             }
@@ -1291,6 +1300,10 @@ Status TransferEngine::ScatterTransferOperation::wait() {
                : Status::InvalidArgument("invalid scatter transfer operation");
 }
 
+bool TransferEngine::ScatterTransferOperation::tryComplete(Status& status) {
+    return impl_ && impl_->tryComplete(status);
+}
+
 Status TransferEngine::ScatterTransferOperation::waitFor(
     std::chrono::nanoseconds timeout) {
     return impl_
@@ -1300,6 +1313,14 @@ Status TransferEngine::ScatterTransferOperation::waitFor(
 
 TransferEngine::ScatterTransferOperation TransferEngine::submitScatter(
     const std::vector<ScatterTransferRange>& ranges) {
+    return submitScatterWithIds(ranges,{});
+}
+
+TransferEngine::ScatterTransferOperation TransferEngine::submitScatterWithIds(
+    const std::vector<ScatterTransferRange>& ranges,
+    const std::vector<uint64_t>& request_ids) {
+    if (!request_ids.empty() && request_ids.size()!=ranges.size())
+        throw std::invalid_argument("scatter request id cardinality mismatch");
     ScatterTransferOperation::Impl::Backend backend;
     backend.legacy = impl_;
 #ifdef USE_TENT
@@ -1308,7 +1329,7 @@ TransferEngine::ScatterTransferOperation TransferEngine::submitScatter(
 
     return ScatterTransferOperation(
         std::make_unique<ScatterTransferOperation::Impl>(
-            *this, std::move(backend), ranges));
+            *this, std::move(backend), ranges,request_ids));
 }
 
 Status TransferEngine::transferScatter(

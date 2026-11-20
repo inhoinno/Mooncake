@@ -86,7 +86,10 @@ class ServingTest(unittest.TestCase):
         expected = serving.instrument(fixture, self.requester)
         self.assertEqual(serving.instrument(fixture, self.requester), expected)
 
-    def fixture(self):
+    def fixture(self, duplex=False, reverse_delay_ns=0):
+        if duplex:
+            self.spec['profile'] = 'bidirectional'
+            self.spec_file.write_text(serving.encoded(self.spec))
         setup = self.init()
         for node, directory in (('a1', self.requester), ('b1', self.source)):
             serving.save(directory / 'preflight.json', dict(
@@ -96,31 +99,43 @@ class ServingTest(unittest.TestCase):
                 vllm_version='fixture', native_abi=1, native_mux_abi=1, source_fingerprint={}))
             (directory / 'host-preflight').mkdir()
             serving.save(directory / 'host-preflight/summary.json', {})
-        src, dst = (self.spec['nodes'][k] for k in ('b1', 'a1'))
-        src_te, dst_te = (f"{n['ip']}:19800" for n in (src, dst))
-
-        def line(path, value):
-            with path.open('a') as stream:
-                stream.write(value + '\n')
-
-        for directory, node, te in ((self.source, src, src_te), (self.requester, dst, dst_te)):
-            line(directory / 'worker.log', 'component=callosum_store event=pool_mounted '
+        for node_id, directory in (('a1', self.requester), ('b1', self.source)):
+            node = self.spec['nodes'][node_id]
+            te = f"{node['ip']}:19800"
+            self.line(directory / 'worker.log', 'component=callosum_store event=pool_mounted '
                  f"pool={node['pool_id']} segment={serving.endpoint(node)} te_endpoint={te} backend=devdax")
+        self.direction('b1', self.source, 'a1', self.requester)
+        if duplex:
+            self.direction('a1', self.requester, 'b1', self.source, reverse_delay_ns)
+        return setup
 
-        for phase in ('produce', 'reuse', 'local', 'cold'):
-            directory = self.source if phase == 'produce' else self.requester
+    @staticmethod
+    def line(path, value):
+        with path.open('a') as stream:
+            stream.write(value + '\n')
+
+    def direction(self, source_id, source_run, target_id, target_run, delay_ns=0):
+        duplex = self.spec.get('profile') == 'bidirectional'
+        src, dst = (self.spec['nodes'][k] for k in (source_id, target_id))
+        src_te, dst_te = (f"{n['ip']}:19800" for n in (src, dst))
+        key_prefix = f'{source_id}-fixture-key' if duplex else 'fixture-key'
+        phases = ('produce', 'reuse', 'local') if duplex else ('produce', 'reuse', 'local', 'cold')
+        for phase in phases:
+            directory = source_run if phase == 'produce' else target_run
+            node_id = source_id if phase == 'produce' else target_id
             log = directory / ('cold.log' if phase == 'cold' else 'worker.log')
-            identity = self.spec['campaign'] + '-' + phase
+            identity = serving.request_identity(self.spec, phase, node_id)
             api_id = 'cmpl-' + identity
             serving.save(directory / f'{phase}.response.json', dict(phase=phase, request_id=identity,
-                         elapsed_ns=100, response=dict(id=api_id, usage=dict(prompt_tokens=33, completion_tokens=1),
+                         elapsed_ns=100, scheduled_unix_s=12345 if duplex and phase == 'reuse' else None,
+                         response=dict(id=api_id, usage=dict(prompt_tokens=33, completion_tokens=1),
                                                        choices=[dict(text='fixture')])) )
             tick = 0
 
             def trace(event, **fields):
                 nonlocal tick
                 tick += 1
-                line(log, '[TTFT_TRACE] ' + json.dumps(dict(event=event, timestamp_ns=tick,
+                self.line(log, '[TTFT_TRACE] ' + json.dumps(dict(event=event, timestamp_ns=tick,
                      request_id=api_id + '-0-1234abcd', **fields)))
 
             reused = phase in ('reuse', 'local')
@@ -129,7 +144,7 @@ class ServingTest(unittest.TestCase):
             if phase != 'cold':
                 for i in range(2):
                     trace('external_kv_chunk_complete' if reused else 'callosum_connector_export',
-                          object_key=f'fixture-key-{i}', start_token=16*i, end_token=16*(i+1),
+                          object_key=f'{key_prefix}-{i}', start_token=16*i, end_token=16*(i+1),
                           status='ok', tp_rank=0, group_index=0, tensor_bytes=[8, 8], bytes=16,
                           replica_endpoints=[src_te], result_code=16)
             if reused:
@@ -139,33 +154,90 @@ class ServingTest(unittest.TestCase):
                   scheduled_tokens=1 if reused else 33)
 
         for i in range(2):
-            key = str(serving.crc64(f'fixture-key-{i}'.encode()))
+            key = str(serving.crc64(f'{key_prefix}-{i}'.encode()))
             identity = dict(attempt=f'copy{i}', source_generation=f's{i}', target_generation=f'd{i}')
+            if duplex:
+                identity['attempt'] += source_id
             gens = {k: v for k, v in identity.items() if k.endswith('generation')}
 
             def native(directory, event, **fields):
-                line(directory / 'worker.log', f'component=callosum_store event={event} ' +
+                self.line(directory / 'worker.log', f'component=callosum_store event={event} ' +
                      ' '.join(f'{k}={v}' for k, v in fields.items()))
 
-            native(self.source, 'store_task_dispatch', key_crc=key, task=f'task{i}')
-            native(self.source, 'receiver_authorized', **identity, key_crc=key, bytes=16,
+            clock = {'a1': 10**10, 'b1': 2 * 10**10}
+            auth = 10**7 * (1 + i)
+            begin = clock[source_id] + auth + 100_000 + delay_ns
+            native(source_run, 'store_task_dispatch', key_crc=key, task=f'task{i}{source_id}')
+            native(source_run, 'receiver_authorized', **identity, key_crc=key, bytes=16,
                    source_pool=src['pool_id'], destination_pool=dst['pool_id'], receiver=dst_te,
-                   source_offset=0, destination_offset=0, receiver_epoch='epoch')
-            native(self.source, 'mux_queued', attempt=identity['attempt'], bytes=16)
-            native(self.source, 'mux_admitted', attempt=identity['attempt'], bytes=16)
-            native(self.source, 'write_drained', **identity, protocol='rdma', opcode='WRITE', sender=src_te,
-                   batch=1, batch_bytes=16, completed_end=16)
-            native(self.source, 'mux_gathered', attempt=identity['attempt'], bytes=16)
-            native(self.source, 'copy_verified', attempt=identity['attempt'], key_crc=key, bytes=16)
-            native(self.source, 'replica_published', key_crc=key, **gens)
-            native(self.requester, 'initial_local_miss', key_crc=key, pool=dst['pool_id'])
-            native(self.requester, 'remote_materialization', key_crc=key, task=f'task{i}')
-            native(self.requester, 'receiver_validated', attempt=identity['attempt'], bytes=16, content_ok=1, epoch='epoch')
+                   source_offset=i * 16, destination_offset=1024 + i * 16, receiver_epoch='epoch',
+                   authorize_start_ns=clock[source_id] + auth,
+                   authorize_end_ns=clock[source_id] + auth + 100_000,
+                   receiver_steady_ns=clock[target_id] + auth + 50_000)
+            native(source_run, 'mux_queued', attempt=identity['attempt'], bytes=16)
+            native(source_run, 'mux_admitted', attempt=identity['attempt'], bytes=16)
+            native(source_run, 'write_drained', **identity, protocol='rdma', opcode='WRITE', sender=src_te,
+                   batch=1, batch_bytes=16, completed_end=16, native_start_ns=begin, native_end_ns=begin + 1_000_000)
+            native(source_run, 'mux_gathered', attempt=identity['attempt'], bytes=16)
+            native(source_run, 'copy_verified', attempt=identity['attempt'], key_crc=key, bytes=16)
+            native(source_run, 'replica_published', key_crc=key, **gens)
+            native(target_run, 'initial_local_miss', key_crc=key, pool=dst['pool_id'])
+            native(target_run, 'remote_materialization', key_crc=key, task=f'task{i}{source_id}')
+            native(target_run, 'receiver_validated', attempt=identity['attempt'], bytes=16, content_ok=1, epoch='epoch')
             for phase in ('remote', 'local'):
-                native(self.requester, 'replica_usable', key_crc=key, phase=phase)
-                native(self.requester, 'gpu_load_verified', key_crc=key, bytes=16,
+                native(target_run, 'replica_usable', key_crc=key, phase=phase)
+                native(target_run, 'gpu_load_verified', key_crc=key, bytes=16,
                        path='local_cxl_copy', replica_generation=gens['target_generation'])
-        return setup
+
+    def test_status_bidirectional_verifies_both_request_paths(self):
+        setup = self.fixture(duplex=True)
+        self.assertEqual(json.loads(serving.command(setup, 'worker')[-1])['kv_role'], 'kv_both')
+        result = serving.verify(setup, self.source)
+        self.assertEqual(result['status'], 'BIDIRECTIONAL_NATIVE_CALL_OVERLAP_PROVEN')
+        self.assertGreater(result['native_call_overlap_lower_bound_ns'], 0)
+        self.assertEqual(result['physical_device_overlap'], 'UNVERIFIED')
+        self.assertEqual([d['requester_node'] for d in result['directions']], ['a1', 'b1'])
+        self.assertEqual([d['reused_prefix_tokens'] for d in result['directions']], [32, 32])
+        self.assertEqual(serving.verify(setup, self.source), result)
+
+    def test_status_shared_start_with_serial_writes_is_insufficient(self):
+        setup = self.fixture(duplex=True, reverse_delay_ns=30_000_000)
+        result = serving.verify(setup, self.source)
+        self.assertEqual(result['status'], 'BIDIRECTIONAL_REUSE_NO_OVERLAP')
+        self.assertEqual(result['native_call_overlap_lower_bound_ns'], 0)
+
+    def test_function_bidirectional_sends_peer_salt_once(self):
+        setup = self.fixture(duplex=True)
+        (self.requester / 'reuse.response.json').unlink()
+        owner = dict(campaign=self.spec['campaign'], role='worker', pid=17, stamp='start17')
+        for kind in ('process', 'ready'):
+            serving.save(self.requester / f'worker.{kind}.json', owner)
+        response = dict(id='cmpl-test-campaign-reuse-a1', choices=[dict(text='fixture')],
+                        usage=dict(prompt_tokens=33, completion_tokens=1))
+        with patch.object(serving, 'process_stamp', return_value='start17'), \
+                patch.object(serving.time, 'time', return_value=12344), \
+                patch.object(serving.time, 'sleep') as wait, \
+                patch.object(serving, 'http', return_value=response) as http:
+            first = serving.request(setup, 'reuse', self.source, 12345)
+            self.assertEqual(first, serving.request(setup, 'reuse', self.source, 12345))
+            wait.assert_called_once_with(1)
+            http.assert_called_once()
+            self.assertEqual(http.call_args.args[1]['cache_salt'], 'test-campaign-b1')
+
+    def test_failure_bidirectional_drain_requires_terminal_tasks(self):
+        setup = self.fixture(duplex=True)
+        (self.requester / 'arena.journal').write_text('IDENTITY test-campaign:pool1\n')
+        with self.assertRaisesRegex(RuntimeError, 'terminal status missing'):
+            serving.drain(setup)
+        for task in ('task0b1', 'task1b1'):
+            self.line(self.requester / 'worker.log',
+                      f'component=callosum_store event=materialization_terminal task={task}')
+        receipt = Path(serving.drain(setup))
+        self.assertEqual(json.loads(receipt.read_text())['tasks'], ['task0b1', 'task1b1'])
+        self.assertEqual(serving.drain(setup), str(receipt))
+        (self.requester / 'local.response.json').unlink()
+        with self.assertRaisesRegex(RuntimeError, 'closed request admission'):
+            serving.request(setup, 'local', self.source)
 
     def test_status_joins_real_event_shapes_and_rejects_recompute(self):
         setup = self.fixture()

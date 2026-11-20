@@ -100,6 +100,7 @@ struct GlobalConfig {
     std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
     bool log_rdma_slice_affinity = false;
     bool track_rdma_posted_slices = false;
+    bool sample_rdma_write_trace = false;
     int parallel_reg_mr = -1;
     // Cap on concurrent buffer registrations in registerLocalMemoryBatch().
     // 0 (default) = unbounded, one thread per buffer. Set via

@@ -31,7 +31,7 @@ struct Fixture {
     Replica::Descriptor source, target;
     std::atomic<bool> published{false};
     explicit Fixture(size_t length = 1024 * 1024 + 31,
-                     uint64_t mux_capacity = 2) {
+                     uint64_t mux_capacity = 2, uint64_t pipeline_depth = 0) {
         char pattern[] = "/tmp/callosum-store-adapter-XXXXXX";
         directory = mkdtemp(pattern);
         const auto token = directory + "/token";
@@ -49,6 +49,7 @@ struct Fixture {
             config->journal = config->path + ".journal";
             config->wait_ms = 2000;
             config->mux_capacity = mux_capacity;
+            config->write_pipeline_depth = pipeline_depth;
             std::ofstream file(config->path);
             file.seekp(config->capacity - 1);
             file.put(0);
@@ -121,6 +122,21 @@ void Preflight() {
     Check(blocked);
 }
 void Function() {
+    for(bool corrupt : {false,true}) {
+        Fixture f(2*1024*1024+31,2,2);
+        f.eb.corrupt=corrupt;
+        f.eb.fail=!corrupt;
+        Check(!f.ba->Materialize("connector-real-key-fixture"));
+        Check(!f.published);
+    }
+    {
+        Fixture f(3*1024*1024+31,2,2);
+        Check(f.ba->Materialize("connector-real-key-fixture"));
+        Check(f.published && f.eb.bytes==3*1024*1024+31 && f.eb.batches==4);
+        Check(std::memcmp(f.pa->base(),f.pb->base(),3*1024*1024+31)==0);
+        const auto before=f.eb.batches.load();
+        Check(f.ba->Materialize("connector-real-key-fixture") && f.eb.batches==before);
+    }
     for (size_t length : {size_t(4096), size_t(1024 * 1024 + 31),
                           size_t(33 * 1024 * 1024 + 3)}) {
         Fixture f(length);
@@ -147,6 +163,11 @@ void RequestLifecycle() {
         queued.set_value();
         return true;
     };
+    auto lookup = f.a.query;
+    f.a.query = [&](const std::string& key) -> std::optional<QueryResult> {
+        if (key == "unrelated-local-key") return QueryResult{std::vector{f.target}};
+        return lookup(key);
+    };
     f.a.query_task = [&]() -> std::optional<QueryTaskResponse> {
         return QueryTaskResponse{f.published.load() ? TaskStatus::SUCCESS
                                                     : TaskStatus::PENDING};
@@ -163,12 +184,18 @@ void RequestLifecycle() {
     Check(f.a.last_key == "connector-real-key-fixture");
     Check(f.a.last_targets == std::vector<std::string>{"receiver"});
     Check(!f.published && f.eb.bytes == 0);
+    auto local = std::async(std::launch::async, [&] {
+        return f.ba->Materialize("unrelated-local-key");
+    });
+    const bool local_hit_unblocked =
+        local.wait_for(std::chrono::milliseconds(150)) == std::future_status::ready;
     Check(demand.wait_for(std::chrono::milliseconds(20)) ==
           std::future_status::timeout);
     const auto copied = f.bb->Copy(f.a.last_key, f.source, {f.target});
     // Emulate Store CopyEnd only after the production bridge validates content.
     f.published = copied.success;
     Check(copied.success && copied.safe_to_revoke && demand.get());
+    Check(local_hit_unblocked && local.get());
     Check(f.ba->Materialize(f.a.last_key));
     Check(f.a.tasks == 1 &&
           f.eb.bytes == f.source.memory.buffer_descriptor.size_);
@@ -477,6 +504,50 @@ void QueuedStoreTargetRevalidation() {
     Check(f.eb.bytes == 4096 && f.eb.batches == 1);
 }
 
+void BidirectionalStoreMux() {
+    constexpr size_t bytes = 1024 * 1024 + 31;
+    Fixture f(bytes);
+    auto* reverse_source = static_cast<unsigned char*>(f.pa->resolve(2 * bytes, bytes));
+    auto* reverse_target = f.pb->resolve(2 * bytes, bytes);
+    std::memset(reverse_source, 0xad, bytes);
+    Replica::Descriptor from_a = {31, {{bytes, reinterpret_cast<uintptr_t>(reverse_source),
+                                       "rdma", "receiver"}}};
+    Replica::Descriptor to_b = {32, {{bytes, reinterpret_cast<uintptr_t>(reverse_target),
+                                     "rdma", "sender"}}};
+    std::atomic<bool> reverse_published{false};
+    f.b.query = [&](const std::string&) -> std::optional<QueryResult> {
+        return QueryResult{reverse_published ? std::vector{from_a, to_b} : std::vector{from_a}};
+    };
+    f.b.copy = [&](const std::string& key) {
+        const auto result = f.ba->Copy(key, from_a, {to_b});
+        reverse_published = result.success;
+        return result.success;
+    };
+    std::promise<void> release;
+    auto gate = release.get_future().share();
+    std::atomic<int> submitting{0};
+    f.ea.on_submit = f.eb.on_submit = [&] {
+        ++submitting;
+        gate.wait();
+    };
+    auto forward = std::async(std::launch::async, [&] {
+        return f.ba->Materialize("connector-real-key-fixture");
+    });
+    auto reverse = std::async(std::launch::async, [&] {
+        return f.bb->Materialize("reverse-key");
+    });
+    const bool crossed = Until([&] { return submitting == 2; });
+    const bool unpublished = !f.published && !reverse_published;
+    release.set_value();
+    Check(forward.get() && reverse.get());
+    Check(crossed && unpublished && f.published && reverse_published);
+    Check(f.ea.bytes == bytes && f.eb.bytes == bytes);
+    Check(std::memcmp(f.pa->base(), f.pb->base(), bytes) == 0);
+    Check(std::memcmp(reverse_source, reverse_target, bytes) == 0);
+    Check(f.ba->Materialize("connector-real-key-fixture") && f.bb->Materialize("reverse-key"));
+    Check(f.a.tasks == 1 && f.b.tasks == 1 && submitting == 2);
+}
+
 void Failure() {
     {
         Fixture denied;
@@ -506,7 +577,7 @@ void Failure() {
     Check(result.success && result.safe_to_revoke);
 }
 
-void UnknownSubmission() {
+void UncertainLifetime(bool lose_receiver_acks) {
     // Isolate the deliberate crash from running progress threads. The parent
     // reads retained file-pool journals; no real DMA exists in this harness.
     int channel[2];
@@ -519,12 +590,20 @@ void UnknownSubmission() {
         const auto path = child.directory + "\n";
         Check(write(channel[1], path.data(), path.size()) ==
               static_cast<ssize_t>(path.size()));
-        child.eb.throw_submit = true;
+        if (lose_receiver_acks) {
+            child.cb.wait_ms = 300;
+            child.bb.reset();
+            child.bb = std::make_unique<CallosumStoreBridge>(child.b, child.eb, child.cb, child.pb);
+            child.ea.drop_terminal_acks = true;
+        } else {
+            child.eb.throw_submit = true;
+        }
         const auto result =
             child.bb->Copy("unknown-submit", child.source, {child.target});
         const auto state = child.bb->MuxStatus();
         std::_Exit(!result.success && !result.safe_to_revoke &&
-                           state.size() == 1 && state[0].state == "QUARANTINED"
+                           state.size() == 1 &&
+                           state[0].state == (lose_receiver_acks ? "DRAINED" : "QUARANTINED")
                        ? 0
                        : 1);
     }
@@ -540,7 +619,8 @@ void UnknownSubmission() {
         std::ifstream file(path + "/" + pool + ".journal");
         std::string data((std::istreambuf_iterator<char>(file)), {});
         Check(data.find("PENDING") != std::string::npos);
-        Check(data.find("DRAINED") == std::string::npos);
+        if (!lose_receiver_acks || *pool == 'B')
+            Check(data.find("DRAINED") == std::string::npos);
     }
     std::filesystem::remove_all(path);  // Fake submit accepted no work.
 }
@@ -578,8 +658,11 @@ int main(int argc, char** argv) {
             NativeMuxProgressAndCancel();
         else if (category == "queued_target_revalidation")
             QueuedStoreTargetRevalidation();
+        else if (category == "bidirectional")
+            BidirectionalStoreMux();
         else if (category == "failure") {
-            UnknownSubmission();
+            UncertainLifetime(false);
+            UncertainLifetime(true);
             Failure();
         } else if (category == "status")
             CheckStatus();

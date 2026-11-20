@@ -32,6 +32,12 @@ from urllib.error import URLError
 
 
 SOURCE_FILES = (
+    'mooncake-transfer-engine/include/write_pipeline.h',
+    'mooncake-transfer-engine/include/write_pipeline_engine.h',
+    'mooncake-transfer-engine/include/transfer_engine.h',
+    'mooncake-integration/pool_relay/CMakeLists.txt',
+    'mooncake-transfer-engine/tests/write_pipeline_test.cpp',
+    'mooncake-transfer-engine/include/transport/rdma_transport/write_diagnostics.h',
     'scripts/callosum_runtime.py', 'scripts/callosum_dispatch.py',
     'scripts/callosum_initiation.py', 'scripts/callosum_worker.py',
     'scripts/callosum_transport_benchmark.py', 'scripts/validate_relay_trace.py',
@@ -46,6 +52,13 @@ SOURCE_FILES = (
     'mooncake-integration/transfer_engine/transfer_engine_py.cpp',
     'mooncake-transfer-engine/src/transport/rdma_transport/worker_pool.cpp',
     'mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp',
+    'mooncake-transfer-engine/src/transport/rdma_transport/rdma_endpoint.cpp',
+    'mooncake-transfer-engine/src/transport/rdma_transport/rdma_transport.cpp',
+    'mooncake-transfer-engine/src/transfer_engine.cpp',
+    'mooncake-transfer-engine/src/transfer_engine_impl.cpp',
+    'mooncake-transfer-engine/src/config.cpp',
+    'mooncake-transfer-engine/include/config.h',
+    'mooncake-transfer-engine/include/transport/rdma_transport/rdma_endpoint.h',
     'mooncake-transfer-engine/include/transport/rdma_transport/worker_pool.h',
     'mooncake-transfer-engine/include/transport/rdma_transport/rdma_context.h',
 )

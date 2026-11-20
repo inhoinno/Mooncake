@@ -31,7 +31,16 @@ def load_spec(path, workers, mode_override=None):
     require(set(spec) <= {'schema_version','topology_file','runtime','token_file','output','output_root',
                          'pairs','schedule','sizes','unit','repetitions','mr_page_mode','require_dax_2m',
                          'access_pattern','access_window_bytes','random_seed','diagnostic_driver',
-                         'diagnostic_pair','sample_queues','synchronized'},'unknown mini config fields')
+                         'diagnostic_pair','sample_queues','synchronized','submission_mode',
+                         'pipeline_depth','pipeline_max_bytes','descriptors_per_submit','pipeline_instrumentation','warmup_blocks'},'unknown mini config fields')
+    require(spec.get('submission_mode') in (None,'serialization','batched','compare'),'unknown submission mode')
+    require(not spec.get('submission_mode') or not spec.get('diagnostic_driver'),
+            'native mode comparison is separate from old Python/C++ diagnostic drivers')
+    for name,default,limit in (('pipeline_depth',4,4096),('pipeline_max_bytes',256<<20,1<<40),
+                               ('descriptors_per_submit',1,1024)):
+        require(type(spec.get(name,default)) is int and 0<spec.get(name,default)<=limit,'invalid '+name)
+    require(spec.get('pipeline_instrumentation','off') in ('off','counters','sampled'),'invalid pipeline instrumentation')
+    require(type(spec.get('warmup_blocks',0)) is int and 0<=spec.get('warmup_blocks',0)<=16,'invalid warmup')
     require(type(spec.get('require_dax_2m',False)) is bool,'require_dax_2m must be boolean')
     if mode_override is not None:
         spec['mr_page_mode']=mode_override
@@ -66,7 +75,7 @@ def load_spec(path, workers, mode_override=None):
             'synchronized transfer requires the colocated concurrent_pairs profile')
     driver,pair=spec.get('diagnostic_driver'),spec.get('diagnostic_pair')
     require(driver in (None,'python','native') and type(spec.get('sample_queues',False)) is bool and
-            (not spec.get('sample_queues') or driver) and
+            (not spec.get('sample_queues') or driver or spec.get('submission_mode')) and
             (pair is None or driver or spec.get('synchronized')) and
             (pair is None or pair in {p['source'] for p in pairs}), 'invalid diagnostic driver/pair')
     if pair is not None:
@@ -125,6 +134,7 @@ def load_spec(path, workers, mode_override=None):
 
 
 def execute(spec,c,topology,env,output,runner):
+    experiment_started=time.monotonic_ns()
     relay=Path(__file__).with_name('run_callosum_relay.sh')
     def command(stage,*args):
         raw=runner.call(stage,['bash',relay,*args,'--config',topology],env,
@@ -143,13 +153,29 @@ def execute(spec,c,topology,env,output,runner):
     require(all(status.get('benchmark_request_timing_versions',{}).get(p['source'])==1 for p in spec['pairs']),
             'running sender lacks request timing; do not hot-restart retained services')
     driver=spec.get('diagnostic_driver')
+    pipeline_mode=spec.get('submission_mode')
     synchronized=spec.get('synchronized',False)
     if synchronized:
         require(status.get('synchronized_transport_version')==1,
                 'live campaign lacks synchronized transfer gates; no seed or WRITE sent')
-        if not driver:
+        if not driver and spec.get('pipeline_instrumentation','off')=='off':
             require(not any(status.get('benchmark_diagnostic_tracking',{}).values()),
                     'disable native tracking for the formal synchronized sweep; no seed or WRITE sent')
+    if pipeline_mode:
+        require(all(status.get('benchmark_pipeline_versions',{}).get(p['source'])==1 for p in spec['pairs']),
+                'native pipeline binding not loaded; rebuild/prepare before any seed or WRITE')
+        require(spec.get('pipeline_instrumentation','off')=='off' or
+                all(status.get('benchmark_diagnostic_tracking',{}).get(p['source']) for p in spec['pairs']),
+                'pipeline counters require tracked sender startup; no seed or WRITE sent')
+        require(spec.get('pipeline_instrumentation')!='sampled' or
+                all(status.get('benchmark_slice_trace',{}).get(p['source']) for p in spec['pairs']),
+                'sampled mode requires MC_SAMPLE_RDMA_WRITE_TRACE=1 at sender startup; no seed or WRITE sent')
+    active_mode=None
+    def mode_options():
+        return (dict(submission_mode=active_mode,pipeline_depth=1 if active_mode=='serialization' else spec.get('pipeline_depth',4),
+            pipeline_max_bytes=spec.get('pipeline_max_bytes',256<<20),
+            descriptors_per_submit=1 if active_mode=='serialization' else spec.get('descriptors_per_submit',1),
+            pipeline_instrumentation=spec.get('pipeline_instrumentation','off'),warmup_blocks=spec.get('warmup_blocks',0)) if active_mode else {})
     if driver:
         require(all(status.get('benchmark_diagnostic_versions',{}).get(n['id'])==1 for n in c['nodes']),
                 'diagnostic needs rebuilt bindings on all endpoints; no seed or WRITE sent')
@@ -204,7 +230,7 @@ def execute(spec,c,topology,env,output,runner):
         (output/f'seed-{i}.json').write_text(json.dumps(seed,indent=2)+'\n')
         sources[i]=key
     def trial(i,pair,size,rep):
-        name=f'block-{size}{spec["unit"]}-pair-{i}-rep-{rep}'
+        name=(f'{active_mode}-' if active_mode else '')+f'block-{size}{spec["unit"]}-pair-{i}-rep-{rep}'
         begin_wall=time.time_ns(); begin=time.monotonic_ns()
         raw=runner.call(name,['bash',relay,'transport-benchmark','--node',pair['source'],
                     '--receiver',pair['receiver'],'--key',sources[i],'--block-size',size,
@@ -212,7 +238,8 @@ def execute(spec,c,topology,env,output,runner):
                  *(['--access-pattern',spec.get('access_pattern','overwrite'),'--access-window-bytes',str(spec['access_window_bytes']),
                     '--random-seed',str(spec.get('random_seed',0))] if spec.get('access_pattern','overwrite')!='overwrite' or spec.get('access_window_bytes') is not None else []),
                  *(['--diagnose',driver] if driver else []),
-                 *(['--sample-queues'] if spec.get('sample_queues') else [])],
+                 *(['--sample-queues'] if spec.get('sample_queues') else []),
+                 *[arg for key,value in mode_options().items() for arg in ('--'+key.replace('_','-'),str(value))]],
                  env,capture=True,log_stdout=False)
         end=time.monotonic_ns(); end_wall=time.time_ns()
         return record_trial(name,i,pair,rep,raw,begin,end,begin_wall,end_wall)
@@ -246,7 +273,7 @@ def execute(spec,c,topology,env,output,runner):
                    mr_page_mode=page_mode,
                    dax_2m_required=spec.get('require_dax_2m',False),
                    mr_pages={n:pages.get(n) for n in pair.values()},
-                   warmup_blocks=0,warmup_bytes=0,
+                   warmup_blocks=row.get('warmup_blocks',0),warmup_bytes=row.get('warmup_bytes',0),
                    controller_invocation_elapsed_ns=end-begin,
                    controller_invocation_start_monotonic_ns=begin,controller_invocation_end_monotonic_ns=end,
                    controller_invocation_start_unix_ns=begin_wall,controller_invocation_end_unix_ns=end_wall,
@@ -256,17 +283,17 @@ def execute(spec,c,topology,env,output,runner):
         with (output/(name+'.json')).open('x') as stream: json.dump(row,stream,indent=2)
         write_request_csv(output/(name+'-requests.csv'),row)
         return row
-    for size in spec['sizes']:
-        for rep in range(spec['repetitions']):
+    modes=['serialization','batched'] if pipeline_mode=='compare' else [pipeline_mode]
+    for active_mode,size,rep in ((m,s,r) for s in spec['sizes'] for r in range(spec['repetitions']) for m in modes):
             start_wall=time.time_ns(); start=time.monotonic_ns()
             if synchronized:
                 begin_wall,begin=time.time_ns(),time.monotonic_ns()
                 requests=[dict(node=p['source'],receiver=p['receiver'],key=sources[i],
                     block_size=size,block_unit=spec['unit'],window_bytes=spec.get('access_window_bytes'),
                     access_pattern=spec.get('access_pattern','overwrite'),random_seed=spec.get('random_seed',0),
-                    diagnostic_driver=driver,sample_queues=spec.get('sample_queues',False))
+                    diagnostic_driver=driver,sample_queues=spec.get('sample_queues',False),**mode_options())
                     for i,p in enumerate(spec['pairs'])]
-                label=f'group-{size}{spec["unit"]}-rep-{rep}'
+                label=(f'{active_mode}-' if active_mode else '')+f'group-{size}{spec["unit"]}-rep-{rep}'
                 raw=runner.call(label,['bash',relay,'transport-group','--config',topology],env,
                                 capture=True,log_stdout=False,input_text=json.dumps(dict(pairs=requests)))
                 end,end_wall=time.monotonic_ns(),time.time_ns()
@@ -275,7 +302,7 @@ def execute(spec,c,topology,env,output,runner):
                 require(isinstance(result,list) and len(result)==len(requests) and
                         all(r.get('trial_group') and r['trial_group']==result[0]['trial_group'] for r in result),
                         'synchronized group lacks complete, correlated drain evidence')
-                group=[record_trial(f'block-{size}{spec["unit"]}-pair-{i}-rep-{rep}',
+                group=[record_trial((f'{active_mode}-' if active_mode else '')+f'block-{size}{spec["unit"]}-pair-{i}-rep-{rep}',
                         i,p,rep,json.dumps(r),begin,end,begin_wall,end_wall)
                        for i,(p,r) in enumerate(zip(spec['pairs'],result))]
             elif spec['schedule']=='concurrent_pairs':
@@ -287,12 +314,14 @@ def execute(spec,c,topology,env,output,runner):
                 group=[trial(i,p,size,rep) for i,p in enumerate(spec['pairs'])]
             elapsed=max(r['controller_invocation_end_monotonic_ns'] for r in group)-start
             end_wall=max(r['controller_invocation_end_unix_ns'] for r in group)
-            group_id=f'{size}{spec["unit"]}-rep-{rep}'
+            group_id=(f'{active_mode}-' if active_mode else '')+f'{size}{spec["unit"]}-rep-{rep}'
             common=dict(group_id=group_id,schedule=spec['schedule'],block_bytes=block_bytes(size,spec['unit']),
                         repetition=rep,controller_elapsed_ns=elapsed,start_unix_ns=start_wall,end_unix_ns=end_wall,
                         useful_bytes=sum(r['bytes'] for r in group),
                         aggregate_protocol_GBps=sum(r['bytes'] for r in group)/elapsed,
                         scope='one controller window includes CLI startup, RPC, verification and JSON return; excludes final report writing; not sender-loop sum')
+            if active_mode:
+                common.update(mode_options())
             if c.get('experiment_layout')=='colocated_pairs':
                 starts=[r['sender_loop_start_monotonic_ns'] for r in group]
                 ends=[start+r['sender_write_loop_ns'] for start,r in zip(starts,group)]
@@ -311,10 +340,11 @@ def execute(spec,c,topology,env,output,runner):
     report=write_report(output,rows)
     sender_groups=[]
     if c.get('experiment_layout')=='colocated_pairs':
-        for size in spec['sizes']:
-            trials=[g for g in groups if g['block_bytes']==block_bytes(size,spec['unit'])]
+        for size,mode in ((s,m) for s in spec['sizes'] for m in modes):
+            trials=[g for g in groups if g['block_bytes']==block_bytes(size,spec['unit']) and g.get('submission_mode')==mode]
             rates=[g['aggregate_sender_GBps'] for g in trials]
             sender_groups.append(dict(size=size,unit=spec['unit'],repetitions=len(trials),
+                submission_mode=mode,
                 weighted_GBps=sum(g['useful_bytes'] for g in trials)/
                               sum(g['sender_common_window_ns'] for g in trials),
                 min_GBps=min(rates),median_GBps=statistics.median(rates),max_GBps=max(rates)))
@@ -352,6 +382,9 @@ def execute(spec,c,topology,env,output,runner):
                 stream.write(f"| {r['direction']} | {r['block_bytes']/2**20:g} | {r['repetition']} | " +
                              ' | '.join(f'{ns/1e6:.3f}' for ns in parts) + ' |\n')
     (output/'summary.json').write_text(json.dumps(dict(status='PASS',evidence_class='TRANSFER_ONLY',
+        experiment_elapsed_ns=time.monotonic_ns()-experiment_started,
+        execution_clock_scope='controller execute entry through report completion; excludes final summary serialization',
+        measured_payload_bytes=sum(r['bytes'] for r in rows),warmup_payload_bytes=sum(r.get('warmup_bytes',0) for r in rows),
         report=report,results=rows,groups=groups,sender_group_summary=sender_groups,
         services_retained=True,
         measurement_scope='DIAGNOSTIC_ONLY' if driver else 'TRANSPORT_BENCHMARK',

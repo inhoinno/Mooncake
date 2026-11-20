@@ -524,6 +524,8 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     const char* track_rdma_posted_slices_env =
         std::getenv("MC_TRACK_RDMA_POSTED_SLICES");
+    if (const char* sample = std::getenv("MC_SAMPLE_RDMA_WRITE_TRACE"))
+        parseBoolConfigEnv(sample, "MC_SAMPLE_RDMA_WRITE_TRACE", config.sample_rdma_write_trace);
     if (track_rdma_posted_slices_env) {
         parseBoolConfigEnv(track_rdma_posted_slices_env,
                            "MC_TRACK_RDMA_POSTED_SLICES",

@@ -16,10 +16,96 @@ from types import SimpleNamespace
 
 import callosum_write_mini as mini
 from callosum_lab import Runner
-from callosum_transport_benchmark import write_loop, TOTAL_BYTES, diagnostic_write_loop, rdma_snapshot, rdma_trial_progress
+from callosum_transport_benchmark import write_loop, TOTAL_BYTES, diagnostic_write_loop, rdma_snapshot, rdma_trial_progress, pipeline_write_loop, sampled_slice_latencies
 
 
 class MiniTest(unittest.TestCase):
+    def test_native_modes_keep_schedule_and_report_overlapping_operation_samples(self):
+        from callosum_benchmark_report import enrich_trial, write_report
+        calls=[];gate=[]
+        def native(segment,src,dst,lengths,so,do,sb,db,mode,depth,budget,descriptors,instrumentation,owner,ready,drained):
+            self.assertIsNotNone(owner)
+            if ready: ready()
+            self.assertEqual(gate[-1],'ready')
+            calls.append((mode,src,dst,lengths,so,do))
+            start=time.monotonic_ns()
+            raw=[(0,0,0,20,True),(1,1,30,40,True)] if mode=='serialization' else [(0,0,0,40,True),(1,0,0,40,True)]
+            end=time.monotonic_ns()
+            if drained:drained()
+            return dict(success=True,bytes=8,start_ns=start,duration_ns=end-start+0,
+                        operations=2 if mode=='serialization' else 1,samples=raw,trace=[],process_cpu_ns=1)
+        engine=SimpleNamespace(relay_write_pipeline=native)
+        rows=[]
+        for mode in ('serialization','batched'):
+            row=pipeline_write_loop(engine,'peer',4096,8192,4,8,[],owner=object(),mode=mode,
+                descriptors=2,access_pattern='sequential',window_bytes=8,ready=lambda:gate.append('ready'))
+            row.update(status='PASS',actual_transport='rdma',path_mode='direct_dax_write')
+            rows.append(enrich_trial(row))
+        self.assertEqual(calls[0][1:],calls[1][1:])
+        self.assertEqual([r['native_calls'] for r in rows],[2,1])
+        self.assertEqual([r['native_calls'] for r in rows[1]['requests']],[1,0])
+        with tempfile.TemporaryDirectory() as directory:
+            write_report(directory,rows)
+            import csv
+            with (Path(directory)/'summary.csv').open() as stream:
+                summary=list(csv.DictReader(stream))
+            self.assertEqual({r['submission_mode'] for r in summary},{'serialization','batched'})
+
+    def test_sampled_slice_join_uses_trial_clock_and_keeps_overflow_visible(self):
+        evidence=dict(native_trace_contexts=[dict(device='hca',port=1,slice_trace_overflow=True,
+            slice_trace=[(10,1,0,64,0,0),(20,1,0,64,7,1),(40,1,0,64,7,2),
+                         (50,2,0,64,7,2),(99,1,0,64,7,2)])])
+        result=sampled_slice_latencies(evidence,0,60)
+        self.assertEqual(result['samples'][0]['enqueue_to_prepost_ns'],10)
+        self.assertEqual(result['samples'][0]['prepost_to_cq_observed_ns'],20)
+        self.assertEqual(result['unmatched_completions'],1)
+        self.assertTrue(result['trace_overflow'])
+
+    def test_compare_driver_keeps_one_seed_and_both_modes_in_one_result_bundle(self):
+        with tempfile.TemporaryDirectory() as directory,contextlib.redirect_stdout(io.StringIO()):
+            root=Path(directory);path,spec=self.fixture(root)
+            spec.update(submission_mode='compare')
+            path.write_text(json.dumps(spec))
+            spec,c,topology,env,out=mini.load_spec(path,2);out.mkdir(parents=True)
+            runner=Runner(out);runner.config_sha256='fixture';calls=[]
+            def command(stage,argv,*a,**kw):
+                calls.append((stage,argv))
+                if stage=='effective-config':return json.dumps(dict(config=c))
+                if stage=='status-before':return json.dumps(dict(fingerprint=c['fingerprint'],topology_verified=True,
+                    registered_nodes=['a1','b1'],operations=[],benchmark_request_timing_versions={'b1':1},
+                    benchmark_pipeline_versions={'b1':1}))
+                if stage.startswith('seed-'):return '{}'
+                mode=argv[argv.index('--submission-mode')+1]
+                row=write_loop(lambda s,d,n:n,4096,8192,1<<20,3<<20,1<<20)
+                return json.dumps(dict(row,status='PASS',actual_transport='rdma',path_mode='direct_dax_write',
+                                      submission_mode=mode,pipeline_depth=1 if mode=='serialization' else 4))
+            with patch.object(Runner,'call',side_effect=command),patch.object(mini,'TOTAL_BYTES',3<<20):
+                try: mini.execute(spec,c,topology,env,out,runner)
+                finally: runner.log.close()
+            results=json.loads((out/'summary.json').read_text())['results']
+            self.assertEqual({r['submission_mode'] for r in results},{'serialization','batched'})
+            self.assertEqual(sum(stage.startswith('seed-') for stage,_ in calls),1)
+
+    def test_native_v2_accounting_rejects_unknown_posts_and_detects_registration_churn(self):
+        q = dict(post_calls=0,posted_wrs=0,posted_bytes=0,rejected_wrs=0,unknown_wrs=0,
+                 completed_wrs=0,completed_bytes=0,completion_errors=0)
+        first = dict(device='hca0',port=1,tracked=True,diagnostic_version=2,
+            pending_write_wrs=0,pending_write_bytes=0,qp_counters_truncated=False,
+            completed_write_bytes=0,write_outstanding_ns=0,qp_completed_bytes={},
+            qp_statistics={11:q},poll_workers={},registration={'calls':1,'registered_bytes':128})
+        last = dict(first,completed_write_bytes=128,write_outstanding_ns=12,qp_completed_bytes={11:128},
+            qp_statistics={11:dict(q,post_calls=1,posted_wrs=2,posted_bytes=128,completed_wrs=2,completed_bytes=128)},
+            poll_workers={0:dict(polls=5,empty_polls=4,errors=0,cqes=2)})
+        def progress(): return rdma_trial_progress(dict(contexts=[first]),dict(contexts=[last]),128)
+        self.assertEqual(progress()['status'],'ACCOUNTED')
+        self.assertFalse(progress()['contexts'][0]['registration_during_trial'])
+        last['registration']={'calls':2,'registered_bytes':256}
+        self.assertTrue(progress()['contexts'][0]['registration_during_trial'])
+        last['qp_statistics'][11]['unknown_wrs']=1
+        self.assertEqual(progress()['status'],'INCOMPLETE')
+        last['pending_write_bytes']=8
+        self.assertEqual(progress()['status'],'OBSERVATION_BOUNDARY_NOT_IDLE')
+
     def test_diagnostic_loops_submit_identical_bytes_and_offsets(self):
         def run(driver):
             posted = []

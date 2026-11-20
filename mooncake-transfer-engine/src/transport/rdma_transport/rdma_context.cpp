@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <exception>
 #include <fstream>
 #include <memory>
@@ -610,7 +611,19 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access,
     // Placeholder context for a failed RNIC: no PD to register against.
     if (!pd_) return 0;
     MemoryRegionMeta mrMeta;
+    const bool track = globalConfig().track_rdma_posted_slices;
+    const auto begin = track ? std::chrono::steady_clock::now() :
+                              std::chrono::steady_clock::time_point{};
     int ret = registerMemoryRegionInternal(addr, length, access, exp, mrMeta);
+    if (track) {
+        registration_calls_.fetch_add(1, std::memory_order_relaxed);
+        registration_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count(), std::memory_order_relaxed);
+        if (ret == 0) {
+            registration_successes_.fetch_add(1, std::memory_order_relaxed);
+            registration_bytes_.fetch_add(length, std::memory_order_relaxed);
+        }
+    }
     if (ret != 0) {
         return ret;
     }
@@ -640,7 +653,17 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
     if (iter == memory_region_map_.end()) {
         return 0;
     }
-    if (ibv_dereg_mr(iter->second.mr)) {
+    const bool track = globalConfig().track_rdma_posted_slices;
+    const auto begin = track ? std::chrono::steady_clock::now() :
+                              std::chrono::steady_clock::time_point{};
+    int rc = ibv_dereg_mr(iter->second.mr);
+    if (track) {
+        deregistration_calls_.fetch_add(1, std::memory_order_relaxed);
+        deregistration_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count(), std::memory_order_relaxed);
+        if (!rc) deregistration_successes_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (rc) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
     }
@@ -1471,12 +1494,23 @@ int RdmaContext::submitPostSend(
 
 void RdmaContext::trackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
-    size_t count) {
-    worker_pool_->trackPostedSlices(slice_list, first, count);
+    size_t count, uint32_t qp) {
+    worker_pool_->trackPostedSlices(slice_list, first, count, qp);
 }
 
 RdmaContext::WriteSnapshot RdmaContext::snapshotWrites() {
     return worker_pool_ ? worker_pool_->snapshotWrites() : WriteSnapshot{};
+}
+
+std::pair<std::vector<WriteDiagnostics::Trace>,bool> RdmaContext::snapshotWriteTrace() {
+    return worker_pool_ ? worker_pool_->snapshotWriteTrace() :
+        std::pair<std::vector<WriteDiagnostics::Trace>,bool>{};
+}
+
+void RdmaContext::recordWritePost(uint32_t qp, uint64_t wrs, uint64_t bytes,
+                                  uint64_t rejected, uint64_t unknown, uint64_t tid,
+                                  const std::string& peer, uint64_t post_ns) {
+    worker_pool_->recordWritePost(qp, wrs, bytes, rejected, unknown, tid, peer, post_ns);
 }
 
 void RdmaContext::untrackPostedSlices(

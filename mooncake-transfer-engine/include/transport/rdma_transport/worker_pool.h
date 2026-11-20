@@ -35,11 +35,15 @@ class WorkerPool {
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
 
     void trackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
-                           size_t first, size_t count);
+                           size_t first, size_t count, uint32_t qp);
     void untrackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
                              size_t first, size_t count);
     // Diagnostic only; counts software-tracked WRs awaiting CQ processing.
     RdmaContext::WriteSnapshot snapshotWrites();
+    std::pair<std::vector<WriteDiagnostics::Trace>,bool> snapshotWriteTrace();
+    void recordWritePost(uint32_t qp, uint64_t wrs, uint64_t bytes,
+                         uint64_t rejected, uint64_t unknown, uint64_t tid,
+                         const std::string& peer, uint64_t post_ns);
 
    private:
     using SliceList = std::vector<Transport::Slice *>;
@@ -146,9 +150,14 @@ class WorkerPool {
 
     std::mutex posted_slices_mutex_;
     std::unordered_set<Transport::Slice *> posted_slices_;
+    std::unordered_map<Transport::Slice *,uint32_t> write_slice_qps_;
+    std::vector<WriteDiagnostics::Trace> write_trace_;
+    uint64_t write_trace_count_ = 0;
+    void traceWrite(Transport::Slice* slice,uint32_t qp,unsigned kind);
     RdmaContext::WriteSnapshot write_diagnostics_;
     uint64_t writes_outstanding_since_ns_ = 0;
-    void removeTrackedSlice(Transport::Slice *slice, const ibv_wc *success);
+    void removeTrackedSlice(Transport::Slice *slice, const ibv_wc *completion,
+                            int worker = -1);
 
     std::atomic<int> redispatch_counter_;
 
